@@ -75,6 +75,22 @@ _stub('utils.slack')
 _slack_config = _stub('utils.slack.slack_config')
 _slack_config.SLACK_BOT_TOKEN_ALERTS = 'preview-token'
 
+# shared slack/bq helpers (only need to import cleanly; not invoked in preview)
+_slack_client = _stub('utils.slack.slack_client')
+
+
+class _SlackNotifier:
+    def __init__(self, *a, **k):
+        pass
+
+    def send_message(self, *a, **k):
+        return {'ok': True}
+
+
+_slack_client.SlackNotifier = _SlackNotifier
+_bq_helper = _stub('utils.slack.bigquery_client')
+_bq_helper.get_bigquery_client = lambda *a, **k: None
+
 
 def load_dag_module(filename):
     here = os.path.dirname(os.path.abspath(__file__))

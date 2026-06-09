@@ -21,8 +21,6 @@ import logging
 import os
 
 import pendulum
-import requests
-from google.cloud import bigquery
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 
@@ -31,13 +29,13 @@ logger = logging.getLogger(__name__)
 
 # ==================== CONFIG ====================
 from utils.slack.slack_config import SLACK_BOT_TOKEN_ALERTS as SLACK_BOT_TOKEN
+from utils.slack.slack_client import SlackNotifier
+from utils.slack.bigquery_client import get_bigquery_client
 SLACK_CHANNEL_ID = os.getenv('CS_METRICS_SLACK_CHANNEL', 'C0B6ACKP9CH')  # #daily-cs-metrics
-BIGQUERY_PROJECT = os.getenv('BIGQUERY_PROJECT', 'emergent-default')
 TABLE_ID = os.getenv('TAT_TABLE_ID', 'emergent-default.analytics.support_tickets_tat')
 TRINITY_TAT_TABLE = os.getenv('TRINITY_TAT_TABLE', 'emergent-default.support.trinity_ticket_tat')
 VTICKETS_TABLE = os.getenv('VTICKETS_TABLE', 'emergent-default.trinity_database.v_tickets')
 CPST_TABLE = os.getenv('CPST_TABLE', 'emergent-default.analytics.closed_pending_support_tickets')
-API_TIMEOUT_SECONDS = 30
 
 # ==================== BIGQUERY QUERY ====================
 
@@ -227,35 +225,6 @@ def build_weekly_slack_message(rows: list) -> str:
     return message
 
 
-def send_slack_message(message: str) -> bool:
-    """Post message to Slack channel."""
-    try:
-        headers = {
-            'Authorization': f'Bearer {SLACK_BOT_TOKEN}',
-            'Content-Type': 'application/json'
-        }
-        payload = {
-            "channel": SLACK_CHANNEL_ID,
-            "text": message,
-        }
-        response = requests.post(
-            "https://slack.com/api/chat.postMessage",
-            headers=headers,
-            json=payload,
-            timeout=API_TIMEOUT_SECONDS
-        )
-        result = response.json()
-        if result.get('ok'):
-            logger.info("      ✓ Slack message sent successfully")
-            return True
-        else:
-            logger.error(f"      Slack API error: {result.get('error')}")
-            return False
-    except Exception as e:
-        logger.error(f"      Slack notification failed: {e}")
-        return False
-
-
 # ==================== MAIN TASK ====================
 
 def run_weekly_stats_to_slack(**context):
@@ -270,14 +239,15 @@ def run_weekly_stats_to_slack(**context):
     logger.info("=" * 60)
 
     logger.info("[1] Querying BigQuery for weekly ticket stats...")
-    client = bigquery.Client(project=BIGQUERY_PROJECT)
+    client = get_bigquery_client()
+    notifier = SlackNotifier(SLACK_BOT_TOKEN, SLACK_CHANNEL_ID)
 
     try:
         query_job = client.query(WEEKLY_STATS_QUERY)
         results = query_job.result()
     except Exception as e:
         logger.error(f"      BigQuery query failed: {e}")
-        send_slack_message(f"🚨 *CS Ticket Stats (Weekly) Error*\n\nBigQuery query failed: {str(e)[:300]}")
+        notifier.send_message(f"🚨 *CS Ticket Stats (Weekly) Error*\n\nBigQuery query failed: {str(e)[:300]}")
         raise
 
     rows = []
@@ -303,10 +273,7 @@ def run_weekly_stats_to_slack(**context):
     message = build_weekly_slack_message(rows)
 
     logger.info("[3] Sending to Slack...")
-    success = send_slack_message(message)
-
-    if not success:
-        raise Exception("Failed to send Slack message")
+    notifier.send_message(message)
 
     logger.info("=" * 60)
     logger.info("CS TICKET STATS (WEEKLY): COMPLETE")
