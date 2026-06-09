@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 import logging
 import os
 
+import pendulum
 import requests
 from google.cloud import bigquery
 from airflow import DAG
@@ -306,7 +307,7 @@ def run_ticket_stats_to_slack(**context):
 default_args = {
     'owner': 'analytics',
     'depends_on_past': False,
-    'start_date': datetime(2025, 1, 1),
+    'start_date': pendulum.datetime(2025, 1, 1, tz='Asia/Kolkata'),
     'email_on_failure': False,
     'email_on_retry': False,
     'retries': 2,
@@ -316,8 +317,8 @@ default_args = {
 dag = DAG(
     'ticket_stats_hourly_slack',
     default_args=default_args,
-    description='Post hourly ticket creation/closure stats to Slack (triggered by TAT DAG)',
-    schedule_interval=None,  # Triggered externally by TAT DAG
+    description='Post hourly ticket creation/closure stats to Slack (every 3h, IST)',
+    schedule_interval='0 */3 * * *',  # Every 3h on the hour, IST: 00,03,06,09,12,15,18,21
     catchup=False,
     tags=['slack', 'analytics', 'support_tickets', 'reporting'],
 )

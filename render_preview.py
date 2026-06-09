@@ -61,6 +61,11 @@ class _Client:
 _bq.Client = _Client
 _google_cloud.bigquery = _bq
 
+# --- pendulum (only datetime() is used, for the tz-aware start_date) ---
+import datetime as _dt
+_pendulum = _stub('pendulum')
+_pendulum.datetime = lambda *a, **k: _dt.datetime(*[x for x in a if isinstance(x, int)])
+
 # --- requests ---
 _stub('requests')
 
