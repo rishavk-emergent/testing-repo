@@ -149,12 +149,14 @@ def format_hour_label(hour: int) -> str:
         return f"{hour - 12} PM"
 
 
-def _fmt_row(cells: list) -> str:
-    """Left-justify the first cell (label), right-justify the rest, per _COLUMNS widths."""
+def _fmt_row(cells: list, header: bool = False) -> str:
+    """Left-justify the first cell (label), right-justify the rest, per _COLUMNS widths.
+    Header row uses ' | ' separators; data rows use blank spacing (same width, so aligned)."""
     out = []
     for i, (cell, (_, w)) in enumerate(zip(cells, _COLUMNS)):
         out.append(f"{cell:<{w}}" if i == 0 else f"{cell:>{w}}")
-    return ' | '.join(out) + "\n"
+    sep = ' | ' if header else '   '
+    return sep.join(out) + "\n"
 
 
 def build_slack_message(rows: list, date_str: str) -> str:
@@ -183,7 +185,7 @@ def build_slack_message(rows: list, date_str: str) -> str:
     message += f"👤 Escalated→Human: new {total_new} · reopen {total_reopn}\n\n"
 
     message += "```\n"
-    message += _fmt_row([h for h, _ in _COLUMNS])
+    message += _fmt_row([h for h, _ in _COLUMNS], header=True)
     message += "─" * _TABLE_WIDTH + "\n"
     for r in rows:
         message += _fmt_row([
