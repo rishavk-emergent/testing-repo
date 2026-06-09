@@ -208,6 +208,12 @@ def build_weekly_slack_message(rows: list) -> str:
     )
     message += "```\n"
 
+    # Legend
+    message += (
+        "_C = Created · OW = Overwatch · Hu = Human · "
+        "*-Cum / Closed = running cumulative across weeks · L1+L2 only_\n"
+    )
+
     if tot_unclassified > 0:
         message += (
             f"\n_⚠️ {tot_unclassified} closed ticket(s) lack a Trinity OW/Hu tag "

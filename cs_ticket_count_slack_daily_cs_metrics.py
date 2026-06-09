@@ -199,6 +199,12 @@ def build_slack_message(rows: list, date_str: str) -> str:
     )
     message += "```\n"
 
+    # Legend
+    message += (
+        "_C = Created · OW = Overwatch · Hu = Human · "
+        "*-Cum / Closed = running cumulative across hours · L1+L2 only_\n"
+    )
+
     # Footnote for tickets closed but not yet classified in Trinity
     if tot_unclassified > 0:
         message += (
