@@ -89,11 +89,16 @@ def main():
     here = os.path.dirname(os.path.abspath(__file__))
     dagmod = load_dag_module()
 
-    with open(os.path.join(here, 'preview_rows.json')) as f:
-        rows = json.load(f)
-
-    date_str = os.getenv('PREVIEW_DATE_STR', 'Sunday, 08 Jun 2026')
-    message = dagmod.build_slack_message(rows, date_str)
+    mode = os.getenv('PREVIEW_MODE', 'daily')
+    if mode == 'weekly':
+        with open(os.path.join(here, 'preview_weeks.json')) as f:
+            rows = json.load(f)
+        message = dagmod.build_weekly_slack_message(rows)
+    else:
+        with open(os.path.join(here, 'preview_rows.json')) as f:
+            rows = json.load(f)
+        date_str = os.getenv('PREVIEW_DATE_STR', 'Sunday, 08 Jun 2026')
+        message = dagmod.build_slack_message(rows, date_str)
     print(message)
     return message
 
