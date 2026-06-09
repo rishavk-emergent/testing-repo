@@ -3,7 +3,7 @@ CS Ticket Count Slack DAG — WEEKLY (Mondays 10 AM, IST)
 Standalone DAG: every Monday at 10:00 AM IST it queries BigQuery for the last
 5 completed Mon-Sun weeks of ticket creation/closure stats, split by support
 level (L1/L2) and — for closures — by Overwatch vs Human, then posts a
-formatted table (one row per week) to the #daily-cs-metrics Slack channel.
+formatted table (one row per week) to the #support-daily-metrics Slack channel.
 
 Schedule: '0 10 * * 1' interpreted in Asia/Kolkata -> every Monday 10:00 IST
 Data Source: analytics.support_tickets_tat (kept fresh by the atlas sync DAGs),
@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 from utils.slack.slack_config import SLACK_BOT_TOKEN_ALERTS as SLACK_BOT_TOKEN
 from utils.slack.slack_client import SlackNotifier
 from utils.slack.bigquery_client import get_bigquery_client
-SLACK_CHANNEL_ID = os.getenv('CS_METRICS_SLACK_CHANNEL', 'C0B6ACKP9CH')  # #daily-cs-metrics
+SLACK_CHANNEL_ID = os.getenv('CS_METRICS_SLACK_CHANNEL', 'C0A8KA1D4U9')  # #support-daily-metrics
 TABLE_ID = os.getenv('TAT_TABLE_ID', 'emergent-default.analytics.support_tickets_tat')
 TRINITY_TAT_TABLE = os.getenv('TRINITY_TAT_TABLE', 'emergent-default.support.trinity_ticket_tat')
 VTICKETS_TABLE = os.getenv('VTICKETS_TABLE', 'emergent-default.trinity_database.v_tickets')
@@ -295,7 +295,7 @@ default_args = {
 dag = DAG(
     'cs_ticket_count_slack_weekly_cs_metrics',
     default_args=default_args,
-    description='Post weekly (last 5 weeks) CS ticket stats to #daily-cs-metrics, Mondays 10am IST',
+    description='Post weekly (last 5 weeks) CS ticket stats to #support-daily-metrics, Mondays 10am IST',
     schedule_interval='0 10 * * 1',  # Every Monday 10:00 AM IST
     catchup=False,
     tags=['slack', 'analytics', 'support_tickets', 'reporting', 'cs_metrics', 'weekly'],
