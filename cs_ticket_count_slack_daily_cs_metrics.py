@@ -128,13 +128,13 @@ ORDER BY hour_ist
 
 # (header, width) for the table; first column is left-justified, rest right.
 _COLUMNS = [
-    ('Hour', 7), ('C-L1', 6), ('C-L2', 6), ('C-Cum', 7),
-    ('OW-L1', 7), ('OW-L2', 7), ('OW-Cum', 8),
-    ('Hu-L1-new', 10), ('Hu-L1-reopn', 12), ('Hu-L1', 7),
-    ('Hu-L2-new', 10), ('Hu-L2-reopn', 12), ('Hu-L2', 7),
-    ('Hu-Cum', 8), ('Closed', 8),
+    ('Hour', 5), ('C-L1', 4), ('C-L2', 4), ('C-Cum', 5),
+    ('OW-L1', 5), ('OW-L2', 5), ('OW-Cum', 6),
+    ('Hu-L1-new', 9), ('Hu-L1-reopn', 11), ('Hu-L1', 5),
+    ('Hu-L2-new', 9), ('Hu-L2-reopn', 11), ('Hu-L2', 5),
+    ('Hu-Cum', 6), ('Closed', 6),
 ]
-_TABLE_WIDTH = sum(w for _, w in _COLUMNS) + 3 * (len(_COLUMNS) - 1)  # +3 per ' | ' separator
+_TABLE_WIDTH = sum(w for _, w in _COLUMNS) + (len(_COLUMNS) - 1)  # +1 per single-char separator
 
 
 def format_hour_label(hour: int) -> str:
@@ -155,7 +155,7 @@ def _fmt_row(cells: list, header: bool = False) -> str:
     out = []
     for i, (cell, (_, w)) in enumerate(zip(cells, _COLUMNS)):
         out.append(f"{cell:<{w}}" if i == 0 else f"{cell:>{w}}")
-    sep = ' | ' if header else '   '
+    sep = '|' if header else ' '
     return sep.join(out) + "\n"
 
 
