@@ -78,7 +78,7 @@ _slack_config.SLACK_BOT_TOKEN_ALERTS = 'preview-token'
 
 def load_dag_module():
     here = os.path.dirname(os.path.abspath(__file__))
-    path = os.path.join(here, 'ticket_stats_hourly_slack_dag.py')
+    path = os.path.join(here, 'cs_ticket_count_slack_daily_cs_metrics.py')
     spec = importlib.util.spec_from_file_location('dagmod', path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)

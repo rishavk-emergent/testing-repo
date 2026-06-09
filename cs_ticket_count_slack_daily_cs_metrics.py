@@ -1,12 +1,15 @@
 """
-Ticket Stats Hourly Slack DAG
-Queries BigQuery for hourly ticket creation/closure stats (IST)
-and posts a formatted table to Slack.
+CS Ticket Count Slack DAG (daily-cs-metrics)
+Standalone DAG: every 4 hours (IST) it queries BigQuery for today's ticket
+creation/closure stats, split by support level (L1/L2) and — for closures —
+by Overwatch vs Human, then posts a formatted table to the #daily-cs-metrics
+Slack channel.
 
-Trigger: Triggered by atlas_support_tickets_tat DAG after each run
-Data Source: analytics.support_tickets_tat (BigQuery), enriched with
-             support.trinity_ticket_tat for OW-vs-Human closure split.
-Output: Slack message with hourly breakdown table (L1/L2 x OW/Human)
+Schedule: '0 */4 * * *' interpreted in Asia/Kolkata -> 00, 04, 08, 12, 16, 20 IST
+Data Source: analytics.support_tickets_tat (kept fresh by the atlas sync DAGs),
+             enriched with support.trinity_ticket_tat for the OW-vs-Human split.
+Triggers: NONE. Fully self-scheduled; not wired to any other DAG.
+Output: Slack message with hourly breakdown table (L1/L2 x OW/Human).
 """
 
 from datetime import datetime, timedelta, timezone
@@ -24,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 # ==================== CONFIG ====================
 from utils.slack.slack_config import SLACK_BOT_TOKEN_ALERTS as SLACK_BOT_TOKEN
-SLACK_CHANNEL_ID = os.getenv('TICKET_STATS_SLACK_CHANNEL', 'C0AHKKJME23')
+SLACK_CHANNEL_ID = os.getenv('CS_METRICS_SLACK_CHANNEL', 'C0B6ACKP9CH')  # #daily-cs-metrics
 BIGQUERY_PROJECT = os.getenv('BIGQUERY_PROJECT', 'emergent-default')
 TABLE_ID = os.getenv('TAT_TABLE_ID', 'emergent-default.analytics.support_tickets_tat')
 TRINITY_TAT_TABLE = os.getenv('TRINITY_TAT_TABLE', 'emergent-default.support.trinity_ticket_tat')
@@ -139,7 +142,7 @@ def build_slack_message(rows: list, date_str: str) -> str:
     Uses Slack's monospace formatting for aligned columns.
     """
     if not rows:
-        return f"📊 *Hourly Ticket Stats — {date_str} (IST)*\n\nNo ticket data available for today yet."
+        return f"📊 *CS Ticket Stats — {date_str} (IST)*\n\nNo ticket data available for today yet."
 
     # Per-hour columns are summed; cumulative columns take the last row's value.
     tot_cr_l1 = sum(r['cr_l1'] for r in rows)
@@ -157,7 +160,7 @@ def build_slack_message(rows: list, date_str: str) -> str:
     total_closed = last['closed_cum']
 
     # Header
-    message = f"📊 *Hourly Ticket Stats — {date_str} (IST)*\n\n"
+    message = f"📊 *CS Ticket Stats — {date_str} (IST)*\n\n"
 
     # Summary line
     message += (
@@ -249,7 +252,7 @@ def run_ticket_stats_to_slack(**context):
     3. Post to Slack
     """
     logger.info("=" * 60)
-    logger.info("TICKET STATS: QUERY & PUSH TO SLACK")
+    logger.info("CS TICKET STATS: QUERY & PUSH TO SLACK")
     logger.info("=" * 60)
 
     # 1. Query BigQuery
@@ -261,7 +264,7 @@ def run_ticket_stats_to_slack(**context):
         results = query_job.result()
     except Exception as e:
         logger.error(f"      BigQuery query failed: {e}")
-        send_slack_message(f"🚨 *Ticket Stats Error*\n\nBigQuery query failed: {str(e)[:300]}")
+        send_slack_message(f"🚨 *CS Ticket Stats Error*\n\nBigQuery query failed: {str(e)[:300]}")
         raise
 
     rows = []
@@ -298,14 +301,14 @@ def run_ticket_stats_to_slack(**context):
         raise Exception("Failed to send Slack message")
 
     logger.info("=" * 60)
-    logger.info("TICKET STATS: COMPLETE")
+    logger.info("CS TICKET STATS: COMPLETE")
     logger.info("=" * 60)
 
 
 # ==================== DAG DEFINITION ====================
 
 default_args = {
-    'owner': 'analytics',
+    'owner': 'cs_team',
     'depends_on_past': False,
     'start_date': pendulum.datetime(2025, 1, 1, tz='Asia/Kolkata'),
     'email_on_failure': False,
@@ -315,16 +318,16 @@ default_args = {
 }
 
 dag = DAG(
-    'ticket_stats_hourly_slack',
+    'cs_ticket_count_slack_daily_cs_metrics',
     default_args=default_args,
-    description='Post hourly ticket creation/closure stats to Slack (every 3h, IST)',
-    schedule_interval='0 */3 * * *',  # Every 3h on the hour, IST: 00,03,06,09,12,15,18,21
+    description='Post CS ticket stats (L1/L2 x OW/Human) to #daily-cs-metrics every 4h IST',
+    schedule_interval='0 */4 * * *',  # Every 4h on the hour, IST: 00,04,08,12,16,20
     catchup=False,
-    tags=['slack', 'analytics', 'support_tickets', 'reporting'],
+    tags=['slack', 'analytics', 'support_tickets', 'reporting', 'cs_metrics'],
 )
 
 push_stats_task = PythonOperator(
-    task_id='push_ticket_stats_to_slack',
+    task_id='push_cs_ticket_stats_to_slack',
     python_callable=run_ticket_stats_to_slack,
     dag=dag,
 )
