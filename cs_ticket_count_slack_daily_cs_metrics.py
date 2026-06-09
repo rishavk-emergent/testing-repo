@@ -134,7 +134,7 @@ _COLUMNS = [
     ('Hu-L2-new', 10), ('Hu-L2-reopn', 12), ('Hu-L2', 7),
     ('Hu-Cum', 8), ('Closed', 8),
 ]
-_TABLE_WIDTH = sum(w for _, w in _COLUMNS)
+_TABLE_WIDTH = sum(w for _, w in _COLUMNS) + 3 * (len(_COLUMNS) - 1)  # +3 per ' | ' separator
 
 
 def format_hour_label(hour: int) -> str:
@@ -154,7 +154,7 @@ def _fmt_row(cells: list) -> str:
     out = []
     for i, (cell, (_, w)) in enumerate(zip(cells, _COLUMNS)):
         out.append(f"{cell:<{w}}" if i == 0 else f"{cell:>{w}}")
-    return ''.join(out) + "\n"
+    return ' | '.join(out) + "\n"
 
 
 def build_slack_message(rows: list, date_str: str) -> str:
