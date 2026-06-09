@@ -128,13 +128,13 @@ ORDER BY hour_ist
 
 # (header, width) for the table; first column is left-justified, rest right.
 _COLUMNS = [
-    ('Hour', 5), ('C-L1', 4), ('C-L2', 4), ('C-Cum', 5),
-    ('OW-L1', 5), ('OW-L2', 5), ('OW-Cum', 6),
-    ('Hu-L1-new', 9), ('Hu-L1-reopn', 11), ('Hu-L1', 5),
-    ('Hu-L2-new', 9), ('Hu-L2-reopn', 11), ('Hu-L2', 5),
-    ('Hu-Cum', 6), ('Closed', 6),
+    ('Hour', 7), ('C-L1', 6), ('C-L2', 6), ('C-Cum', 7),
+    ('OW-L1', 7), ('OW-L2', 7), ('OW-Cum', 8),
+    ('Hu-L1-new', 10), ('Hu-L1-reopn', 12), ('Hu-L1', 7),
+    ('Hu-L2-new', 10), ('Hu-L2-reopn', 12), ('Hu-L2', 7),
+    ('Hu-Cum', 8), ('Closed', 8),
 ]
-_TABLE_WIDTH = sum(w for _, w in _COLUMNS) + (len(_COLUMNS) - 1)  # +1 per single-char separator
+_TABLE_WIDTH = sum(w for _, w in _COLUMNS)
 
 
 def format_hour_label(hour: int) -> str:
@@ -149,14 +149,12 @@ def format_hour_label(hour: int) -> str:
         return f"{hour - 12} PM"
 
 
-def _fmt_row(cells: list, header: bool = False) -> str:
-    """Left-justify the first cell (label), right-justify the rest, per _COLUMNS widths.
-    Header row uses ' | ' separators; data rows use blank spacing (same width, so aligned)."""
+def _fmt_row(cells: list) -> str:
+    """Left-justify the first cell (label), right-justify the rest, per _COLUMNS widths."""
     out = []
     for i, (cell, (_, w)) in enumerate(zip(cells, _COLUMNS)):
         out.append(f"{cell:<{w}}" if i == 0 else f"{cell:>{w}}")
-    sep = '|' if header else ' '
-    return sep.join(out) + "\n"
+    return ''.join(out) + "\n"
 
 
 def build_slack_message(rows: list, date_str: str) -> str:
@@ -185,7 +183,7 @@ def build_slack_message(rows: list, date_str: str) -> str:
     message += f"👤 Escalated→Human: new {total_new} · reopen {total_reopn}\n\n"
 
     message += "```\n"
-    message += _fmt_row([h for h, _ in _COLUMNS], header=True)
+    message += _fmt_row([h for h, _ in _COLUMNS])
     message += "─" * _TABLE_WIDTH + "\n"
     for r in rows:
         message += _fmt_row([
