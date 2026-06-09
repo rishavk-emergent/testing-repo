@@ -76,9 +76,9 @@ _slack_config = _stub('utils.slack.slack_config')
 _slack_config.SLACK_BOT_TOKEN_ALERTS = 'preview-token'
 
 
-def load_dag_module():
+def load_dag_module(filename):
     here = os.path.dirname(os.path.abspath(__file__))
-    path = os.path.join(here, 'cs_ticket_count_slack_daily_cs_metrics.py')
+    path = os.path.join(here, filename)
     spec = importlib.util.spec_from_file_location('dagmod', path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -87,14 +87,15 @@ def load_dag_module():
 
 def main():
     here = os.path.dirname(os.path.abspath(__file__))
-    dagmod = load_dag_module()
-
     mode = os.getenv('PREVIEW_MODE', 'daily')
+
     if mode == 'weekly':
+        dagmod = load_dag_module('cs_ticket_count_slack_weekly_cs_metrics.py')
         with open(os.path.join(here, 'preview_weeks.json')) as f:
             rows = json.load(f)
         message = dagmod.build_weekly_slack_message(rows)
     else:
+        dagmod = load_dag_module('cs_ticket_count_slack_daily_cs_metrics.py')
         with open(os.path.join(here, 'preview_rows.json')) as f:
             rows = json.load(f)
         date_str = os.getenv('PREVIEW_DATE_STR', 'Sunday, 08 Jun 2026')
