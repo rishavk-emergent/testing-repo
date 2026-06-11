@@ -1,7 +1,5 @@
 [
- {"week_start": "2026-05-04", "cr_l1": 9411, "cr_l2": 1791, "cr_cum": 11202, "ow_l1": 17, "ow_l2": 4, "ow_cum": 21, "hu_l1": 1, "hu_l2": 1, "hu_cum": 2, "closed_cum": 11239, "unclassified": 11216},
- {"week_start": "2026-05-11", "cr_l1": 5686, "cr_l2": 1790, "cr_cum": 18678, "ow_l1": 347, "ow_l2": 79, "ow_cum": 447, "hu_l1": 140, "hu_l2": 136, "hu_cum": 278, "closed_cum": 18515, "unclassified": 6574},
- {"week_start": "2026-05-18", "cr_l1": 4492, "cr_l2": 1968, "cr_cum": 25138, "ow_l1": 2027, "ow_l2": 462, "ow_cum": 2936, "hu_l1": 919, "hu_l2": 794, "hu_cum": 1991, "closed_cum": 24733, "unclassified": 2016},
- {"week_start": "2026-05-25", "cr_l1": 3991, "cr_l2": 1949, "cr_cum": 31078, "ow_l1": 2184, "ow_l2": 457, "ow_cum": 5577, "hu_l1": 1328, "hu_l2": 1186, "hu_cum": 4505, "closed_cum": 29970, "unclassified": 82},
- {"week_start": "2026-06-01", "cr_l1": 4411, "cr_l2": 1867, "cr_cum": 37356, "ow_l1": 2889, "ow_l2": 698, "ow_cum": 9164, "hu_l1": 1588, "hu_l2": 1363, "hu_cum": 7456, "closed_cum": 36542, "unclassified": 34}
+ {"week_start":"2026-05-18","cr_l1":4492,"cr_l2":1968,"cr_cum":6460,"ow_l1":3289,"ow_l2":1351,"ow_cum":4640,"hu_l1":1248,"hu_l2":1361,"hu_cum":2609,"closed_cum":7249},
+ {"week_start":"2026-05-25","cr_l1":3991,"cr_l2":1948,"cr_cum":12399,"ow_l1":2671,"ow_l2":718,"ow_cum":8029,"hu_l1":2001,"hu_l2":2020,"hu_cum":6630,"closed_cum":14659},
+ {"week_start":"2026-06-01","cr_l1":4408,"cr_l2":1868,"cr_cum":18675,"ow_l1":2963,"ow_l2":843,"ow_cum":11835,"hu_l1":2653,"hu_l2":2611,"hu_cum":11894,"closed_cum":23729}
 ]

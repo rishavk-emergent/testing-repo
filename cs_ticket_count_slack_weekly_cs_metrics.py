@@ -3,17 +3,23 @@ CS Ticket Count Slack DAG — WEEKLY (Mondays 10 AM, IST)
 Standalone DAG: every Monday at 10:00 AM IST it queries BigQuery for the last
 5 completed Mon-Sun weeks of ticket creation/closure stats, split by support
 level (L1/L2) and — for closures — by Overwatch vs Human, then posts a
-formatted table (one row per week) to the #support-daily-metrics Slack channel.
+formatted table (one row per week, most recent on top) to #support-daily-metrics.
+
+Closures are EVENT-BASED (same method as the daily DAG): counted from Trinity
+ticket-event close transitions — status_changed -> CLOSED by actor_kind
+SYSTEM (Overwatch) / AGENT (Human). This replaces the old snapshot
+(trinity_ticket_tat.escalated_to) join, which undercounted OW/Hu every week.
+
+Trinity rollout was ~18 May 2026, and Trinity has no ticket-event history before
+then — so weeks earlier than that have no usable OW/Hu split. The window is
+therefore CAPPED to weeks >= the rollout: today it shows the covered subset of
+the last 5 weeks, and automatically fills back to a full 5 once the pre-rollout
+weeks age out of the trailing window (~late June).
 
 Schedule: '0 10 * * 1' interpreted in Asia/Kolkata -> every Monday 10:00 IST
-Data Source: analytics.support_tickets_tat (kept fresh by the atlas sync DAGs),
-             enriched with support.trinity_ticket_tat for the OW-vs-Human split.
+Data Source: closes from trinity_database.v_ticket_events; created from
+             analytics.support_tickets_tat; tier (L1/L2) from CPST.support_level.
 Triggers: NONE. Fully self-scheduled; not wired to any other DAG.
-Output: Slack message with a 5-week breakdown table (L1/L2 x OW/Human).
-
-Note: Trinity OW/Human classification began ~18 May 2026, so weeks before that
-show near-empty OW/Hu (counted in Closed, surfaced as 'unclassified'). This
-self-corrects as older weeks roll out of the 5-week window.
 """
 
 from datetime import datetime, timedelta, timezone
@@ -33,101 +39,89 @@ from utils.slack.slack_client import SlackNotifier
 from utils.slack.bigquery_client import get_bigquery_client
 SLACK_CHANNEL_ID = os.getenv('CS_METRICS_SLACK_CHANNEL', 'C0A8KA1D4U9')  # #support-daily-metrics
 TABLE_ID = os.getenv('TAT_TABLE_ID', 'emergent-default.analytics.support_tickets_tat')
-TRINITY_TAT_TABLE = os.getenv('TRINITY_TAT_TABLE', 'emergent-default.support.trinity_ticket_tat')
+TICKET_EVENTS_TABLE = os.getenv('TICKET_EVENTS_TABLE', 'emergent-default.trinity_database.v_ticket_events')
 VTICKETS_TABLE = os.getenv('VTICKETS_TABLE', 'emergent-default.trinity_database.v_tickets')
 CPST_TABLE = os.getenv('CPST_TABLE', 'emergent-default.analytics.closed_pending_support_tickets')
+# Trinity rollout — weeks before this lack ticket-event history, so OW/Hu can't be split.
+TRINITY_START = os.getenv('TRINITY_START', '2026-05-18')
 
 # ==================== BIGQUERY QUERY ====================
 
-# The 5 completed Mon-Sun weeks before the run-day Monday. One row per week,
-# running cumulative across weeks (oldest -> newest).
+# Last 5 completed Mon-Sun weeks, capped to weeks >= TRINITY_START. One row per week,
+# OW/Hu from event-based close transitions, running cumulative across weeks (oldest -> newest).
 WEEKLY_STATS_QUERY = f"""
 WITH
 bounds AS (
   SELECT DATE_TRUNC(DATE(DATETIME(CURRENT_TIMESTAMP(), 'Asia/Kolkata')), WEEK(MONDAY)) AS cur_mon
 ),
-weeks AS (
-  SELECT wk
-  FROM bounds, UNNEST(GENERATE_DATE_ARRAY(
-    DATE_SUB(cur_mon, INTERVAL 5 WEEK), DATE_SUB(cur_mon, INTERVAL 1 WEEK), INTERVAL 1 WEEK)) AS wk
+win AS (
+  SELECT
+    GREATEST(DATE_SUB((SELECT cur_mon FROM bounds), INTERVAL 5 WEEK), DATE '{TRINITY_START}') AS ws,
+    DATE_SUB((SELECT cur_mon FROM bounds), INTERVAL 1 DAY) AS we
 ),
--- OW vs Human classification per Atlas ticket_number, sourced from Trinity.
-trinity AS (
-  SELECT ticket_id, escalated_to
-  FROM `{TRINITY_TAT_TABLE}`
-  QUALIFY ROW_NUMBER() OVER (PARTITION BY ticket_id ORDER BY sync_timestamp DESC) = 1
+
+-- tier lookup (atlas ticket id -> L1/L2)
+cpst AS (
+  SELECT id AS atlas_id, COALESCE(NULLIF(support_level, 'N/A'), 'untagged') AS tier
+  FROM `{CPST_TABLE}`
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY id ORDER BY sync_timestamp DESC) = 1
 ),
 vt AS (
-  SELECT _id, atlas_id
-  FROM `{VTICKETS_TABLE}`
+  SELECT _id, atlas_id FROM `{VTICKETS_TABLE}`
   WHERE atlas_id IS NOT NULL
   QUALIFY ROW_NUMBER() OVER (PARTITION BY _id ORDER BY source_timestamp DESC) = 1
 ),
-cpst AS (
-  SELECT id, number
-  FROM `{CPST_TABLE}`
-  WHERE number IS NOT NULL
-  QUALIFY ROW_NUMBER() OVER (PARTITION BY id ORDER BY number) = 1
+
+-- event-based closes: SYSTEM = Overwatch, AGENT = Human
+closes AS (
+  SELECT e.ticket_id, e.actor_kind,
+    DATE_TRUNC(DATE(DATETIME(e.created_at, 'Asia/Kolkata')), WEEK(MONDAY)) AS wk
+  FROM `{TICKET_EVENTS_TABLE}` e, win
+  WHERE e.action = 'status_changed' AND SAFE.STRING(e.new_value) = 'CLOSED'
+    AND DATE(DATETIME(e.created_at, 'Asia/Kolkata')) BETWEEN win.ws AND win.we
 ),
-ow_class AS (
-  SELECT cpst.number AS ticket_number, t.escalated_to  -- 0 = OW-handled, 1 = escalated to Human
-  FROM trinity t
-  JOIN vt   ON t.ticket_id = vt._id
-  JOIN cpst ON vt.atlas_id = cpst.id
-  QUALIFY ROW_NUMBER() OVER (PARTITION BY cpst.number ORDER BY t.escalated_to DESC) = 1
+close_tier AS (
+  SELECT c.wk, c.actor_kind, cp.tier
+  FROM closes c
+  JOIN vt   ON c.ticket_id = vt._id
+  JOIN cpst cp ON vt.atlas_id = cp.atlas_id
+),
+close_agg AS (
+  SELECT wk,
+    COUNTIF(actor_kind='SYSTEM' AND tier='L1') AS ow_l1,
+    COUNTIF(actor_kind='SYSTEM' AND tier='L2') AS ow_l2,
+    COUNTIF(actor_kind='AGENT'  AND tier='L1') AS hu_l1,
+    COUNTIF(actor_kind='AGENT'  AND tier='L2') AS hu_l2,
+    COUNTIF(tier IN ('L1','L2')) AS overall_closed
+  FROM close_tier GROUP BY wk
 ),
 
--- L1/L2 tickets only (N/A and L3 excluded by design)
-base AS (
-  SELECT ticket_number, support_level, created_at, closed_at
-  FROM `{TABLE_ID}`
-  WHERE support_level IN ('L1', 'L2')
-),
-
-wk_created AS (
-  SELECT
-    DATE_TRUNC(DATE(DATETIME(created_at, 'Asia/Kolkata')), WEEK(MONDAY)) AS wk,
-    COUNTIF(support_level = 'L1') AS cr_l1,
-    COUNTIF(support_level = 'L2') AS cr_l2
-  FROM base, bounds
-  WHERE DATE(DATETIME(created_at, 'Asia/Kolkata')) >= DATE_SUB(cur_mon, INTERVAL 5 WEEK)
-    AND DATE(DATETIME(created_at, 'Asia/Kolkata')) <  cur_mon
+created AS (
+  SELECT DATE_TRUNC(DATE(DATETIME(created_at, 'Asia/Kolkata')), WEEK(MONDAY)) AS wk,
+    COUNTIF(support_level='L1') AS cr_l1, COUNTIF(support_level='L2') AS cr_l2
+  FROM `{TABLE_ID}`, win
+  WHERE support_level IN ('L1','L2')
+    AND DATE(DATETIME(created_at, 'Asia/Kolkata')) BETWEEN win.ws AND win.we
   GROUP BY 1
 ),
 
-wk_closed AS (
-  SELECT
-    DATE_TRUNC(DATE(DATETIME(b.closed_at, 'Asia/Kolkata')), WEEK(MONDAY)) AS wk,
-    COUNTIF(b.support_level = 'L1' AND oc.escalated_to = 0) AS ow_l1,
-    COUNTIF(b.support_level = 'L2' AND oc.escalated_to = 0) AS ow_l2,
-    COUNTIF(b.support_level = 'L1' AND oc.escalated_to = 1) AS hu_l1,
-    COUNTIF(b.support_level = 'L2' AND oc.escalated_to = 1) AS hu_l2,
-    COUNTIF(oc.escalated_to IS NULL) AS unclassified,
-    COUNT(*) AS overall_closed
-  FROM base b, bounds
-  LEFT JOIN ow_class oc USING (ticket_number)
-  WHERE b.closed_at IS NOT NULL
-    AND DATE(DATETIME(b.closed_at, 'Asia/Kolkata')) >= DATE_SUB(cur_mon, INTERVAL 5 WEEK)
-    AND DATE(DATETIME(b.closed_at, 'Asia/Kolkata')) <  cur_mon
-  GROUP BY 1
-)
+weeks AS (SELECT wk FROM created UNION DISTINCT SELECT wk FROM close_agg)
 
 SELECT
   FORMAT_DATE('%Y-%m-%d', w.wk) AS week_start,
   COALESCE(c.cr_l1, 0) AS cr_l1,
   COALESCE(c.cr_l2, 0) AS cr_l2,
   SUM(COALESCE(c.cr_l1, 0) + COALESCE(c.cr_l2, 0)) OVER ww AS cr_cum,
-  COALESCE(x.ow_l1, 0) AS ow_l1,
-  COALESCE(x.ow_l2, 0) AS ow_l2,
-  SUM(COALESCE(x.ow_l1, 0) + COALESCE(x.ow_l2, 0)) OVER ww AS ow_cum,
-  COALESCE(x.hu_l1, 0) AS hu_l1,
-  COALESCE(x.hu_l2, 0) AS hu_l2,
-  SUM(COALESCE(x.hu_l1, 0) + COALESCE(x.hu_l2, 0)) OVER ww AS hu_cum,
-  SUM(COALESCE(x.overall_closed, 0)) OVER ww AS closed_cum,
-  COALESCE(x.unclassified, 0) AS unclassified
+  COALESCE(a.ow_l1, 0) AS ow_l1,
+  COALESCE(a.ow_l2, 0) AS ow_l2,
+  SUM(COALESCE(a.ow_l1, 0) + COALESCE(a.ow_l2, 0)) OVER ww AS ow_cum,
+  COALESCE(a.hu_l1, 0) AS hu_l1,
+  COALESCE(a.hu_l2, 0) AS hu_l2,
+  SUM(COALESCE(a.hu_l1, 0) + COALESCE(a.hu_l2, 0)) OVER ww AS hu_cum,
+  SUM(COALESCE(a.overall_closed, 0)) OVER ww AS closed_cum
 FROM weeks w
-LEFT JOIN wk_created c ON w.wk = c.wk
-LEFT JOIN wk_closed  x ON w.wk = x.wk
+LEFT JOIN created   c ON w.wk = c.wk
+LEFT JOIN close_agg a ON w.wk = a.wk
 WINDOW ww AS (ORDER BY w.wk)
 ORDER BY w.wk
 """
@@ -146,12 +140,11 @@ def format_week_label(week_start: str) -> str:
 
 def build_weekly_slack_message(rows: list) -> str:
     """
-    Weekly view: one row per week (Mon-Sun) for the last 5 completed weeks.
-    Columns: Created (L1/L2/Cum) | Closed-OW (L1/L2/Cum) | Closed-Hu (L1/L2/Cum) | Overall Closed (Cum).
-    All *-Cum columns and Overall Closed are running cumulative across weeks.
+    Weekly view: one row per week (Mon-Sun), most-recent on top.
+    OW/Hu are event-based closes; *-Cum / Closed are running cumulative (computed oldest->newest).
     """
     if not rows:
-        return "📊 *CS Ticket Stats — Weekly (last 5 weeks, IST)*\n\nNo data available."
+        return "📊 *CS Ticket Stats — Weekly (IST)*\n\nNo data available."
 
     tot_cr_l1 = sum(r['cr_l1'] for r in rows)
     tot_cr_l2 = sum(r['cr_l2'] for r in rows)
@@ -159,20 +152,18 @@ def build_weekly_slack_message(rows: list) -> str:
     tot_ow_l2 = sum(r['ow_l2'] for r in rows)
     tot_hu_l1 = sum(r['hu_l1'] for r in rows)
     tot_hu_l2 = sum(r['hu_l2'] for r in rows)
-    tot_unclassified = sum(r['unclassified'] for r in rows)
 
-    last = rows[-1]
+    last = rows[-1]  # newest (cumulative computed oldest->newest)
     total_created = tot_cr_l1 + tot_cr_l2
     total_ow = tot_ow_l1 + tot_ow_l2
     total_hu = tot_hu_l1 + tot_hu_l2
     total_closed = last['closed_cum']
 
-    # Window range from the spine, e.g. "04 May – 07 Jun 2026"
     first_mon = datetime.strptime(rows[0]['week_start'], '%Y-%m-%d')
     last_sun = datetime.strptime(last['week_start'], '%Y-%m-%d') + timedelta(days=6)
     range_str = f"{first_mon.strftime('%d %b')} – {last_sun.strftime('%d %b %Y')}"
 
-    message = f"📊 *CS Ticket Stats — Weekly (last 5 weeks: {range_str}, IST)*\n\n"
+    message = f"📊 *CS Ticket Stats — Weekly — last {len(rows)} completed weeks ({range_str}, IST)*\n\n"
     message += (
         f"🎫 Created: *{total_created}* (L1 {tot_cr_l1} / L2 {tot_cr_l2})  |  "
         f"✅ Closed: *{total_closed}* (OW {total_ow} / Hu {total_hu})\n\n"
@@ -207,34 +198,25 @@ def build_weekly_slack_message(rows: list) -> str:
     )
     message += "```\n"
 
-    # Legend
     message += (
-        "_C = Created · OW = Overwatch · Hu = Human · "
-        "*-Cum / Closed = running cumulative across weeks · L1+L2 only_\n"
+        "_C = Created · OW = closed by Overwatch · Hu = closed by Human · "
+        "*-Cum / Closed = running cumulative across weeks · L1+L2 only._\n"
     )
-
-    if tot_unclassified > 0:
+    if len(rows) < 5:
         message += (
-            f"\n_⚠️ {tot_unclassified} closed ticket(s) lack a Trinity OW/Hu tag "
-            f"(counted in Closed, excluded from OW/Hu). Mostly pre-~18 May weeks — "
-            f"coverage fills in for recent weeks._"
+            f"_Showing {len(rows)} of 5 weeks — earlier weeks predate the ~18 May Trinity rollout "
+            f"(no OW/Hu data); fills to 5 as they age out._\n"
         )
 
     now_ist = datetime.now(timezone(timedelta(hours=5, minutes=30)))
     message += f"\n_Generated: {now_ist.strftime('%d %b %Y %I:%M %p IST')}_"
-
     return message
 
 
 # ==================== MAIN TASK ====================
 
 def run_weekly_stats_to_slack(**context):
-    """
-    Main function:
-    1. Query BigQuery for the last 5 completed weeks
-    2. Format as a table
-    3. Post to Slack
-    """
+    """Query BigQuery for the last 5 completed weeks (capped to Trinity coverage), format, post."""
     logger.info("=" * 60)
     logger.info("CS TICKET STATS (WEEKLY): QUERY & PUSH TO SLACK")
     logger.info("=" * 60)
@@ -265,7 +247,6 @@ def run_weekly_stats_to_slack(**context):
             'hu_l2': row.hu_l2,
             'hu_cum': row.hu_cum,
             'closed_cum': row.closed_cum,
-            'unclassified': row.unclassified,
         })
 
     logger.info(f"      ✓ Got {len(rows)} weekly rows")
@@ -296,7 +277,7 @@ default_args = {
 dag = DAG(
     'cs_ticket_count_slack_weekly_cs_metrics',
     default_args=default_args,
-    description='Post weekly (last 5 weeks) CS ticket stats to #support-daily-metrics, Mondays 10am IST',
+    description='Post weekly (last 5 wks, event-based, capped to Trinity coverage) CS ticket stats to #support-daily-metrics, Mondays 10am IST',
     schedule_interval='0 10 * * 1',  # Every Monday 10:00 AM IST
     catchup=False,
     tags=['slack', 'analytics', 'support_tickets', 'reporting', 'cs_metrics', 'weekly'],
