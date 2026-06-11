@@ -188,7 +188,8 @@ def build_weekly_slack_message(rows: list) -> str:
     width = 13 + 8 * 10
     message += "─" * width + "\n"
 
-    for row in rows:
+    # Display most-recent week on top (cumulative columns are still computed oldest->newest)
+    for row in reversed(rows):
         wl = format_week_label(row['week_start'])
         message += (
             f"{wl:<13}{row['cr_l1']:>8}{row['cr_l2']:>8}{row['cr_cum']:>8}"
