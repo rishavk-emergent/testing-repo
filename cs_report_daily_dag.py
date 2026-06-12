@@ -53,7 +53,7 @@ audit_per_ticket AS (
 ),
 -- Trinity TAT phase split, mapped to atlas ticket id
 ticket_tat AS (
-  SELECT vt.atlas_id AS ticket_id, t.time1 AS ow_t, t.time3 AS hufrt_t, (t.time1 + t.time2) AS frt_t
+  SELECT vt.atlas_id AS ticket_id, t.time1 AS ow_t, t.time3 AS hufrt_t, (t.time1 + t.time3) AS frt_t
   FROM (SELECT ticket_id, time1, time2, time3 FROM `emergent-default.support.trinity_ticket_tat` QUALIFY ROW_NUMBER() OVER (PARTITION BY ticket_id ORDER BY sync_timestamp DESC)=1) t
   JOIN (SELECT _id, atlas_id FROM `emergent-default.trinity_database.v_tickets` WHERE atlas_id IS NOT NULL QUALIFY ROW_NUMBER() OVER (PARTITION BY _id ORDER BY source_timestamp DESC)=1) vt ON vt._id = t.ticket_id
 ),
@@ -61,7 +61,7 @@ closures AS (
   SELECT fe.ticket_id, COALESCE(cl.tier,'untagged') AS tier, fe.first_eval_day AS day,
     (IFNULL(ap.escalation_count,0)=0) AS ow_solved,
     ct.csat_score, IFNULL(tt.reopen_flag,0)=1 AS is_reopened,
-    tat.ow_t, IF(IFNULL(ap.escalation_count,0)=0, NULL, tat.hufrt_t) AS hufrt_t, tat.frt_t
+    tat.ow_t, IF(IFNULL(ap.escalation_count,0)=0, NULL, tat.hufrt_t) AS hufrt_t, IF(IFNULL(ap.escalation_count,0)=0, NULL, tat.frt_t) AS frt_t
   FROM first_eval_per_ticket fe
   LEFT JOIN cpst_latest cl ON cl.ticket_id=fe.ticket_id
   LEFT JOIN tat_latest tt ON tt.ticket_number=cl.number
@@ -91,7 +91,7 @@ m AS (
     ROUND(APPROX_QUANTILES(c.hufrt_t,100)[OFFSET(50)],1) AS hufrt_p50, ROUND(APPROX_QUANTILES(c.hufrt_t,100)[OFFSET(75)],1) AS hufrt_p75, ROUND(APPROX_QUANTILES(c.hufrt_t,100)[OFFSET(90)],1) AS hufrt_p90,
     ROUND(APPROX_QUANTILES(IF(c.tier='L1',c.hufrt_t,NULL),100)[OFFSET(50)],1) AS hufrt_p50_L1, ROUND(APPROX_QUANTILES(IF(c.tier='L1',c.hufrt_t,NULL),100)[OFFSET(75)],1) AS hufrt_p75_L1, ROUND(APPROX_QUANTILES(IF(c.tier='L1',c.hufrt_t,NULL),100)[OFFSET(90)],1) AS hufrt_p90_L1,
     ROUND(APPROX_QUANTILES(IF(c.tier='L2',c.hufrt_t,NULL),100)[OFFSET(50)],1) AS hufrt_p50_L2, ROUND(APPROX_QUANTILES(IF(c.tier='L2',c.hufrt_t,NULL),100)[OFFSET(75)],1) AS hufrt_p75_L2, ROUND(APPROX_QUANTILES(IF(c.tier='L2',c.hufrt_t,NULL),100)[OFFSET(90)],1) AS hufrt_p90_L2,
-    -- §2 created->human first resolution (time1+2), all tickets
+    -- §2 created->human FRT (time1+3), escalated tickets only
     ROUND(APPROX_QUANTILES(c.frt_t,100)[OFFSET(50)],1) AS frt_p50, ROUND(APPROX_QUANTILES(c.frt_t,100)[OFFSET(75)],1) AS frt_p75, ROUND(APPROX_QUANTILES(c.frt_t,100)[OFFSET(90)],1) AS frt_p90,
     ROUND(APPROX_QUANTILES(IF(c.tier='L1',c.frt_t,NULL),100)[OFFSET(50)],1) AS frt_p50_L1, ROUND(APPROX_QUANTILES(IF(c.tier='L1',c.frt_t,NULL),100)[OFFSET(75)],1) AS frt_p75_L1, ROUND(APPROX_QUANTILES(IF(c.tier='L1',c.frt_t,NULL),100)[OFFSET(90)],1) AS frt_p90_L1,
     ROUND(APPROX_QUANTILES(IF(c.tier='L2',c.frt_t,NULL),100)[OFFSET(50)],1) AS frt_p50_L2, ROUND(APPROX_QUANTILES(IF(c.tier='L2',c.frt_t,NULL),100)[OFFSET(75)],1) AS frt_p75_L2, ROUND(APPROX_QUANTILES(IF(c.tier='L2',c.frt_t,NULL),100)[OFFSET(90)],1) AS frt_p90_L2,
@@ -341,13 +341,13 @@ def render_report(payload, mode):
 
     # ---- §2 Resolution TAT ----
     fig=_fig(); _masthead(fig,title,'RESOLUTION TAT · P50 / P75 / P90',period); ax=_cards(fig)
-    cols=[('Created→OW','ow'),('Esc→Human FRT','hufrt'),('Created→Human Res','frt')]
+    cols=[('Created→OW','ow'),('Esc→Human FRT','hufrt'),('Created→Human FRT','frt')]
     for r,(tn,sfx) in enumerate(tiers):
         for cc,(cn,ph) in enumerate(cols): _tat_card(ax[r*3+cc],d,tn+' · '+cn,ph,sfx)
     cax=_charts(fig,3)
     _chart(cax[0],labels,[{'data':tat_series('ow_p50'),'color':BLUE}],'m',0,title='CREATED → OW')
     _chart(cax[1],labels,[{'data':tat_series('hufrt_p50'),'color':AMBERC}],'m',0,title='ESC → HUMAN FRT')
-    _chart(cax[2],labels,[{'data':tat_series('frt_p50'),'color':PINK}],'m',0,title='CREATED → HUMAN RES')
+    _chart(cax[2],labels,[{'data':tat_series('frt_p50'),'color':PINK}],'m',0,title='CREATED → HUMAN FRT')
     fig.text(0.04,0.30,'— P50 TREND · '+span,color=SUB,fontsize=9,family='monospace')
     out.append(('Resolution TAT',_png(fig)))
 
