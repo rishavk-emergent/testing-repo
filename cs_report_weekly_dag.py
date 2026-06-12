@@ -17,7 +17,7 @@ from utils.slack.slack_config import SLACK_BOT_TOKEN_ALERTS as SLACK_TOKEN
 
 logger = logging.getLogger(__name__)
 MODE = 'weekly'
-SLACK_CHANNEL = os.getenv('CS_REPORT_SLACK_CHANNEL', 'C0B4J9RBWDC')
+SLACK_CHANNEL = os.getenv('CS_REPORT_SLACK_CHANNEL', 'C0B075CBPS7')
 
 QUERY = r'''-- Customer Success Report v2 — single-row payload (newest-first comma series, 30d).
 -- §1 volume/automation, §2 TAT phases (trinity_ticket_tat), §3 CSAT+Reopen w/ counts.
