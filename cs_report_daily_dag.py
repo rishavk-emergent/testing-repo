@@ -4,7 +4,7 @@ Standalone DAG: queries BigQuery, renders 3 report sections as PNGs with matplot
 and posts them to Slack directly via files_upload_v2. No HTML, no headless Chrome,
 no external git repo. Schedule: 0 11 * * * (11 AM IST). Triggers: NONE.
 Slack: posts via utils.slack.slack_config.SLACK_BOT_TOKEN_ALERTS (shared bot, already
-provisioned in Composer). Channel via CS_REPORT_SLACK_CHANNEL env (default test channel).
+provisioned in Composer). Channel via CS_REPORT_SLACK_CHANNEL env (default cs-associates).
 PyPI deps: matplotlib, Pillow (Pillow present; matplotlib must be added to the Composer env).
 """
 from datetime import timedelta
@@ -361,11 +361,24 @@ def render_report(payload, mode):
                 prev=next((arr[j] for j in range(i+1,len(arr)) if arr[j] is not None),None)
                 return v,prev,(na[i] if i<len(na) else None)
         return None,None,None
+    def csat_window(pk,nk,start,days):
+        # pool GOOD/BAD counts across a window (don't average daily %): pct = sum(pos)/sum(n)
+        pos=_nums(d,pk); na=_nums(d,nk); P=0.0; N=0
+        for i in range(start, min(start+days, len(na))):
+            nv=na[i] if i<len(na) else None
+            pv=pos[i] if i<len(pos) else None
+            if nv and pv is not None: P+=pv/100.0*nv; N+=nv
+        return (100.0*P/N if N>0 else None), N
     cdefs=[('CSAT Overall','csat_pos','csat_n'),('OW CSAT','csat_pos_ow','csat_n_ow'),('Human CSAT','csat_pos_hu','csat_n_hu'),
            ('Human CSAT','csat_pos_hu','csat_n_hu'),('L1 Human CSAT','csat_pos_hu_L1','csat_n_hu_L1'),('L2 Human CSAT','csat_pos_hu_L2','csat_n_hu_L2')]
     for i,(lab,pk,nk) in enumerate(cdefs):
-        v,prev,nv=csat_latest(pk,nk); c,t=_delta(v,prev,'up_good')
-        _card(ax[i],lab,_fmt_pct(v),_fmt_int(nv)+' responses',c,t)
+        if weekly:
+            v,prev,nv=csat_latest(pk,nk); sub=_fmt_int(nv)+' responses'
+        else:
+            # daily: single-day CSAT is too thin -> pool the last 7 days, delta vs prior 7
+            v,nv=csat_window(pk,nk,0,7); prev,_=csat_window(pk,nk,7,7); sub=_fmt_int(nv)+' responses · last 7 days'
+        c,t=_delta(v,prev,'up_good')
+        _card(ax[i],lab,_fmt_pct(v),sub,c,t)
     for i,(lab,rk,nk) in enumerate([('Reopen Overall','reopen_rate','reopen_n'),('L1 Reopen','reopen_rate_L1','reopen_n_L1'),('L2 Reopen','reopen_rate_L2','reopen_n_L2')]):
         c,t=_delta(_y(d,rk),_yprev(d,rk),'down_good'); _card(ax[6+i],lab,_fmt_pct(_y(d,rk)),_fmt_int(_y(d,nk))+' tickets',c,t)
     cax=_charts(fig,2)
