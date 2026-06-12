@@ -85,7 +85,11 @@ m AS (
     ROUND(100.0*COUNTIF(NOT ow_solved AND tier='L2' AND csat_score=1)/NULLIF(COUNTIF(NOT ow_solved AND tier='L2' AND csat_score IS NOT NULL),0),1) AS csat_pos_hu_L2, COUNTIF(NOT ow_solved AND tier='L2' AND csat_score IS NOT NULL) AS csat_n_hu_L2,
     ROUND(100.0*COUNTIF(is_reopened)/NULLIF(COUNT(*),0),1) AS reopen_rate, COUNTIF(is_reopened) AS reopen_n,
     ROUND(100.0*COUNTIF(is_reopened AND tier='L1')/NULLIF(COUNTIF(tier='L1'),0),1) AS reopen_rate_L1, COUNTIF(is_reopened AND tier='L1') AS reopen_n_L1,
-    ROUND(100.0*COUNTIF(is_reopened AND tier='L2')/NULLIF(COUNTIF(tier='L2'),0),1) AS reopen_rate_L2, COUNTIF(is_reopened AND tier='L2') AS reopen_n_L2
+    ROUND(100.0*COUNTIF(is_reopened AND tier='L2')/NULLIF(COUNTIF(tier='L2'),0),1) AS reopen_rate_L2, COUNTIF(is_reopened AND tier='L2') AS reopen_n_L2,
+    ROUND(100.0*COUNTIF(is_reopened AND ow_solved)/NULLIF(COUNTIF(ow_solved),0),1) AS reopen_rate_ow, COUNTIF(is_reopened AND ow_solved) AS reopen_n_ow,
+    ROUND(100.0*COUNTIF(is_reopened AND NOT ow_solved)/NULLIF(COUNTIF(NOT ow_solved),0),1) AS reopen_rate_hu, COUNTIF(is_reopened AND NOT ow_solved) AS reopen_n_hu,
+    ROUND(100.0*COUNTIF(is_reopened AND NOT ow_solved AND tier='L1')/NULLIF(COUNTIF(NOT ow_solved AND tier='L1'),0),1) AS reopen_rate_hu_L1, COUNTIF(is_reopened AND NOT ow_solved AND tier='L1') AS reopen_n_hu_L1,
+    ROUND(100.0*COUNTIF(is_reopened AND NOT ow_solved AND tier='L2')/NULLIF(COUNTIF(NOT ow_solved AND tier='L2'),0),1) AS reopen_rate_hu_L2, COUNTIF(is_reopened AND NOT ow_solved AND tier='L2') AS reopen_n_hu_L2
   FROM c GROUP BY day
 )
 SELECT TO_JSON_STRING(STRUCT(
@@ -144,7 +148,15 @@ SELECT TO_JSON_STRING(STRUCT(
   STRING_AGG(IFNULL(CAST(reopen_rate_L1 AS STRING),''),',' ORDER BY day DESC) AS reopen_rate_L1,
   STRING_AGG(CAST(reopen_n_L1 AS STRING),',' ORDER BY day DESC) AS reopen_n_L1,
   STRING_AGG(IFNULL(CAST(reopen_rate_L2 AS STRING),''),',' ORDER BY day DESC) AS reopen_rate_L2,
-  STRING_AGG(CAST(reopen_n_L2 AS STRING),',' ORDER BY day DESC) AS reopen_n_L2
+  STRING_AGG(CAST(reopen_n_L2 AS STRING),',' ORDER BY day DESC) AS reopen_n_L2,
+  STRING_AGG(IFNULL(CAST(reopen_rate_ow AS STRING),''),',' ORDER BY day DESC) AS reopen_rate_ow,
+  STRING_AGG(CAST(reopen_n_ow AS STRING),',' ORDER BY day DESC) AS reopen_n_ow,
+  STRING_AGG(IFNULL(CAST(reopen_rate_hu AS STRING),''),',' ORDER BY day DESC) AS reopen_rate_hu,
+  STRING_AGG(CAST(reopen_n_hu AS STRING),',' ORDER BY day DESC) AS reopen_n_hu,
+  STRING_AGG(IFNULL(CAST(reopen_rate_hu_L1 AS STRING),''),',' ORDER BY day DESC) AS reopen_rate_hu_L1,
+  STRING_AGG(CAST(reopen_n_hu_L1 AS STRING),',' ORDER BY day DESC) AS reopen_n_hu_L1,
+  STRING_AGG(IFNULL(CAST(reopen_rate_hu_L2 AS STRING),''),',' ORDER BY day DESC) AS reopen_rate_hu_L2,
+  STRING_AGG(CAST(reopen_n_hu_L2 AS STRING),',' ORDER BY day DESC) AS reopen_n_hu_L2
 )) AS payload FROM m;'''
 
 # ===== CS Success Report renderer (pure Python: matplotlib -> PNG -> Slack) =====
@@ -264,19 +276,20 @@ def _masthead(fig,title,sub,period):
     fig.text(0.04,0.93,sub,color=SUB,fontsize=11,family='monospace',va='center')
     fig.text(0.96,0.95,period,color=SUB,fontsize=12,family='monospace',va='center',ha='right')
     fig.add_artist(Line2D([0.04,0.96],[0.905,0.905],color=INK,lw=1.2))
-def _cards(fig):
+def _cards(fig, rbs=(0.715,0.520,0.325), h=0.165, ncols=3):
     ax=[]
-    for rb in (0.715,0.520,0.325):     # rows raised; gives charts more height below
-        for c in range(3): ax.append(fig.add_axes([0.04+c*0.322,rb,0.30,0.165]))
+    x0,pitch,w = (0.04,0.322,0.30) if ncols==3 else (0.04,0.24,0.222)
+    for rb in rbs:
+        for c in range(ncols): ax.append(fig.add_axes([x0+c*pitch,rb,w,h]))
     return ax
-def _charts(fig,nc):
+def _charts(fig,nc,bottom=0.065,h=0.185):
     # charts align to the card columns above them
     out=[]
     if nc==3:
         xs=[0.04,0.362,0.684]; w=0.30
     else:
         xs=[0.04,0.522]; w=0.462
-    for c in range(nc): out.append(fig.add_axes([xs[c],0.065,w,0.185]))
+    for c in range(nc): out.append(fig.add_axes([xs[c],bottom,w,h]))
     return out
 def _png(fig):
     buf=io.BytesIO(); fig.savefig(buf,format='png',facecolor=BG); plt.close(fig); return buf.getvalue()
@@ -288,8 +301,13 @@ def render_report(payload, mode):
     title = 'WEEKLY CS REPORT' if weekly else 'CUSTOMER SUCCESS REPORT'
     period = _split(d,'period_label')[0]
     span = 'LAST 5 WEEKS' if weekly else 'LAST 7 DAYS'
-    starts = list(reversed(_split(d,'period_start')[:n]))
-    labels = [ (s.split('-')[2]+'/'+s.split('-')[1]) if len(s.split('-'))==3 else s for s in starts ]
+    if weekly:
+        # weekly: label each point with the full week range (e.g. 01/06-07/06) so it
+        # is never mistaken for "week start -> today"
+        labels = list(reversed(_split(d,'period_label')[:n]))
+    else:
+        starts = list(reversed(_split(d,'period_start')[:n]))
+        labels = [ (s.split('-')[2]+'/'+s.split('-')[1]) if len(s.split('-'))==3 else s for s in starts ]
     tiers=[('Total',''),('L1','_L1'),('L2','_L2')]
     def tat_series(key):
         return _series_gated(d,key,'tat_n',1500,n) if weekly else _series(d,key,n)
@@ -330,7 +348,7 @@ def render_report(payload, mode):
     out.append(('Resolution TAT',_png(fig)))
 
     # ---- §3 CSAT & Reopen ----
-    fig=_fig(); _masthead(fig,title,'CSAT & REOPEN',period); ax=_cards(fig)
+    fig=_fig(); _masthead(fig,title,'CSAT & REOPEN',period); ax=_cards(fig, ncols=4)
     def csat_latest(pk,nk):
         arr=_nums(d,pk); na=_nums(d,nk)
         for i,v in enumerate(arr):
@@ -346,16 +364,6 @@ def render_report(payload, mode):
             pv=pos[i] if i<len(pos) else None
             if nv and pv is not None: P+=pv/100.0*nv; N+=nv
         return (100.0*P/N if N>0 else None), N
-    cdefs=[('CSAT Overall','csat_pos','csat_n'),('OW CSAT','csat_pos_ow','csat_n_ow'),('Human CSAT','csat_pos_hu','csat_n_hu'),
-           ('Human CSAT','csat_pos_hu','csat_n_hu'),('L1 Human CSAT','csat_pos_hu_L1','csat_n_hu_L1'),('L2 Human CSAT','csat_pos_hu_L2','csat_n_hu_L2')]
-    for i,(lab,pk,nk) in enumerate(cdefs):
-        if weekly:
-            v,prev,nv=csat_latest(pk,nk); sub=_fmt_int(nv)+' responses'
-        else:
-            # daily: single-day CSAT is too thin -> pool the last 7 days, delta vs prior 7
-            v,nv=csat_window(pk,nk,0,7); prev,_=csat_window(pk,nk,7,7); sub=_fmt_int(nv)+' responses · last 7 days'
-        c,t=_delta(v,prev,'up_good')
-        _card(ax[i],lab,_fmt_pct(v),sub,c,t)
     def reopen_window(nk,dk,start,days):
         # pool reopened count / total handled across a window: rate = sum(reopened)/sum(total)
         num=_nums(d,nk); den=_nums(d,dk); N=0; D=0
@@ -363,14 +371,28 @@ def render_report(payload, mode):
             nv=num[i] if i<len(num) else None; dv=den[i] if i<len(den) else None
             if nv is not None and dv: N+=nv; D+=dv
         return (100.0*N/D if D>0 else None), N
-    reo=[('Reopen Overall','reopen_rate','reopen_n','closed'),('L1 Reopen','reopen_rate_L1','reopen_n_L1','total_L1'),('L2 Reopen','reopen_rate_L2','reopen_n_L2','total_L2')]
-    for i,(lab,rk,nk,dk) in enumerate(reo):
+    def _csat_card(axn,lab,pk,nk):
         if weekly:
-            val=_y(d,rk); prev=_yprev(d,rk); nv=_y(d,nk); sub=_fmt_int(nv)+' tickets'
+            v,prev,nv=csat_latest(pk,nk); sub=_fmt_int(nv)+' responses'
+        else:  # daily: single-day CSAT too thin -> pool last 7 days
+            v,nv=csat_window(pk,nk,0,7); prev,_=csat_window(pk,nk,7,7); sub=_fmt_int(nv)+' responses · last 7 days'
+        cc,tt=_delta(v,prev,'up_good'); _card(axn,lab,_fmt_pct(v),sub,cc,tt)
+    def _reopen_card(axn,lab,rk,nk,dk):
+        if weekly:
+            val=_y(d,rk); prev=_yprev(d,rk); nv=_y(d,nk); sub=_fmt_int(nv)+' reopened'
         else:
             val,nv=reopen_window(nk,dk,0,7); prev,_=reopen_window(nk,dk,7,7); sub=_fmt_int(nv)+' reopened · last 7 days'
-        c,t=_delta(val,prev,'down_good')
-        _card(ax[6+i],lab,_fmt_pct(val),sub,c,t)
+        cc,tt=_delta(val,prev,'down_good'); _card(axn,lab,_fmt_pct(val),sub,cc,tt)
+    # 3 rows x 4 columns — each column is a metric group (transposed)
+    col_csat   =[('CSAT Overall','csat_pos','csat_n'),('OW CSAT','csat_pos_ow','csat_n_ow'),('Human CSAT','csat_pos_hu','csat_n_hu')]
+    col_csat_t =[('Human CSAT','csat_pos_hu','csat_n_hu'),('L1 Human CSAT','csat_pos_hu_L1','csat_n_hu_L1'),('L2 Human CSAT','csat_pos_hu_L2','csat_n_hu_L2')]
+    col_reo    =[('Reopen Overall','reopen_rate','reopen_n','closed'),('OW Reopen','reopen_rate_ow','reopen_n_ow','overwatch_total'),('Human Reopen','reopen_rate_hu','reopen_n_hu','human_total')]
+    col_reo_t  =[('Human Reopen','reopen_rate_hu','reopen_n_hu','human_total'),('L1 Human Reopen','reopen_rate_hu_L1','reopen_n_hu_L1','human_L1'),('L2 Human Reopen','reopen_rate_hu_L2','reopen_n_hu_L2','human_L2')]
+    for r in range(3):
+        _csat_card(ax[r*4+0], *col_csat[r])
+        _csat_card(ax[r*4+1], *col_csat_t[r])
+        _reopen_card(ax[r*4+2], *col_reo[r])
+        _reopen_card(ax[r*4+3], *col_reo_t[r])
     cax=_charts(fig,2)
     _chart(cax[0],labels,[{'data':csat_series('csat_pos','csat_n'),'color':GREENC,'label':'Overall'},{'data':csat_series('csat_pos_ow','csat_n_ow'),'color':BLUE,'label':'OW'},{'data':csat_series('csat_pos_hu','csat_n_hu'),'color':PINK,'label':'Human'}],'%',0,100,title='CSAT % POSITIVE')
     _chart(cax[1],labels,[{'data':_series(d,'reopen_rate',n),'color':AMBERC,'label':'Overall'},{'data':_series(d,'reopen_rate_L1',n),'color':BLUE,'label':'L1'},{'data':_series(d,'reopen_rate_L2',n),'color':PURPLE,'label':'L2'}],'%',0,title='REOPEN RATE')
