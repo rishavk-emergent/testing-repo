@@ -3,8 +3,9 @@ CS Customer Success Report - DAILY (pure-Python image report).
 Standalone DAG: queries BigQuery, renders 3 report sections as PNGs with matplotlib,
 and posts them to Slack directly via files_upload_v2. No HTML, no headless Chrome,
 no external git repo. Schedule: 0 11 * * * (11 AM IST). Triggers: NONE.
-Composer env: CS_REPORT_SLACK_TOKEN (bot token, Secret Manager), CS_REPORT_SLACK_CHANNEL.
-PyPI deps: matplotlib, Pillow.
+Slack: posts via utils.slack.slack_config.SLACK_BOT_TOKEN_ALERTS (shared bot, already
+provisioned in Composer). Channel via CS_REPORT_SLACK_CHANNEL env (default test channel).
+PyPI deps: matplotlib, Pillow (Pillow present; matplotlib must be added to the Composer env).
 """
 from datetime import timedelta
 import logging, os
@@ -12,10 +13,10 @@ import pendulum
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 from utils.slack.bigquery_client import get_bigquery_client
+from utils.slack.slack_config import SLACK_BOT_TOKEN_ALERTS as SLACK_TOKEN
 
 logger = logging.getLogger(__name__)
 MODE = 'daily'
-SLACK_TOKEN = os.getenv('CS_REPORT_SLACK_TOKEN', '')
 SLACK_CHANNEL = os.getenv('CS_REPORT_SLACK_CHANNEL', 'C0B4J9RBWDC')
 
 QUERY = r'''-- Customer Success Report v2 — single-row payload (newest-first comma series, 30d).
@@ -412,8 +413,6 @@ def run_cs_report(**context):
     payload = r0['payload'] if isinstance(r0, dict) else r0.payload
     images = render_report(payload, MODE)
     caption = report_caption(payload, MODE)
-    if not SLACK_TOKEN:
-        raise Exception('CS_REPORT_SLACK_TOKEN not set')
     slack_upload_v2(SLACK_TOKEN, SLACK_CHANNEL, images, caption)
     logger.info('CS report %s posted to %s', MODE, SLACK_CHANNEL)
 
