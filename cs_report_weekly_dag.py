@@ -383,8 +383,21 @@ def render_report(payload, mode):
             v,nv=csat_window(pk,nk,0,7); prev,_=csat_window(pk,nk,7,7); sub=_fmt_int(nv)+' responses · last 7 days'
         c,t=_delta(v,prev,'up_good')
         _card(ax[i],lab,_fmt_pct(v),sub,c,t)
-    for i,(lab,rk,nk) in enumerate([('Reopen Overall','reopen_rate','reopen_n'),('L1 Reopen','reopen_rate_L1','reopen_n_L1'),('L2 Reopen','reopen_rate_L2','reopen_n_L2')]):
-        c,t=_delta(_y(d,rk),_yprev(d,rk),'down_good'); _card(ax[6+i],lab,_fmt_pct(_y(d,rk)),_fmt_int(_y(d,nk))+' tickets',c,t)
+    def reopen_window(nk,dk,start,days):
+        # pool reopened count / total handled across a window: rate = sum(reopened)/sum(total)
+        num=_nums(d,nk); den=_nums(d,dk); N=0; D=0
+        for i in range(start, min(start+days, len(num))):
+            nv=num[i] if i<len(num) else None; dv=den[i] if i<len(den) else None
+            if nv is not None and dv: N+=nv; D+=dv
+        return (100.0*N/D if D>0 else None), N
+    reo=[('Reopen Overall','reopen_rate','reopen_n','closed'),('L1 Reopen','reopen_rate_L1','reopen_n_L1','total_L1'),('L2 Reopen','reopen_rate_L2','reopen_n_L2','total_L2')]
+    for i,(lab,rk,nk,dk) in enumerate(reo):
+        if weekly:
+            val=_y(d,rk); prev=_yprev(d,rk); nv=_y(d,nk); sub=_fmt_int(nv)+' tickets'
+        else:
+            val,nv=reopen_window(nk,dk,0,7); prev,_=reopen_window(nk,dk,7,7); sub=_fmt_int(nv)+' reopened · last 7 days'
+        c,t=_delta(val,prev,'down_good')
+        _card(ax[6+i],lab,_fmt_pct(val),sub,c,t)
     cax=_charts(fig,2)
     _chart(cax[0],labels,[{'data':csat_series('csat_pos','csat_n'),'color':GREENC,'label':'Overall'},{'data':csat_series('csat_pos_ow','csat_n_ow'),'color':BLUE,'label':'OW'},{'data':csat_series('csat_pos_hu','csat_n_hu'),'color':PINK,'label':'Human'}],'%',0,100,title='CSAT % POSITIVE')
     _chart(cax[1],labels,[{'data':_series(d,'reopen_rate',n),'color':AMBERC,'label':'Overall'},{'data':_series(d,'reopen_rate_L1',n),'color':BLUE,'label':'L1'},{'data':_series(d,'reopen_rate_L2',n),'color':PURPLE,'label':'L2'}],'%',0,title='REOPEN RATE')
