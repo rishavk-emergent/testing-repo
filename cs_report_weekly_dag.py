@@ -1,11 +1,11 @@
 """
 CS Customer Success Report - WEEKLY (pure-Python image report).
-Standalone DAG: queries BigQuery (last 5 completed weeks), renders 3 report sections
-as PNGs with matplotlib, posts them to Slack via files_upload_v2. No HTML/Chrome/git.
-Schedule: 0 10 * * 1 (Mon 10 AM IST). Triggers: NONE.
-Slack: posts via utils.slack.slack_config.SLACK_BOT_TOKEN_ALERTS (shared bot, already
-provisioned in Composer). Channel via CS_REPORT_SLACK_CHANNEL env (default cs-associates).
-PyPI deps: matplotlib, Pillow (Pillow present; matplotlib must be added to the Composer env).
+Standalone DAG: queries BigQuery (Trinity v_overwatch_runs), last 5 completed weeks,
+renders 3 report sections as PNGs with matplotlib, posts via files_upload_v2. No HTML/Chrome/git.
+Schedule: 0 10 * * 1 (Mon 10 AM IST).
+Slack: posts via utils.slack.slack_config.SLACK_BOT_TOKEN_ALERTS (shared bot, provisioned
+in Composer). Channel via CS_REPORT_SLACK_CHANNEL env (default cs-associates).
+PyPI deps: matplotlib, Pillow (Pillow present; add matplotlib to the Composer env).
 """
 from datetime import timedelta
 import logging, os
@@ -19,160 +19,138 @@ logger = logging.getLogger(__name__)
 MODE = 'weekly'
 SLACK_CHANNEL = os.getenv('CS_REPORT_SLACK_CHANNEL', 'C0B075CBPS7')
 
-QUERY = r'''-- Customer Success Report v2 — single-row payload (newest-first comma series, 30d).
--- §1 volume/automation, §2 TAT phases (trinity_ticket_tat), §3 CSAT+Reopen w/ counts.
--- Bucketed by first-eval day. Deltas are computed in the renderer (today vs yesterday).
+QUERY = r'''-- Customer Success Report — WEEKLY payload (Trinity-sourced §1: v_overwatch_runs).
+-- Volume/automation/tier from v_overwatch_runs (ow_escalation_required / ow_support_level, MAX).
+-- TAT/CSAT/reopen via v_tickets.atlas_id. Last 5 completed weeks (floor 2026-05-04); older
+-- weeks are sparse until Trinity history backfills (charts gate on tat_n).
 DECLARE last_week_start DATE DEFAULT DATE_SUB(DATE_TRUNC(CURRENT_DATE('Asia/Kolkata'), WEEK(MONDAY)), INTERVAL 1 WEEK);
 DECLARE start_week DATE DEFAULT GREATEST(DATE_SUB(last_week_start, INTERVAL 9 WEEK), DATE_TRUNC(DATE('2026-05-04'), WEEK(MONDAY)));
-DECLARE win_start DATE DEFAULT start_week;
-DECLARE win_end   DATE DEFAULT DATE_ADD(last_week_start, INTERVAL 6 DAY);
-
 WITH
-cpst_latest AS (
-  SELECT c.id AS ticket_id, c.number,
-    COALESCE(NULLIF(c.support_level,'N/A'),'untagged') AS tier,
-    c.closed_at AS closed_at_epoch, c.created_at AS created_at_epoch
-  FROM `emergent-default.analytics.closed_pending_support_tickets` c
-  QUALIFY ROW_NUMBER() OVER (PARTITION BY c.id ORDER BY c.sync_timestamp DESC)=1
+runs AS (
+  SELECT ticket_id AS cid,
+    LOGICAL_OR(COALESCE(SAFE_CAST(ow_escalation_required AS BOOL),FALSE)) AS esc,
+    MAX(ow_support_level) AS tier,
+    DATE(MIN(created_at),'Asia/Kolkata') AS day,
+    ANY_VALUE(request_payload_customer_email) AS email
+  FROM `emergent-default.trinity_database.v_overwatch_runs`
+  WHERE ticket_id IS NOT NULL AND created_at IS NOT NULL GROUP BY ticket_id
 ),
-first_eval_per_ticket AS (
-  SELECT a.job_id AS ticket_id, DATE(MIN(a.started_at),'Asia/Kolkata') AS first_eval_day
-  FROM `emergent-default.overwatch_bq.v_ab_auto_send_audit` a
-  WHERE a.started_at IS NOT NULL AND a.conversation_id IS NOT NULL GROUP BY a.job_id
-),
-tat_latest AS (SELECT ticket_number, reopen_flag FROM `emergent-default.analytics.support_tickets_tat` QUALIFY ROW_NUMBER() OVER (PARTITION BY ticket_number ORDER BY timestamp DESC)=1),
-csat_trinity AS (
-  SELECT vt.atlas_id AS ticket_id, CASE WHEN cs.rating='GOOD' THEN 1 WHEN cs.rating='BAD' THEN 0 END AS csat_score
+spam AS (SELECT email, day FROM runs WHERE email IS NOT NULL AND email!='' GROUP BY email, day HAVING COUNT(DISTINCT cid)>10),
+vt AS (SELECT _id, atlas_id FROM `emergent-default.trinity_database.v_tickets` WHERE atlas_id IS NOT NULL QUALIFY ROW_NUMBER() OVER (PARTITION BY _id ORDER BY source_timestamp DESC)=1),
+cpst AS (SELECT id, number FROM `emergent-default.analytics.closed_pending_support_tickets` QUALIFY ROW_NUMBER() OVER (PARTITION BY id ORDER BY sync_timestamp DESC)=1),
+reop AS (SELECT ticket_number, reopen_flag FROM `emergent-default.analytics.support_tickets_tat` QUALIFY ROW_NUMBER() OVER (PARTITION BY ticket_number ORDER BY timestamp DESC)=1),
+csat AS (
+  SELECT vt2.atlas_id AS ticket_id, CASE WHEN cs.rating='GOOD' THEN 1 WHEN cs.rating='BAD' THEN 0 END AS s
   FROM `emergent-default.trinity_database.v_csat_surveys` cs
-  JOIN (SELECT _id,atlas_id FROM `emergent-default.trinity_database.v_tickets` WHERE atlas_id IS NOT NULL QUALIFY ROW_NUMBER() OVER (PARTITION BY _id ORDER BY source_timestamp DESC)=1) vt ON vt._id=cs.ticket_id
-  WHERE cs.rating IS NOT NULL QUALIFY ROW_NUMBER() OVER (PARTITION BY vt.atlas_id ORDER BY cs.rated_at DESC)=1
+  JOIN (SELECT _id,atlas_id FROM `emergent-default.trinity_database.v_tickets` WHERE atlas_id IS NOT NULL QUALIFY ROW_NUMBER() OVER (PARTITION BY _id ORDER BY source_timestamp DESC)=1) vt2 ON vt2._id=cs.ticket_id
+  WHERE cs.rating IS NOT NULL QUALIFY ROW_NUMBER() OVER (PARTITION BY vt2.atlas_id ORDER BY cs.rated_at DESC)=1
 ),
-conv_email AS (SELECT job_id AS ticket_id, ANY_VALUE(customer_email) AS customer_email FROM `emergent-default.overwatch_bq.v_oracle_triggers` WHERE job_id IS NOT NULL GROUP BY job_id),
-spam_pairs AS (SELECT ce.customer_email, fe.first_eval_day FROM conv_email ce INNER JOIN first_eval_per_ticket fe USING(ticket_id) WHERE ce.customer_email IS NOT NULL GROUP BY ce.customer_email, fe.first_eval_day HAVING COUNT(DISTINCT ce.ticket_id)>10),
-spam_tickets AS (SELECT DISTINCT ce.ticket_id FROM conv_email ce INNER JOIN first_eval_per_ticket fe USING(ticket_id) INNER JOIN spam_pairs sp ON sp.customer_email=ce.customer_email AND sp.first_eval_day=fe.first_eval_day),
-audit_per_ticket AS (
-  SELECT a.job_id AS ticket_id, COUNTIF(LOWER(IFNULL(JSON_VALUE(a.checks,'$.escalation_required'),''))='true') AS escalation_count
-  FROM `emergent-default.overwatch_bq.v_ab_auto_send_audit` a INNER JOIN first_eval_per_ticket fe ON fe.ticket_id=a.job_id WHERE a.conversation_id IS NOT NULL GROUP BY a.job_id
+tat AS (
+  SELECT vt3.atlas_id AS ticket_id, t.time1 AS ow_t, t.time3 AS hufrt_raw, (t.time1+t.time3) AS frt_raw
+  FROM (SELECT ticket_id,time1,time3 FROM `emergent-default.support.trinity_ticket_tat` QUALIFY ROW_NUMBER() OVER (PARTITION BY ticket_id ORDER BY sync_timestamp DESC)=1) t
+  JOIN (SELECT _id,atlas_id FROM `emergent-default.trinity_database.v_tickets` WHERE atlas_id IS NOT NULL QUALIFY ROW_NUMBER() OVER (PARTITION BY _id ORDER BY source_timestamp DESC)=1) vt3 ON vt3._id=t.ticket_id
 ),
--- Trinity TAT phase split, mapped to atlas ticket id
-ticket_tat AS (
-  SELECT vt.atlas_id AS ticket_id, t.time1 AS ow_t, t.time3 AS hufrt_t, (t.time1 + t.time3) AS frt_t
-  FROM (SELECT ticket_id, time1, time2, time3 FROM `emergent-default.support.trinity_ticket_tat` QUALIFY ROW_NUMBER() OVER (PARTITION BY ticket_id ORDER BY sync_timestamp DESC)=1) t
-  JOIN (SELECT _id, atlas_id FROM `emergent-default.trinity_database.v_tickets` WHERE atlas_id IS NOT NULL QUALIFY ROW_NUMBER() OVER (PARTITION BY _id ORDER BY source_timestamp DESC)=1) vt ON vt._id = t.ticket_id
+c AS (
+  SELECT DATE_TRUNC(r.day, WEEK(MONDAY)) AS wk, COALESCE(r.tier,'untagged') AS tier, (NOT r.esc) AS ow_solved,
+    csat.s AS csat_score, IFNULL(reop.reopen_flag,0)=1 AS is_reopened,
+    tat.ow_t AS ow_t, IF(r.esc, tat.hufrt_raw, NULL) AS hufrt_t, IF(r.esc, tat.frt_raw, NULL) AS frt_t
+  FROM runs r
+  LEFT JOIN spam sp ON sp.email=r.email AND sp.day=r.day
+  LEFT JOIN vt ON vt._id=r.cid
+  LEFT JOIN cpst ON cpst.id=vt.atlas_id
+  LEFT JOIN reop ON reop.ticket_number=cpst.number
+  LEFT JOIN csat ON csat.ticket_id=vt.atlas_id
+  LEFT JOIN tat  ON tat.ticket_id=vt.atlas_id
+  WHERE r.day BETWEEN start_week AND DATE_ADD(last_week_start, INTERVAL 6 DAY) AND sp.email IS NULL
 ),
-closures AS (
-  SELECT fe.ticket_id, COALESCE(cl.tier,'untagged') AS tier, DATE_TRUNC(fe.first_eval_day, WEEK(MONDAY)) AS day,
-    (IFNULL(ap.escalation_count,0)=0) AS ow_solved,
-    ct.csat_score, IFNULL(tt.reopen_flag,0)=1 AS is_reopened,
-    tat.ow_t, IF(IFNULL(ap.escalation_count,0)=0, NULL, tat.hufrt_t) AS hufrt_t, IF(IFNULL(ap.escalation_count,0)=0, NULL, tat.frt_t) AS frt_t
-  FROM first_eval_per_ticket fe
-  LEFT JOIN cpst_latest cl ON cl.ticket_id=fe.ticket_id
-  LEFT JOIN tat_latest tt ON tt.ticket_number=cl.number
-  LEFT JOIN csat_trinity ct ON ct.ticket_id=fe.ticket_id
-  LEFT JOIN audit_per_ticket ap ON ap.ticket_id=fe.ticket_id
-  LEFT JOIN ticket_tat tat ON tat.ticket_id=fe.ticket_id
-  WHERE fe.first_eval_day BETWEEN win_start AND win_end AND fe.ticket_id NOT IN (SELECT ticket_id FROM spam_tickets)
-),
-week_scaffold AS (SELECT w AS day FROM UNNEST(GENERATE_DATE_ARRAY(start_week, last_week_start, INTERVAL 1 WEEK)) AS w),
 m AS (
-  SELECT s.day AS day,
-    CONCAT(FORMAT_DATE('%d/%m', s.day),'-',FORMAT_DATE('%d/%m', DATE_ADD(s.day, INTERVAL 6 DAY))) AS period_label,
-    FORMAT_DATE('%Y-%m-%d', s.day) AS period_start,
-    -- §1
-    COUNTIF(c.ticket_id IS NOT NULL) AS closed,
-    COUNTIF(c.ow_solved) AS overwatch_total,
-    COUNTIF(NOT c.ow_solved AND c.ticket_id IS NOT NULL) AS human_total,
-    ROUND(100.0*COUNTIF(c.ow_solved)/NULLIF(COUNTIF(c.ticket_id IS NOT NULL),0),1) AS pct_overwatch,
-    ROUND(100.0*COUNTIF(NOT c.ow_solved AND c.ticket_id IS NOT NULL)/NULLIF(COUNTIF(c.ticket_id IS NOT NULL),0),1) AS pct_human,
-    COUNTIF(c.tier='L1') AS total_L1, COUNTIF(c.ow_solved AND c.tier='L1') AS overwatch_L1, COUNTIF(NOT c.ow_solved AND c.tier='L1') AS human_L1,
-    COUNTIF(c.tier='L2') AS total_L2, COUNTIF(c.ow_solved AND c.tier='L2') AS overwatch_L2, COUNTIF(NOT c.ow_solved AND c.tier='L2') AS human_L2,
-    COUNTIF(c.ow_t IS NOT NULL) AS tat_n,
-    -- §2 created->OW (time1), all tickets
-    ROUND(APPROX_QUANTILES(c.ow_t,100)[OFFSET(50)],1) AS ow_p50, ROUND(APPROX_QUANTILES(c.ow_t,100)[OFFSET(75)],1) AS ow_p75, ROUND(APPROX_QUANTILES(c.ow_t,100)[OFFSET(90)],1) AS ow_p90,
-    ROUND(APPROX_QUANTILES(IF(c.tier='L1',c.ow_t,NULL),100)[OFFSET(50)],1) AS ow_p50_L1, ROUND(APPROX_QUANTILES(IF(c.tier='L1',c.ow_t,NULL),100)[OFFSET(75)],1) AS ow_p75_L1, ROUND(APPROX_QUANTILES(IF(c.tier='L1',c.ow_t,NULL),100)[OFFSET(90)],1) AS ow_p90_L1,
-    ROUND(APPROX_QUANTILES(IF(c.tier='L2',c.ow_t,NULL),100)[OFFSET(50)],1) AS ow_p50_L2, ROUND(APPROX_QUANTILES(IF(c.tier='L2',c.ow_t,NULL),100)[OFFSET(75)],1) AS ow_p75_L2, ROUND(APPROX_QUANTILES(IF(c.tier='L2',c.ow_t,NULL),100)[OFFSET(90)],1) AS ow_p90_L2,
-    -- §2 esc->first human resolution (time3), human tickets only
-    ROUND(APPROX_QUANTILES(c.hufrt_t,100)[OFFSET(50)],1) AS hufrt_p50, ROUND(APPROX_QUANTILES(c.hufrt_t,100)[OFFSET(75)],1) AS hufrt_p75, ROUND(APPROX_QUANTILES(c.hufrt_t,100)[OFFSET(90)],1) AS hufrt_p90,
-    ROUND(APPROX_QUANTILES(IF(c.tier='L1',c.hufrt_t,NULL),100)[OFFSET(50)],1) AS hufrt_p50_L1, ROUND(APPROX_QUANTILES(IF(c.tier='L1',c.hufrt_t,NULL),100)[OFFSET(75)],1) AS hufrt_p75_L1, ROUND(APPROX_QUANTILES(IF(c.tier='L1',c.hufrt_t,NULL),100)[OFFSET(90)],1) AS hufrt_p90_L1,
-    ROUND(APPROX_QUANTILES(IF(c.tier='L2',c.hufrt_t,NULL),100)[OFFSET(50)],1) AS hufrt_p50_L2, ROUND(APPROX_QUANTILES(IF(c.tier='L2',c.hufrt_t,NULL),100)[OFFSET(75)],1) AS hufrt_p75_L2, ROUND(APPROX_QUANTILES(IF(c.tier='L2',c.hufrt_t,NULL),100)[OFFSET(90)],1) AS hufrt_p90_L2,
-    -- §2 created->human FRT (time1+3), escalated tickets only
-    ROUND(APPROX_QUANTILES(c.frt_t,100)[OFFSET(50)],1) AS frt_p50, ROUND(APPROX_QUANTILES(c.frt_t,100)[OFFSET(75)],1) AS frt_p75, ROUND(APPROX_QUANTILES(c.frt_t,100)[OFFSET(90)],1) AS frt_p90,
-    ROUND(APPROX_QUANTILES(IF(c.tier='L1',c.frt_t,NULL),100)[OFFSET(50)],1) AS frt_p50_L1, ROUND(APPROX_QUANTILES(IF(c.tier='L1',c.frt_t,NULL),100)[OFFSET(75)],1) AS frt_p75_L1, ROUND(APPROX_QUANTILES(IF(c.tier='L1',c.frt_t,NULL),100)[OFFSET(90)],1) AS frt_p90_L1,
-    ROUND(APPROX_QUANTILES(IF(c.tier='L2',c.frt_t,NULL),100)[OFFSET(50)],1) AS frt_p50_L2, ROUND(APPROX_QUANTILES(IF(c.tier='L2',c.frt_t,NULL),100)[OFFSET(75)],1) AS frt_p75_L2, ROUND(APPROX_QUANTILES(IF(c.tier='L2',c.frt_t,NULL),100)[OFFSET(90)],1) AS frt_p90_L2,
-    -- §3 CSAT % + response count
-    ROUND(100.0*COUNTIF(c.csat_score=1)/NULLIF(COUNTIF(c.csat_score IS NOT NULL),0),1) AS csat_pos, COUNTIF(c.csat_score IS NOT NULL) AS csat_n,
-    ROUND(100.0*COUNTIF(c.ow_solved AND c.csat_score=1)/NULLIF(COUNTIF(c.ow_solved AND c.csat_score IS NOT NULL),0),1) AS csat_pos_ow, COUNTIF(c.ow_solved AND c.csat_score IS NOT NULL) AS csat_n_ow,
-    ROUND(100.0*COUNTIF(NOT c.ow_solved AND c.ticket_id IS NOT NULL AND c.csat_score=1)/NULLIF(COUNTIF(NOT c.ow_solved AND c.ticket_id IS NOT NULL AND c.csat_score IS NOT NULL),0),1) AS csat_pos_hu, COUNTIF(NOT c.ow_solved AND c.ticket_id IS NOT NULL AND c.csat_score IS NOT NULL) AS csat_n_hu,
-    ROUND(100.0*COUNTIF(NOT c.ow_solved AND c.tier='L1' AND c.csat_score=1)/NULLIF(COUNTIF(NOT c.ow_solved AND c.tier='L1' AND c.csat_score IS NOT NULL),0),1) AS csat_pos_hu_L1, COUNTIF(NOT c.ow_solved AND c.tier='L1' AND c.csat_score IS NOT NULL) AS csat_n_hu_L1,
-    ROUND(100.0*COUNTIF(NOT c.ow_solved AND c.tier='L2' AND c.csat_score=1)/NULLIF(COUNTIF(NOT c.ow_solved AND c.tier='L2' AND c.csat_score IS NOT NULL),0),1) AS csat_pos_hu_L2, COUNTIF(NOT c.ow_solved AND c.tier='L2' AND c.csat_score IS NOT NULL) AS csat_n_hu_L2,
-    -- §3 Reopen % + count
-    ROUND(100.0*COUNTIF(c.is_reopened)/NULLIF(COUNTIF(c.ticket_id IS NOT NULL),0),1) AS reopen_rate, COUNTIF(c.is_reopened) AS reopen_n,
-    ROUND(100.0*COUNTIF(c.is_reopened AND c.tier='L1')/NULLIF(COUNTIF(c.tier='L1'),0),1) AS reopen_rate_L1, COUNTIF(c.is_reopened AND c.tier='L1') AS reopen_n_L1,
-    ROUND(100.0*COUNTIF(c.is_reopened AND c.tier='L2')/NULLIF(COUNTIF(c.tier='L2'),0),1) AS reopen_rate_L2, COUNTIF(c.is_reopened AND c.tier='L2') AS reopen_n_L2
-  FROM week_scaffold s
-  LEFT JOIN closures c ON c.day = s.day
-  GROUP BY s.day
+  SELECT wk AS day,
+    CONCAT(FORMAT_DATE('%d/%m', wk),'-',FORMAT_DATE('%d/%m', DATE_ADD(wk, INTERVAL 6 DAY))) AS period_label,
+    FORMAT_DATE('%Y-%m-%d', wk) AS period_start,
+    COUNT(*) AS closed, COUNTIF(ow_solved) AS overwatch_total, COUNTIF(NOT ow_solved) AS human_total,
+    ROUND(100.0*COUNTIF(ow_solved)/NULLIF(COUNT(*),0),1) AS pct_overwatch,
+    ROUND(100.0*COUNTIF(NOT ow_solved)/NULLIF(COUNT(*),0),1) AS pct_human,
+    COUNTIF(tier='L1') AS total_L1, COUNTIF(ow_solved AND tier='L1') AS overwatch_L1, COUNTIF(NOT ow_solved AND tier='L1') AS human_L1,
+    COUNTIF(tier='L2') AS total_L2, COUNTIF(ow_solved AND tier='L2') AS overwatch_L2, COUNTIF(NOT ow_solved AND tier='L2') AS human_L2,
+    COUNTIF(ow_t IS NOT NULL) AS tat_n,
+    ROUND(APPROX_QUANTILES(ow_t,100)[OFFSET(50)],1) AS ow_p50, ROUND(APPROX_QUANTILES(ow_t,100)[OFFSET(75)],1) AS ow_p75, ROUND(APPROX_QUANTILES(ow_t,100)[OFFSET(90)],1) AS ow_p90,
+    ROUND(APPROX_QUANTILES(IF(tier='L1',ow_t,NULL),100)[OFFSET(50)],1) AS ow_p50_L1, ROUND(APPROX_QUANTILES(IF(tier='L1',ow_t,NULL),100)[OFFSET(75)],1) AS ow_p75_L1, ROUND(APPROX_QUANTILES(IF(tier='L1',ow_t,NULL),100)[OFFSET(90)],1) AS ow_p90_L1,
+    ROUND(APPROX_QUANTILES(IF(tier='L2',ow_t,NULL),100)[OFFSET(50)],1) AS ow_p50_L2, ROUND(APPROX_QUANTILES(IF(tier='L2',ow_t,NULL),100)[OFFSET(75)],1) AS ow_p75_L2, ROUND(APPROX_QUANTILES(IF(tier='L2',ow_t,NULL),100)[OFFSET(90)],1) AS ow_p90_L2,
+    ROUND(APPROX_QUANTILES(hufrt_t,100)[OFFSET(50)],1) AS hufrt_p50, ROUND(APPROX_QUANTILES(hufrt_t,100)[OFFSET(75)],1) AS hufrt_p75, ROUND(APPROX_QUANTILES(hufrt_t,100)[OFFSET(90)],1) AS hufrt_p90,
+    ROUND(APPROX_QUANTILES(IF(tier='L1',hufrt_t,NULL),100)[OFFSET(50)],1) AS hufrt_p50_L1, ROUND(APPROX_QUANTILES(IF(tier='L1',hufrt_t,NULL),100)[OFFSET(75)],1) AS hufrt_p75_L1, ROUND(APPROX_QUANTILES(IF(tier='L1',hufrt_t,NULL),100)[OFFSET(90)],1) AS hufrt_p90_L1,
+    ROUND(APPROX_QUANTILES(IF(tier='L2',hufrt_t,NULL),100)[OFFSET(50)],1) AS hufrt_p50_L2, ROUND(APPROX_QUANTILES(IF(tier='L2',hufrt_t,NULL),100)[OFFSET(75)],1) AS hufrt_p75_L2, ROUND(APPROX_QUANTILES(IF(tier='L2',hufrt_t,NULL),100)[OFFSET(90)],1) AS hufrt_p90_L2,
+    ROUND(APPROX_QUANTILES(frt_t,100)[OFFSET(50)],1) AS frt_p50, ROUND(APPROX_QUANTILES(frt_t,100)[OFFSET(75)],1) AS frt_p75, ROUND(APPROX_QUANTILES(frt_t,100)[OFFSET(90)],1) AS frt_p90,
+    ROUND(APPROX_QUANTILES(IF(tier='L1',frt_t,NULL),100)[OFFSET(50)],1) AS frt_p50_L1, ROUND(APPROX_QUANTILES(IF(tier='L1',frt_t,NULL),100)[OFFSET(75)],1) AS frt_p75_L1, ROUND(APPROX_QUANTILES(IF(tier='L1',frt_t,NULL),100)[OFFSET(90)],1) AS frt_p90_L1,
+    ROUND(APPROX_QUANTILES(IF(tier='L2',frt_t,NULL),100)[OFFSET(50)],1) AS frt_p50_L2, ROUND(APPROX_QUANTILES(IF(tier='L2',frt_t,NULL),100)[OFFSET(75)],1) AS frt_p75_L2, ROUND(APPROX_QUANTILES(IF(tier='L2',frt_t,NULL),100)[OFFSET(90)],1) AS frt_p90_L2,
+    ROUND(100.0*COUNTIF(csat_score=1)/NULLIF(COUNTIF(csat_score IS NOT NULL),0),1) AS csat_pos, COUNTIF(csat_score IS NOT NULL) AS csat_n,
+    ROUND(100.0*COUNTIF(ow_solved AND csat_score=1)/NULLIF(COUNTIF(ow_solved AND csat_score IS NOT NULL),0),1) AS csat_pos_ow, COUNTIF(ow_solved AND csat_score IS NOT NULL) AS csat_n_ow,
+    ROUND(100.0*COUNTIF(NOT ow_solved AND csat_score=1)/NULLIF(COUNTIF(NOT ow_solved AND csat_score IS NOT NULL),0),1) AS csat_pos_hu, COUNTIF(NOT ow_solved AND csat_score IS NOT NULL) AS csat_n_hu,
+    ROUND(100.0*COUNTIF(NOT ow_solved AND tier='L1' AND csat_score=1)/NULLIF(COUNTIF(NOT ow_solved AND tier='L1' AND csat_score IS NOT NULL),0),1) AS csat_pos_hu_L1, COUNTIF(NOT ow_solved AND tier='L1' AND csat_score IS NOT NULL) AS csat_n_hu_L1,
+    ROUND(100.0*COUNTIF(NOT ow_solved AND tier='L2' AND csat_score=1)/NULLIF(COUNTIF(NOT ow_solved AND tier='L2' AND csat_score IS NOT NULL),0),1) AS csat_pos_hu_L2, COUNTIF(NOT ow_solved AND tier='L2' AND csat_score IS NOT NULL) AS csat_n_hu_L2,
+    ROUND(100.0*COUNTIF(is_reopened)/NULLIF(COUNT(*),0),1) AS reopen_rate, COUNTIF(is_reopened) AS reopen_n,
+    ROUND(100.0*COUNTIF(is_reopened AND tier='L1')/NULLIF(COUNTIF(tier='L1'),0),1) AS reopen_rate_L1, COUNTIF(is_reopened AND tier='L1') AS reopen_n_L1,
+    ROUND(100.0*COUNTIF(is_reopened AND tier='L2')/NULLIF(COUNTIF(tier='L2'),0),1) AS reopen_rate_L2, COUNTIF(is_reopened AND tier='L2') AS reopen_n_L2
+  FROM c GROUP BY wk
 )
 SELECT TO_JSON_STRING(STRUCT(
-  STRING_AGG(period_label, ',' ORDER BY day DESC) AS period_label,
-  STRING_AGG(period_start, ',' ORDER BY day DESC) AS period_start,
-  STRING_AGG(CAST(closed AS STRING), ',' ORDER BY day DESC) AS closed,
-  STRING_AGG(CAST(overwatch_total AS STRING), ',' ORDER BY day DESC) AS overwatch_total,
-  STRING_AGG(CAST(human_total AS STRING), ',' ORDER BY day DESC) AS human_total,
-  STRING_AGG(IFNULL(CAST(pct_overwatch AS STRING),''), ',' ORDER BY day DESC) AS pct_overwatch,
-  STRING_AGG(IFNULL(CAST(pct_human AS STRING),''), ',' ORDER BY day DESC) AS pct_human,
-  STRING_AGG(CAST(total_L1 AS STRING), ',' ORDER BY day DESC) AS total_L1,
-  STRING_AGG(CAST(overwatch_L1 AS STRING), ',' ORDER BY day DESC) AS overwatch_L1,
-  STRING_AGG(CAST(human_L1 AS STRING), ',' ORDER BY day DESC) AS human_L1,
-  STRING_AGG(CAST(total_L2 AS STRING), ',' ORDER BY day DESC) AS total_L2,
-  STRING_AGG(CAST(overwatch_L2 AS STRING), ',' ORDER BY day DESC) AS overwatch_L2,
-  STRING_AGG(CAST(human_L2 AS STRING), ',' ORDER BY day DESC) AS human_L2,
-  STRING_AGG(CAST(tat_n AS STRING), ',' ORDER BY day DESC) AS tat_n,
-  STRING_AGG(IFNULL(CAST(ow_p50 AS STRING),''), ',' ORDER BY day DESC) AS ow_p50,
-  STRING_AGG(IFNULL(CAST(ow_p75 AS STRING),''), ',' ORDER BY day DESC) AS ow_p75,
-  STRING_AGG(IFNULL(CAST(ow_p90 AS STRING),''), ',' ORDER BY day DESC) AS ow_p90,
-  STRING_AGG(IFNULL(CAST(ow_p50_L1 AS STRING),''), ',' ORDER BY day DESC) AS ow_p50_L1,
-  STRING_AGG(IFNULL(CAST(ow_p75_L1 AS STRING),''), ',' ORDER BY day DESC) AS ow_p75_L1,
-  STRING_AGG(IFNULL(CAST(ow_p90_L1 AS STRING),''), ',' ORDER BY day DESC) AS ow_p90_L1,
-  STRING_AGG(IFNULL(CAST(ow_p50_L2 AS STRING),''), ',' ORDER BY day DESC) AS ow_p50_L2,
-  STRING_AGG(IFNULL(CAST(ow_p75_L2 AS STRING),''), ',' ORDER BY day DESC) AS ow_p75_L2,
-  STRING_AGG(IFNULL(CAST(ow_p90_L2 AS STRING),''), ',' ORDER BY day DESC) AS ow_p90_L2,
-  STRING_AGG(IFNULL(CAST(hufrt_p50 AS STRING),''), ',' ORDER BY day DESC) AS hufrt_p50,
-  STRING_AGG(IFNULL(CAST(hufrt_p75 AS STRING),''), ',' ORDER BY day DESC) AS hufrt_p75,
-  STRING_AGG(IFNULL(CAST(hufrt_p90 AS STRING),''), ',' ORDER BY day DESC) AS hufrt_p90,
-  STRING_AGG(IFNULL(CAST(hufrt_p50_L1 AS STRING),''), ',' ORDER BY day DESC) AS hufrt_p50_L1,
-  STRING_AGG(IFNULL(CAST(hufrt_p75_L1 AS STRING),''), ',' ORDER BY day DESC) AS hufrt_p75_L1,
-  STRING_AGG(IFNULL(CAST(hufrt_p90_L1 AS STRING),''), ',' ORDER BY day DESC) AS hufrt_p90_L1,
-  STRING_AGG(IFNULL(CAST(hufrt_p50_L2 AS STRING),''), ',' ORDER BY day DESC) AS hufrt_p50_L2,
-  STRING_AGG(IFNULL(CAST(hufrt_p75_L2 AS STRING),''), ',' ORDER BY day DESC) AS hufrt_p75_L2,
-  STRING_AGG(IFNULL(CAST(hufrt_p90_L2 AS STRING),''), ',' ORDER BY day DESC) AS hufrt_p90_L2,
-  STRING_AGG(IFNULL(CAST(frt_p50 AS STRING),''), ',' ORDER BY day DESC) AS frt_p50,
-  STRING_AGG(IFNULL(CAST(frt_p75 AS STRING),''), ',' ORDER BY day DESC) AS frt_p75,
-  STRING_AGG(IFNULL(CAST(frt_p90 AS STRING),''), ',' ORDER BY day DESC) AS frt_p90,
-  STRING_AGG(IFNULL(CAST(frt_p50_L1 AS STRING),''), ',' ORDER BY day DESC) AS frt_p50_L1,
-  STRING_AGG(IFNULL(CAST(frt_p75_L1 AS STRING),''), ',' ORDER BY day DESC) AS frt_p75_L1,
-  STRING_AGG(IFNULL(CAST(frt_p90_L1 AS STRING),''), ',' ORDER BY day DESC) AS frt_p90_L1,
-  STRING_AGG(IFNULL(CAST(frt_p50_L2 AS STRING),''), ',' ORDER BY day DESC) AS frt_p50_L2,
-  STRING_AGG(IFNULL(CAST(frt_p75_L2 AS STRING),''), ',' ORDER BY day DESC) AS frt_p75_L2,
-  STRING_AGG(IFNULL(CAST(frt_p90_L2 AS STRING),''), ',' ORDER BY day DESC) AS frt_p90_L2,
-  STRING_AGG(IFNULL(CAST(csat_pos AS STRING),''), ',' ORDER BY day DESC) AS csat_pos,
-  STRING_AGG(CAST(csat_n AS STRING), ',' ORDER BY day DESC) AS csat_n,
-  STRING_AGG(IFNULL(CAST(csat_pos_ow AS STRING),''), ',' ORDER BY day DESC) AS csat_pos_ow,
-  STRING_AGG(CAST(csat_n_ow AS STRING), ',' ORDER BY day DESC) AS csat_n_ow,
-  STRING_AGG(IFNULL(CAST(csat_pos_hu AS STRING),''), ',' ORDER BY day DESC) AS csat_pos_hu,
-  STRING_AGG(CAST(csat_n_hu AS STRING), ',' ORDER BY day DESC) AS csat_n_hu,
-  STRING_AGG(IFNULL(CAST(csat_pos_hu_L1 AS STRING),''), ',' ORDER BY day DESC) AS csat_pos_hu_L1,
-  STRING_AGG(CAST(csat_n_hu_L1 AS STRING), ',' ORDER BY day DESC) AS csat_n_hu_L1,
-  STRING_AGG(IFNULL(CAST(csat_pos_hu_L2 AS STRING),''), ',' ORDER BY day DESC) AS csat_pos_hu_L2,
-  STRING_AGG(CAST(csat_n_hu_L2 AS STRING), ',' ORDER BY day DESC) AS csat_n_hu_L2,
-  STRING_AGG(IFNULL(CAST(reopen_rate AS STRING),''), ',' ORDER BY day DESC) AS reopen_rate,
-  STRING_AGG(CAST(reopen_n AS STRING), ',' ORDER BY day DESC) AS reopen_n,
-  STRING_AGG(IFNULL(CAST(reopen_rate_L1 AS STRING),''), ',' ORDER BY day DESC) AS reopen_rate_L1,
-  STRING_AGG(CAST(reopen_n_L1 AS STRING), ',' ORDER BY day DESC) AS reopen_n_L1,
-  STRING_AGG(IFNULL(CAST(reopen_rate_L2 AS STRING),''), ',' ORDER BY day DESC) AS reopen_rate_L2,
-  STRING_AGG(CAST(reopen_n_L2 AS STRING), ',' ORDER BY day DESC) AS reopen_n_L2
-)) AS payload
-FROM m;'''
+  STRING_AGG(period_label,',' ORDER BY day DESC) AS period_label,
+  STRING_AGG(period_start,',' ORDER BY day DESC) AS period_start,
+  STRING_AGG(CAST(closed AS STRING),',' ORDER BY day DESC) AS closed,
+  STRING_AGG(CAST(overwatch_total AS STRING),',' ORDER BY day DESC) AS overwatch_total,
+  STRING_AGG(CAST(human_total AS STRING),',' ORDER BY day DESC) AS human_total,
+  STRING_AGG(IFNULL(CAST(pct_overwatch AS STRING),''),',' ORDER BY day DESC) AS pct_overwatch,
+  STRING_AGG(IFNULL(CAST(pct_human AS STRING),''),',' ORDER BY day DESC) AS pct_human,
+  STRING_AGG(CAST(total_L1 AS STRING),',' ORDER BY day DESC) AS total_L1,
+  STRING_AGG(CAST(overwatch_L1 AS STRING),',' ORDER BY day DESC) AS overwatch_L1,
+  STRING_AGG(CAST(human_L1 AS STRING),',' ORDER BY day DESC) AS human_L1,
+  STRING_AGG(CAST(total_L2 AS STRING),',' ORDER BY day DESC) AS total_L2,
+  STRING_AGG(CAST(overwatch_L2 AS STRING),',' ORDER BY day DESC) AS overwatch_L2,
+  STRING_AGG(CAST(human_L2 AS STRING),',' ORDER BY day DESC) AS human_L2,
+  STRING_AGG(CAST(tat_n AS STRING),',' ORDER BY day DESC) AS tat_n,
+  STRING_AGG(IFNULL(CAST(ow_p50 AS STRING),''),',' ORDER BY day DESC) AS ow_p50,
+  STRING_AGG(IFNULL(CAST(ow_p75 AS STRING),''),',' ORDER BY day DESC) AS ow_p75,
+  STRING_AGG(IFNULL(CAST(ow_p90 AS STRING),''),',' ORDER BY day DESC) AS ow_p90,
+  STRING_AGG(IFNULL(CAST(ow_p50_L1 AS STRING),''),',' ORDER BY day DESC) AS ow_p50_L1,
+  STRING_AGG(IFNULL(CAST(ow_p75_L1 AS STRING),''),',' ORDER BY day DESC) AS ow_p75_L1,
+  STRING_AGG(IFNULL(CAST(ow_p90_L1 AS STRING),''),',' ORDER BY day DESC) AS ow_p90_L1,
+  STRING_AGG(IFNULL(CAST(ow_p50_L2 AS STRING),''),',' ORDER BY day DESC) AS ow_p50_L2,
+  STRING_AGG(IFNULL(CAST(ow_p75_L2 AS STRING),''),',' ORDER BY day DESC) AS ow_p75_L2,
+  STRING_AGG(IFNULL(CAST(ow_p90_L2 AS STRING),''),',' ORDER BY day DESC) AS ow_p90_L2,
+  STRING_AGG(IFNULL(CAST(hufrt_p50 AS STRING),''),',' ORDER BY day DESC) AS hufrt_p50,
+  STRING_AGG(IFNULL(CAST(hufrt_p75 AS STRING),''),',' ORDER BY day DESC) AS hufrt_p75,
+  STRING_AGG(IFNULL(CAST(hufrt_p90 AS STRING),''),',' ORDER BY day DESC) AS hufrt_p90,
+  STRING_AGG(IFNULL(CAST(hufrt_p50_L1 AS STRING),''),',' ORDER BY day DESC) AS hufrt_p50_L1,
+  STRING_AGG(IFNULL(CAST(hufrt_p75_L1 AS STRING),''),',' ORDER BY day DESC) AS hufrt_p75_L1,
+  STRING_AGG(IFNULL(CAST(hufrt_p90_L1 AS STRING),''),',' ORDER BY day DESC) AS hufrt_p90_L1,
+  STRING_AGG(IFNULL(CAST(hufrt_p50_L2 AS STRING),''),',' ORDER BY day DESC) AS hufrt_p50_L2,
+  STRING_AGG(IFNULL(CAST(hufrt_p75_L2 AS STRING),''),',' ORDER BY day DESC) AS hufrt_p75_L2,
+  STRING_AGG(IFNULL(CAST(hufrt_p90_L2 AS STRING),''),',' ORDER BY day DESC) AS hufrt_p90_L2,
+  STRING_AGG(IFNULL(CAST(frt_p50 AS STRING),''),',' ORDER BY day DESC) AS frt_p50,
+  STRING_AGG(IFNULL(CAST(frt_p75 AS STRING),''),',' ORDER BY day DESC) AS frt_p75,
+  STRING_AGG(IFNULL(CAST(frt_p90 AS STRING),''),',' ORDER BY day DESC) AS frt_p90,
+  STRING_AGG(IFNULL(CAST(frt_p50_L1 AS STRING),''),',' ORDER BY day DESC) AS frt_p50_L1,
+  STRING_AGG(IFNULL(CAST(frt_p75_L1 AS STRING),''),',' ORDER BY day DESC) AS frt_p75_L1,
+  STRING_AGG(IFNULL(CAST(frt_p90_L1 AS STRING),''),',' ORDER BY day DESC) AS frt_p90_L1,
+  STRING_AGG(IFNULL(CAST(frt_p50_L2 AS STRING),''),',' ORDER BY day DESC) AS frt_p50_L2,
+  STRING_AGG(IFNULL(CAST(frt_p75_L2 AS STRING),''),',' ORDER BY day DESC) AS frt_p75_L2,
+  STRING_AGG(IFNULL(CAST(frt_p90_L2 AS STRING),''),',' ORDER BY day DESC) AS frt_p90_L2,
+  STRING_AGG(IFNULL(CAST(csat_pos AS STRING),''),',' ORDER BY day DESC) AS csat_pos,
+  STRING_AGG(CAST(csat_n AS STRING),',' ORDER BY day DESC) AS csat_n,
+  STRING_AGG(IFNULL(CAST(csat_pos_ow AS STRING),''),',' ORDER BY day DESC) AS csat_pos_ow,
+  STRING_AGG(CAST(csat_n_ow AS STRING),',' ORDER BY day DESC) AS csat_n_ow,
+  STRING_AGG(IFNULL(CAST(csat_pos_hu AS STRING),''),',' ORDER BY day DESC) AS csat_pos_hu,
+  STRING_AGG(CAST(csat_n_hu AS STRING),',' ORDER BY day DESC) AS csat_n_hu,
+  STRING_AGG(IFNULL(CAST(csat_pos_hu_L1 AS STRING),''),',' ORDER BY day DESC) AS csat_pos_hu_L1,
+  STRING_AGG(CAST(csat_n_hu_L1 AS STRING),',' ORDER BY day DESC) AS csat_n_hu_L1,
+  STRING_AGG(IFNULL(CAST(csat_pos_hu_L2 AS STRING),''),',' ORDER BY day DESC) AS csat_pos_hu_L2,
+  STRING_AGG(CAST(csat_n_hu_L2 AS STRING),',' ORDER BY day DESC) AS csat_n_hu_L2,
+  STRING_AGG(IFNULL(CAST(reopen_rate AS STRING),''),',' ORDER BY day DESC) AS reopen_rate,
+  STRING_AGG(CAST(reopen_n AS STRING),',' ORDER BY day DESC) AS reopen_n,
+  STRING_AGG(IFNULL(CAST(reopen_rate_L1 AS STRING),''),',' ORDER BY day DESC) AS reopen_rate_L1,
+  STRING_AGG(CAST(reopen_n_L1 AS STRING),',' ORDER BY day DESC) AS reopen_n_L1,
+  STRING_AGG(IFNULL(CAST(reopen_rate_L2 AS STRING),''),',' ORDER BY day DESC) AS reopen_rate_L2,
+  STRING_AGG(CAST(reopen_n_L2 AS STRING),',' ORDER BY day DESC) AS reopen_n_L2
+)) AS payload FROM m;'''
 
 # ===== CS Success Report renderer (pure Python: matplotlib -> PNG -> Slack) =====
 # Shared, self-contained block embedded verbatim into both DAG files.
@@ -453,7 +431,7 @@ default_args = {
     'retries': 2, 'retry_delay': timedelta(minutes=3),
 }
 dag = DAG('cs_report_weekly', default_args=default_args,
-    description='Weekly CS Success Report (3 image sections) rendered in Python and posted to Slack',
+    description='Weekly CS Success Report (Trinity-sourced) rendered in Python and posted to Slack',
     schedule_interval='0 10 * * 1', catchup=False,
     tags=['slack','analytics','cs_metrics','reporting','images'])
 PythonOperator(task_id='build_and_post_cs_report_weekly', python_callable=run_cs_report, dag=dag)
