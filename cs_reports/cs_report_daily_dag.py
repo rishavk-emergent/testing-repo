@@ -1,11 +1,11 @@
 """
 CS Customer Success Report - DAILY (pure-Python image report).
 Standalone DAG: queries BigQuery (Trinity v_overwatch_runs for volume/automation/tier),
-renders 3 report sections as PNGs with matplotlib, posts them to Slack via files_upload_v2.
+renders 3 report sections as PNGs with Pillow, posts them to Slack via files_upload_v2.
 No HTML, no headless Chrome, no external git repo. Schedule: 0 11 * * * (11 AM IST).
 Slack: posts via utils.slack.slack_config.SLACK_BOT_TOKEN_ALERTS (shared bot, provisioned
 in Composer). Channel via CS_REPORT_SLACK_CHANNEL env (default cs-associates).
-PyPI deps: matplotlib, Pillow (Pillow present; add matplotlib to the Composer env).
+PyPI deps: Pillow only (already in Composer). Fonts (DejaVu TTFs) bundled under ./fonts.
 """
 from datetime import timedelta
 import logging, os
@@ -159,16 +159,55 @@ SELECT TO_JSON_STRING(STRUCT(
   STRING_AGG(CAST(reopen_n_hu_L2 AS STRING),',' ORDER BY day DESC) AS reopen_n_hu_L2
 )) AS payload FROM m;'''
 
-# ===== CS Success Report renderer (pure Python: matplotlib -> PNG -> Slack) =====
+# ===== CS Success Report renderer (pure Python: Pillow -> PNG -> Slack) =====
 # Shared, self-contained block embedded verbatim into both DAG files.
 # Public entry points: render_report(payload, mode) -> [(title, png_bytes)]
 #                      slack_upload_v2(token, channel, images, comment)
-import io, json, urllib.request, urllib.parse
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-from matplotlib.patches import Rectangle, FancyBboxPatch
-from matplotlib.lines import Line2D
+import io, json, os, urllib.request, urllib.parse
+from PIL import Image, ImageDraw, ImageFont
+
+# Pure-Pillow renderer (no matplotlib). Fonts: DejaVu TTFs bundled under ./fonts so
+# the only runtime dependency is Pillow (already present in Composer). System and
+# PIL-default fallbacks are tried if the bundled files are ever missing.
+W, H = 1650, 1050
+PT = 150 / 72.0  # matplotlib-point (at 150 dpi) -> pixels, keeps prior sizing
+
+_HERE = os.path.dirname(os.path.abspath(__file__)) if '__file__' in globals() else '.'
+_FONT_CANDS = {
+    'serif_bold': ['DejaVuSerif-Bold.ttf', '/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf', '/System/Library/Fonts/Supplemental/Georgia Bold.ttf'],
+    'mono':       ['DejaVuSansMono.ttf', '/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf', '/System/Library/Fonts/Menlo.ttc'],
+    'sans':       ['DejaVuSans.ttf', '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf', '/System/Library/Fonts/Helvetica.ttc'],
+    'sans_bold':  ['DejaVuSans-Bold.ttf', '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf', '/System/Library/Fonts/Supplemental/Arial Bold.ttf'],
+}
+_font_cache = {}
+def _font(family, pt):
+    px = max(8, int(round(pt * PT)))
+    key = (family, px)
+    if key in _font_cache: return _font_cache[key]
+    for cand in _FONT_CANDS.get(family, []):
+        path = cand if os.path.isabs(cand) else os.path.join(_HERE, 'fonts', cand)
+        try:
+            f = ImageFont.truetype(path, px); _font_cache[key] = f; return f
+        except Exception:
+            continue
+    f = ImageFont.load_default(); _font_cache[key] = f; return f
+
+def _rgb(c):
+    if isinstance(c, str): return c
+    return tuple(int(round(max(0.0, min(1.0, v)) * 255)) for v in c[:3])
+
+class _Canvas:
+    def __init__(self):
+        self.img = Image.new('RGB', (W, H), BG)
+        self.d = ImageDraw.Draw(self.img)
+    def text(self, xf, yf, s, color=None, fontsize=9, family='sans', fontweight=None, va='baseline', ha='left'):
+        fam = 'serif_bold' if (family == 'serif' and fontweight == 'bold') else ('mono' if family in ('monospace', 'mono') else ('sans_bold' if fontweight == 'bold' else 'sans'))
+        anchor = ('r' if ha == 'right' else ('m' if ha == 'center' else 'l')) + ('m' if va == 'center' else 's')
+        self.d.text((xf * W, (1 - yf) * H), s, font=_font(fam, fontsize), fill=_rgb(color if color is not None else SUB), anchor=anchor)
+
+class _Cell:
+    __slots__ = ('d', 'x', 'y', 'w', 'h')
+    def __init__(self, d, x, y, w, h): self.d = d; self.x = x; self.y = y; self.w = w; self.h = h
 
 BG='#0d1117'; CARD='#161b22'; BORDER='#30363d'; INK='#e6edf3'; SUB='#8b949e'
 RED=(0.973,0.318,0.286); GREEN=(0.247,0.725,0.314); GREY=(0.545,0.580,0.620)
@@ -223,76 +262,95 @@ def _series_gated(d,key,gate_key,thr,n):
         out.append(vals[i] if (g is not None and g>=thr) else None)
     return list(reversed(out))
 
-def _card(ax,label,value,sub,dcol,dtext):
-    ax.set_xlim(0,1); ax.set_ylim(0,1); ax.axis('off')
-    ax.add_patch(FancyBboxPatch((0.02,0.05),0.96,0.90,boxstyle="round,pad=0.008,rounding_size=0.025",lw=0.9,edgecolor=BORDER,facecolor=CARD,mutation_aspect=0.5))
-    ax.add_patch(Rectangle((0.03,0.945),0.94,0.018,color=dcol))   # thin accent line
-    ax.text(0.08,0.77,label.upper(),color=SUB,fontsize=8,family='monospace',va='center')
-    ax.text(0.08,0.50,value,color=INK,fontsize=19,fontweight='bold',family='serif',va='center')
-    ax.text(0.08,0.26,sub,color=SUB,fontsize=8.5,va='center')
-    ax.text(0.08,0.12,dtext,color=dcol,fontsize=8.5,family='monospace',va='center')
-def _tat_card(ax,d,label,ph,sfx):
-    ax.set_xlim(0,1); ax.set_ylim(0,1); ax.axis('off')
-    col,dt=_delta(_y(d,ph+'_p75'+sfx),_yprev(d,ph+'_p75'+sfx),'down_good')
-    ax.add_patch(FancyBboxPatch((0.02,0.05),0.96,0.90,boxstyle="round,pad=0.008,rounding_size=0.025",lw=0.9,edgecolor=BORDER,facecolor=CARD,mutation_aspect=0.5))
-    ax.add_patch(Rectangle((0.03,0.945),0.94,0.018,color=col))
-    ax.text(0.08,0.78,label.upper(),color=SUB,fontsize=8,family='monospace',va='center')
+def _card(cell,label,value,sub,dcol,dtext):
+    d=cell.d; x,y,w,h=cell.x,cell.y,cell.w,cell.h
+    d.rounded_rectangle([x,y,x+w,y+h],radius=12,fill=CARD,outline=BORDER,width=1)
+    dc=_rgb(dcol)
+    d.rectangle([x+10,y+8,x+w-10,y+13],fill=dc)              # thin accent line
+    tx=x+0.06*w
+    d.text((tx,y+0.23*h),label.upper(),font=_font('mono',8),fill=_rgb(SUB),anchor='lm')
+    d.text((tx,y+0.50*h),value,font=_font('serif_bold',19),fill=_rgb(INK),anchor='lm')
+    d.text((tx,y+0.74*h),sub,font=_font('sans',8.5),fill=_rgb(SUB),anchor='lm')
+    d.text((tx,y+0.88*h),dtext,font=_font('mono',8.5),fill=dc,anchor='lm')
+def _tat_card(cell,dd,label,ph,sfx):
+    d=cell.d; x,y,w,h=cell.x,cell.y,cell.w,cell.h
+    col,dt=_delta(_y(dd,ph+'_p75'+sfx),_yprev(dd,ph+'_p75'+sfx),'down_good')
+    cc=_rgb(col)
+    d.rounded_rectangle([x,y,x+w,y+h],radius=12,fill=CARD,outline=BORDER,width=1)
+    d.rectangle([x+10,y+8,x+w-10,y+13],fill=cc)
+    tx=x+0.06*w
+    d.text((tx,y+0.22*h),label.upper(),font=_font('mono',8),fill=_rgb(SUB),anchor='lm')
     for i,(nm,key) in enumerate([('p50','_p50'),('p75','_p75'),('p90','_p90')]):
-        x=0.10+i*0.30
-        ax.text(x,0.54,nm,color=SUB,fontsize=7.5,family='monospace',va='center')
-        ax.text(x,0.36,_fmt_tat(_y(d,ph+key+sfx)),color=INK,fontsize=13,fontweight='bold',family='serif',va='center')
-    ax.text(0.08,0.13,dt,color=col,fontsize=8,family='monospace',va='center')
-def _chart(ax,labels,series_list,unit='',ymin=0,ymax=None,title=None):
-    ax.set_facecolor(CARD)
-    for sp in ax.spines.values(): sp.set_color(BORDER); sp.set_linewidth(0.8)
-    ax.tick_params(colors=SUB,labelsize=7,length=0)
+        px=x+(0.10+i*0.30)*w
+        d.text((px,y+0.46*h),nm,font=_font('mono',7.5),fill=_rgb(SUB),anchor='lm')
+        d.text((px,y+0.64*h),_fmt_tat(_y(dd,ph+key+sfx)),font=_font('serif_bold',13),fill=_rgb(INK),anchor='lm')
+    d.text((tx,y+0.87*h),dt,font=_font('mono',8),fill=cc,anchor='lm')
+def _chart(cell,labels,series_list,unit='',ymin=0,ymax=None,title=None):
+    d=cell.d; x,y,w,h=cell.x,cell.y,cell.w,cell.h
+    d.rectangle([x,y,x+w,y+h],fill=CARD,outline=BORDER,width=1)
+    px0=x+38; px1=x+w-34; py0=y+14; py1=y+h-20
     allv=[v for s in series_list for v in s['data'] if v is not None]
     if allv:
         lo=ymin if ymin is not None else min(allv)*0.9
         hi=ymax if ymax is not None else max(allv)*1.4
         if hi<=lo: hi=lo+1
-        ax.set_ylim(lo,hi)
-        if ymax==100: ax.set_yticks([0,25,50,75,100])
-    n=len(labels); ax.set_xlim(-0.3,n-1+0.85)
+    else:
+        lo,hi=0,1
+    def Y(v): return py1-(v-lo)/(hi-lo)*(py1-py0)
+    n=len(labels)
+    def X(i): return px0+(px1-px0)*((i/(n-1)) if n>1 else 0.5)
+    ticks=[0,25,50,75,100] if ymax==100 else [lo+(hi-lo)*t for t in (0,0.25,0.5,0.75,1.0)]
+    ftk=_font('mono',7)
+    for tv in ticks:
+        if tv<lo-1e-9 or tv>hi+1e-9: continue
+        yy=Y(tv)
+        d.line([(px0,yy),(px1,yy)],fill=_rgb(BORDER),width=1)
+        d.text((px0-5,yy),'%d'%round(tv),font=ftk,fill=_rgb(SUB),anchor='rm')
     for s in series_list:
-        xv=[i for i,v in enumerate(s['data']) if v is not None]
-        yv=[v for v in s['data'] if v is not None]
-        ax.plot(xv,yv,marker='o',ms=2.6,lw=1.5,color=s['color'],label=s.get('label'),solid_capstyle='round')
-        if xv:
-            ax.annotate(('%.0f'%yv[-1])+unit,(xv[-1],yv[-1]),color=s['color'],fontsize=7,fontweight='bold',xytext=(4,0),textcoords='offset points',va='center')
-    ax.set_xticks(range(n)); ax.set_xticklabels(labels)
-    ax.grid(True,axis='y',color=BORDER,ls='-',lw=0.5,alpha=0.35); ax.set_axisbelow(True)
+        col=_rgb(s['color']); pts=[(X(i),Y(v)) for i,v in enumerate(s['data']) if v is not None]
+        if len(pts)>=2: d.line(pts,fill=col,width=2,joint='curve')
+        for p in pts: d.ellipse([p[0]-3,p[1]-3,p[0]+3,p[1]+3],fill=col)
+        if pts:
+            lastv=[v for v in s['data'] if v is not None][-1]
+            d.text((pts[-1][0]+5,pts[-1][1]),('%.0f'%lastv)+unit,font=_font('sans_bold',7),fill=col,anchor='lm')
+    fxl=_font('mono',7)
+    for i,lab in enumerate(labels):
+        d.text((X(i),py1+9),lab,font=fxl,fill=_rgb(SUB),anchor='mm')
     if title:
-        ax.text(0.0,1.08,title,transform=ax.transAxes,color=SUB,fontsize=7.5,family='monospace',va='bottom',ha='left')
-        ax.text(1.0,1.08,unit if unit else '%',transform=ax.transAxes,color=SUB,fontsize=7.5,family='monospace',va='bottom',ha='right')
+        d.text((px0,y-4),title,font=_font('mono',7.5),fill=_rgb(SUB),anchor='ls')
+        d.text((px1,y-4),unit if unit else '%',font=_font('mono',7.5),fill=_rgb(SUB),anchor='rs')
     if any(s.get('label') for s in series_list):
-        lg=ax.legend(loc='upper left',fontsize=6,frameon=False,ncol=len(series_list),handlelength=1.0,columnspacing=0.9,handletextpad=0.4,borderaxespad=0.2)
-        for txt in lg.get_texts(): txt.set_color(SUB)
+        lx=px0+2; ly=py0+7; fl=_font('sans',6.5)
+        for s in series_list:
+            if not s.get('label'): continue
+            col=_rgb(s['color'])
+            d.line([(lx,ly),(lx+12,ly)],fill=col,width=2)
+            d.ellipse([lx+4,ly-2,lx+8,ly+2],fill=col)
+            d.text((lx+16,ly),s['label'],font=fl,fill=_rgb(SUB),anchor='lm')
+            lx+=16+int(fl.getlength(s['label']))+14
 
-def _fig():
-    f=plt.figure(figsize=(11,7),dpi=150); f.patch.set_facecolor(BG); return f
+def _fig(): return _Canvas()
 def _masthead(fig,title,sub,period):
-    fig.text(0.04,0.965,title,color=INK,fontsize=22,fontweight='bold',family='serif',va='center')
+    fig.text(0.04,0.965,title,color=INK,fontsize=22,family='serif',fontweight='bold',va='center')
     fig.text(0.04,0.93,sub,color=SUB,fontsize=11,family='monospace',va='center')
     fig.text(0.96,0.95,period,color=SUB,fontsize=12,family='monospace',va='center',ha='right')
-    fig.add_artist(Line2D([0.04,0.96],[0.905,0.905],color=INK,lw=1.2))
+    yy=(1-0.905)*H
+    fig.d.line([(0.04*W,yy),(0.96*W,yy)],fill=_rgb(INK),width=2)
 def _cards(fig, rbs=(0.715,0.520,0.325), h=0.165, ncols=3):
-    ax=[]
+    cells=[]
     x0,pitch,w = (0.04,0.322,0.30) if ncols==3 else (0.04,0.24,0.222)
     for rb in rbs:
-        for c in range(ncols): ax.append(fig.add_axes([x0+c*pitch,rb,w,h]))
-    return ax
+        top=(1-(rb+h))*H; hpx=h*H
+        for c in range(ncols):
+            cells.append(_Cell(fig.d,(x0+c*pitch)*W,top,w*W,hpx))
+    return cells
 def _charts(fig,nc,bottom=0.065,h=0.185):
-    # charts align to the card columns above them
-    out=[]
-    if nc==3:
-        xs=[0.04,0.362,0.684]; w=0.30
-    else:
-        xs=[0.04,0.522]; w=0.462
-    for c in range(nc): out.append(fig.add_axes([xs[c],bottom,w,h]))
+    out=[]; top=(1-(bottom+h))*H; hpx=h*H
+    xs,w = ([0.04,0.362,0.684],0.30) if nc==3 else ([0.04,0.522],0.462)
+    for c in range(nc): out.append(_Cell(fig.d,xs[c]*W,top,w*W,hpx))
     return out
 def _png(fig):
-    buf=io.BytesIO(); fig.savefig(buf,format='png',facecolor=BG); plt.close(fig); return buf.getvalue()
+    buf=io.BytesIO(); fig.img.save(buf,format='PNG'); return buf.getvalue()
 
 def render_report(payload, mode):
     d=json.loads(payload) if isinstance(payload,str) else payload
