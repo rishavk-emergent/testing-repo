@@ -455,5 +455,6 @@ default_args = {
 dag = DAG('cs_report_weekly', default_args=default_args,
     description='Weekly CS Success Report (Trinity-sourced) rendered in Python and posted to Slack',
     schedule_interval='0 10 * * 1', catchup=False,
+    is_paused_upon_creation=False,  # deploy active so it fires on the next schedule without a manual unpause
     tags=['slack','analytics','cs_metrics','reporting','images'])
 PythonOperator(task_id='build_and_post_cs_report_weekly', python_callable=run_cs_report, dag=dag)
