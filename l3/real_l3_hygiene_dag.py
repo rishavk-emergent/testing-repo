@@ -20,7 +20,7 @@ Customer reply done?-> a public outbound message authored by the ESCALATOR after
                         replied, the escalator is still pinged.)
 Escalator -> Slack   -> v_agents.email -> Slack users.lookupByEmail (@mention).
 
-Window: only tickets escalated 1-3 h ago are considered, so at go-live we don't flood the
+Window: only tickets escalated 1-2 h ago are considered, so at go-live we don't flood the
 channel with the whole existing backlog; combined with the state table this gives each new
 escalation a single ping ~1-1.5 h after it happens.
 
@@ -47,7 +47,7 @@ SLACK_CHANNEL_ID = os.getenv('REAL_L3_HYGIENE_SLACK_CHANNEL', 'C0B075CBPS7')  # 
 REAL_L3_TAG_ID   = '6a1f2e835ad901b459b7665f'
 STATE_TABLE      = 'emergent-default.support.real_l3_hygiene_pinged'
 SLA_MINUTES      = 60    # ping only once the escalation is at least this old
-WINDOW_MINUTES   = 180   # ...and at most this old, so we never nag stale backlog
+WINDOW_MINUTES   = 120   # ...and at most this old (>2h = stale, no nag)
 
 # ==================== STATE TABLE (dedup) ====================
 DDL = f"""
