@@ -174,8 +174,10 @@ from PIL import Image, ImageDraw, ImageFont
 # Pure-Pillow renderer (no matplotlib). Fonts: DejaVu TTFs bundled under ./fonts so
 # the only runtime dependency is Pillow (already present in Composer). System and
 # PIL-default fallbacks are tried if the bundled files are ever missing.
-W, H = 1650, 1050
-PT = 150 / 72.0  # matplotlib-point (at 150 dpi) -> pixels, keeps prior sizing
+SS = 2                       # supersample: render at SSx, LANCZOS-downscale in _png (anti-aliasing)
+BASE_W, BASE_H = 1650, 1050
+W, H = BASE_W * SS, BASE_H * SS
+PT = (150 / 72.0) * SS       # matplotlib-point (at 150 dpi) -> pixels, keeps prior sizing
 
 _HERE = os.path.dirname(os.path.abspath(__file__)) if '__file__' in globals() else '.'
 _FONT_CANDS = {
@@ -269,9 +271,9 @@ def _series_gated(d,key,gate_key,thr,n):
 
 def _card(cell,label,value,sub,dcol,dtext):
     d=cell.d; x,y,w,h=cell.x,cell.y,cell.w,cell.h
-    d.rounded_rectangle([x,y,x+w,y+h],radius=12,fill=CARD,outline=BORDER,width=1)
+    d.rounded_rectangle([x,y,x+w,y+h],radius=12*SS,fill=CARD,outline=BORDER,width=SS)
     dc=_rgb(dcol)
-    d.rectangle([x+10,y+8,x+w-10,y+13],fill=dc)              # thin accent line
+    d.rectangle([x+10*SS,y+8*SS,x+w-10*SS,y+13*SS],fill=dc)              # thin accent line
     tx=x+0.06*w
     d.text((tx,y+0.23*h),label.upper(),font=_font('mono',8),fill=_rgb(SUB),anchor='lm')
     d.text((tx,y+0.50*h),value,font=_font('serif_bold',19),fill=_rgb(INK),anchor='lm')
@@ -281,8 +283,8 @@ def _tat_card(cell,dd,label,ph,sfx):
     d=cell.d; x,y,w,h=cell.x,cell.y,cell.w,cell.h
     col,dt=_delta(_y(dd,ph+'_p75'+sfx),_yprev(dd,ph+'_p75'+sfx),'down_good')
     cc=_rgb(col)
-    d.rounded_rectangle([x,y,x+w,y+h],radius=12,fill=CARD,outline=BORDER,width=1)
-    d.rectangle([x+10,y+8,x+w-10,y+13],fill=cc)
+    d.rounded_rectangle([x,y,x+w,y+h],radius=12*SS,fill=CARD,outline=BORDER,width=SS)
+    d.rectangle([x+10*SS,y+8*SS,x+w-10*SS,y+13*SS],fill=cc)
     tx=x+0.06*w
     d.text((tx,y+0.22*h),label.upper(),font=_font('mono',8),fill=_rgb(SUB),anchor='lm')
     for i,(nm,key) in enumerate([('p50','_p50'),('p75','_p75'),('p90','_p90')]):
@@ -292,8 +294,8 @@ def _tat_card(cell,dd,label,ph,sfx):
     d.text((tx,y+0.87*h),dt,font=_font('mono',8),fill=cc,anchor='lm')
 def _chart(cell,labels,series_list,unit='',ymin=0,ymax=None,title=None):
     d=cell.d; x,y,w,h=cell.x,cell.y,cell.w,cell.h
-    d.rectangle([x,y,x+w,y+h],fill=CARD,outline=BORDER,width=1)
-    px0=x+38; px1=x+w-34; py0=y+14; py1=y+h-20
+    d.rectangle([x,y,x+w,y+h],fill=CARD,outline=BORDER,width=SS)
+    px0=x+38*SS; px1=x+w-34*SS; py0=y+14*SS; py1=y+h-20*SS
     allv=[v for s in series_list for v in s['data'] if v is not None]
     if allv:
         lo=ymin if ymin is not None else min(allv)*0.9
@@ -309,30 +311,30 @@ def _chart(cell,labels,series_list,unit='',ymin=0,ymax=None,title=None):
     for tv in ticks:
         if tv<lo-1e-9 or tv>hi+1e-9: continue
         yy=Y(tv)
-        d.line([(px0,yy),(px1,yy)],fill=_rgb(BORDER),width=1)
-        d.text((px0-5,yy),'%d'%round(tv),font=ftk,fill=_rgb(SUB),anchor='rm')
+        d.line([(px0,yy),(px1,yy)],fill=_rgb(BORDER),width=SS)
+        d.text((px0-5*SS,yy),'%d'%round(tv),font=ftk,fill=_rgb(SUB),anchor='rm')
     for s in series_list:
         col=_rgb(s['color']); pts=[(X(i),Y(v)) for i,v in enumerate(s['data']) if v is not None]
-        if len(pts)>=2: d.line(pts,fill=col,width=2,joint='curve')
-        for p in pts: d.ellipse([p[0]-3,p[1]-3,p[0]+3,p[1]+3],fill=col)
+        if len(pts)>=2: d.line(pts,fill=col,width=2*SS,joint='curve')
+        for p in pts: d.ellipse([p[0]-3*SS,p[1]-3*SS,p[0]+3*SS,p[1]+3*SS],fill=col)
         if pts:
             lastv=[v for v in s['data'] if v is not None][-1]
-            d.text((pts[-1][0]+5,pts[-1][1]),('%.0f'%lastv)+unit,font=_font('sans_bold',7),fill=col,anchor='lm')
+            d.text((pts[-1][0]+5*SS,pts[-1][1]),('%.0f'%lastv)+unit,font=_font('sans_bold',7),fill=col,anchor='lm')
     fxl=_font('mono',7)
     for i,lab in enumerate(labels):
-        d.text((X(i),py1+9),lab,font=fxl,fill=_rgb(SUB),anchor='mm')
+        d.text((X(i),py1+9*SS),lab,font=fxl,fill=_rgb(SUB),anchor='mm')
     if title:
-        d.text((px0,y-4),title,font=_font('mono',7.5),fill=_rgb(SUB),anchor='ls')
-        d.text((px1,y-4),unit if unit else '%',font=_font('mono',7.5),fill=_rgb(SUB),anchor='rs')
+        d.text((px0,y-4*SS),title,font=_font('mono',7.5),fill=_rgb(SUB),anchor='ls')
+        d.text((px1,y-4*SS),unit if unit else '%',font=_font('mono',7.5),fill=_rgb(SUB),anchor='rs')
     if any(s.get('label') for s in series_list):
-        lx=px0+2; ly=py0+7; fl=_font('sans',6.5)
+        lx=px0+2*SS; ly=py0+7*SS; fl=_font('sans',6.5)
         for s in series_list:
             if not s.get('label'): continue
             col=_rgb(s['color'])
-            d.line([(lx,ly),(lx+12,ly)],fill=col,width=2)
-            d.ellipse([lx+4,ly-2,lx+8,ly+2],fill=col)
-            d.text((lx+16,ly),s['label'],font=fl,fill=_rgb(SUB),anchor='lm')
-            lx+=16+int(fl.getlength(s['label']))+14
+            d.line([(lx,ly),(lx+12*SS,ly)],fill=col,width=2*SS)
+            d.ellipse([lx+4*SS,ly-2*SS,lx+8*SS,ly+2*SS],fill=col)
+            d.text((lx+16*SS,ly),s['label'],font=fl,fill=_rgb(SUB),anchor='lm')
+            lx+=16*SS+int(fl.getlength(s['label']))+14*SS
 
 def _fig(): return _Canvas()
 def _masthead(fig,title,sub,period):
@@ -340,7 +342,7 @@ def _masthead(fig,title,sub,period):
     fig.text(0.04,0.93,sub,color=SUB,fontsize=11,family='monospace',va='center')
     fig.text(0.96,0.95,period,color=SUB,fontsize=12,family='monospace',va='center',ha='right')
     yy=(1-0.905)*H
-    fig.d.line([(0.04*W,yy),(0.96*W,yy)],fill=_rgb(INK),width=2)
+    fig.d.line([(0.04*W,yy),(0.96*W,yy)],fill=_rgb(INK),width=2*SS)
 def _cards(fig, rbs=(0.715,0.520,0.325), h=0.165, ncols=3):
     cells=[]
     x0,pitch,w = (0.04,0.322,0.30) if ncols==3 else (0.04,0.24,0.222)
@@ -355,7 +357,9 @@ def _charts(fig,nc,bottom=0.065,h=0.185):
     for c in range(nc): out.append(_Cell(fig.d,xs[c]*W,top,w*W,hpx))
     return out
 def _png(fig):
-    buf=io.BytesIO(); fig.img.save(buf,format='PNG'); return buf.getvalue()
+    buf=io.BytesIO()
+    fig.img.resize((BASE_W, BASE_H), Image.LANCZOS).save(buf, format='PNG')  # downscale = anti-alias
+    return buf.getvalue()
 
 def render_report(payload, mode):
     d=json.loads(payload) if isinstance(payload,str) else payload
