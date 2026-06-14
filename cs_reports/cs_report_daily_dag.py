@@ -360,9 +360,9 @@ def render_report(payload, mode):
     period = _split(d,'period_label')[0]
     span = 'LAST 5 WEEKS' if weekly else 'LAST 7 DAYS'
     if weekly:
-        # weekly: label each point with the full week range (e.g. 01/06-07/06) so it
-        # is never mistaken for "week start -> today"
-        labels = list(reversed(_split(d,'period_label')[:n]))
+        # weekly: label each point with the week-END date only (e.g. 07/06). The end
+        # date is already in the past, so it isn't mistaken for "week start -> today".
+        labels = [ (p.split('-')[1] if '-' in p else p) for p in reversed(_split(d,'period_label')[:n]) ]
     else:
         starts = list(reversed(_split(d,'period_start')[:n]))
         labels = [ (s.split('-')[2]+'/'+s.split('-')[1]) if len(s.split('-'))==3 else s for s in starts ]
