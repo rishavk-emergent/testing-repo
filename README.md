@@ -10,15 +10,17 @@ readability — they do NOT exist in the deploy target).
 |--------------------------------------------|-------------------------------------------|
 | `l3/real_l3_open_pending_dag.py`           | `dags/real_l3_open_pending_dag.py`        |
 | `l3/l3_needs_review_dag.py`                | `dags/l3_needs_review_dag.py`             |
+| `l3/real_l3_hygiene_dag.py`                | `dags/real_l3_hygiene_dag.py`             |
 | `cs_reports/cs_report_daily_dag.py`        | `dags/cs_report_daily_dag.py`             |
 | `cs_reports/cs_report_weekly_dag.py`       | `dags/cs_report_weekly_dag.py`            |
-| `cs_reports/fonts/*.ttf`                   | `dags/fonts/*.ttf`                        |
 
 ## Status of the staged files
-- All four have `is_paused_upon_creation=False`.
+- All five are standalone single `.py` files with `is_paused_upon_creation=False`.
 - `real_l3_open_pending_dag.py` has `from __future__ import annotations` (Py3.8-safe).
-- `cs_reports/*` render with **Pillow only** (no matplotlib) — DejaVu fonts bundled
-  under `cs_reports/fonts/` (deploy to `dags/fonts/`). No Composer env change needed.
+- `cs_reports/*` render with **Pillow only** (no matplotlib); the DejaVu font is
+  embedded as base64 inside each file (no external files; Pillow >= 8.0).
+- `real_l3_hygiene_dag.py` writes a dedup state table `support.real_l3_hygiene_pinged`
+  and uses Slack `users.lookupByEmail` (bot scope `users:read.email`, already added).
 
 ## Workflow
 1. Make changes in the file under `l3/` or `cs_reports/`.
