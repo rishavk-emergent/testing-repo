@@ -149,7 +149,7 @@ def build_message(row, uid):
     return (
         ':rotating_light: *real_l3 escalation hygiene*\n'
         '%s · %s — missing: *%s*\n'
-        'Please complete: set the team, add the Slack link, and reply to the customer.'
+        'Please complete: set the team, add the Slack link, and reply to the customer if you are escalating a ticket to real_l3'
         % (who, link, miss)
     )
 
