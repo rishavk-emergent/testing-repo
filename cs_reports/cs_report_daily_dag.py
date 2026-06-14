@@ -5,7 +5,7 @@ renders 3 report sections as PNGs with Pillow, posts them to Slack via files_upl
 No HTML, no headless Chrome, no external git repo. Schedule: 0 11 * * * (11 AM IST).
 Slack: posts via utils.slack.slack_config.SLACK_BOT_TOKEN_ALERTS (shared bot, provisioned
 in Composer). Channel via CS_REPORT_SLACK_CHANNEL env (default cs-associates).
-PyPI deps: Pillow only (already in Composer). Fonts (DejaVu TTFs) bundled under ./fonts.
+PyPI deps: Pillow >= 10.1 only (already in Composer). Standalone - no external font files.
 """
 from datetime import timedelta
 import logging, os
@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 MODE = 'daily'
 SLACK_CHANNEL = os.getenv('CS_REPORT_SLACK_CHANNEL', 'C0B075CBPS7')
 
-QUERY = r'''-- Customer Success Report — DAILY payload (Trinity-sourced §1: v_overwatch_runs).
+QUERY = r'''-- Customer Success Report - DAILY payload (Trinity-sourced S1: v_overwatch_runs).
 -- Volume/automation/tier from v_overwatch_runs (ow_escalation_required / ow_support_level, MAX).
 -- TAT/CSAT/reopen re-keyed via v_tickets.atlas_id. Aligns with canonical CS query 36050.
 DECLARE end_day   DATE DEFAULT DATE_SUB(CURRENT_DATE('Asia/Kolkata'), INTERVAL 1 DAY);
@@ -166,33 +166,25 @@ SELECT TO_JSON_STRING(STRUCT(
 import io, json, os, urllib.request, urllib.parse
 from PIL import Image, ImageDraw, ImageFont
 
-# Pure-Pillow renderer (no matplotlib). Fonts: DejaVu TTFs bundled under ./fonts so
-# the only runtime dependency is Pillow (already present in Composer). System and
-# PIL-default fallbacks are tried if the bundled files are ever missing.
+# Pure-Pillow renderer (no matplotlib). Standalone: uses Pillow's built-in default
+# font (ImageFont.load_default), so there are NO external font files to ship -
+# just this one .py. Requires Pillow >= 10.1 (scalable default font + text anchors).
 SS = 2                       # supersample: render at SSx, LANCZOS-downscale in _png (anti-aliasing)
 BASE_W, BASE_H = 1650, 1050
 W, H = BASE_W * SS, BASE_H * SS
 PT = (150 / 72.0) * SS       # matplotlib-point (at 150 dpi) -> pixels, keeps prior sizing
 
-_HERE = os.path.dirname(os.path.abspath(__file__)) if '__file__' in globals() else '.'
-_FONT_CANDS = {
-    'serif_bold': ['DejaVuSerif-Bold.ttf', '/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf', '/System/Library/Fonts/Supplemental/Georgia Bold.ttf'],
-    'mono':       ['DejaVuSansMono.ttf', '/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf', '/System/Library/Fonts/Menlo.ttc'],
-    'sans':       ['DejaVuSans.ttf', '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf', '/System/Library/Fonts/Helvetica.ttc'],
-    'sans_bold':  ['DejaVuSans-Bold.ttf', '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf', '/System/Library/Fonts/Supplemental/Arial Bold.ttf'],
-}
 _font_cache = {}
 def _font(family, pt):
+    # family is ignored - Pillow's built-in font is a single typeface. Sizing only.
     px = max(8, int(round(pt * PT)))
-    key = (family, px)
-    if key in _font_cache: return _font_cache[key]
-    for cand in _FONT_CANDS.get(family, []):
-        path = cand if os.path.isabs(cand) else os.path.join(_HERE, 'fonts', cand)
-        try:
-            f = ImageFont.truetype(path, px); _font_cache[key] = f; return f
-        except Exception:
-            continue
-    f = ImageFont.load_default(); _font_cache[key] = f; return f
+    if px in _font_cache: return _font_cache[px]
+    try:
+        f = ImageFont.load_default(size=px)   # Pillow >= 10.1: scalable built-in font
+    except TypeError:
+        f = ImageFont.load_default()          # very old Pillow: small bitmap fallback
+    _font_cache[px] = f
+    return f
 
 def _rgb(c):
     if isinstance(c, str): return c
@@ -226,15 +218,15 @@ def _y(d,k):
 def _yprev(d,k):
     a=_nums(d,k); return a[1] if len(a)>1 else None
 def _fmt_int(n):
-    if n is None: return '–'
+    if n is None: return '-'
     try: return '{:,}'.format(int(round(float(n))))
-    except: return '–'
+    except: return '-'
 def _fmt_pct(n):
-    if n is None: return '–'
+    if n is None: return '-'
     try: return '{:.0f}%'.format(float(n))
-    except: return '–'
+    except: return '-'
 def _fmt_tat(n):
-    if n is None: return '–'
+    if n is None: return '-'
     m=float(n)
     if m<60: return '%dm'%round(m)
     h=m/60.0
@@ -246,16 +238,15 @@ def _pct_of(d,nk,dk,i=0):
     return None
 def _lerp(a,b,t): return tuple(a[i]+(b[i]-a[i])*t for i in range(3))
 def _delta(today,prev,direction):
-    if today is None or prev in (None,0): return GREY,'· no prev'
+    if today is None or prev in (None,0): return GREY,'no prev'
     diff=today-prev; pctc=diff/abs(prev)*100.0
-    arrow='▲' if diff>0 else ('▼' if diff<0 else '·')
     if direction=='neutral': col=GREY
     else:
         good=pctc if direction=='up_good' else -pctc
         t=max(-1.0,min(1.0,good/15.0))
         col=_lerp(GREY,GREEN,t) if t>=0 else _lerp(GREY,RED,-t)
     sign='+' if diff>0 else ''
-    return col,'%s %s%.0f%% vs prev'%(arrow,sign,pctc)
+    return col,'%s%.0f%% vs prev'%(sign,pctc)
 def _series(d,key,n): return list(reversed(_nums(d,key)[:n]))
 def _series_gated(d,key,gate_key,thr,n):
     vals=_nums(d,key)[:n]; gates=_nums(d,gate_key)[:n]; out=[]
@@ -377,7 +368,7 @@ def render_report(payload, mode):
         return _series_gated(d,key,nk,20,n) if weekly else _series(d,key,n)
     out=[]
 
-    # ---- §1 Volume & Automation ----
+    # ---- S1 Volume & Automation ----
     fig=_fig(); _masthead(fig,title,'VOLUME & AUTOMATION',period); ax=_cards(fig)
     for r,(tn,sfx) in enumerate(tiers):
         totk='closed' if not sfx else 'total'+sfx
@@ -394,22 +385,22 @@ def render_report(payload, mode):
         ow=[100.0*a/b if (a and b) else None for a,b in zip(_nums(d,'overwatch'+sfx)[:n],_nums(d,'total'+sfx)[:n])][::-1]
         hu=[100.0*a/b if (a and b) else None for a,b in zip(_nums(d,'human'+sfx)[:n],_nums(d,'total'+sfx)[:n])][::-1]
         _chart(cax[i],labels,[{'data':ow,'color':BLUE,'label':'OW%'},{'data':hu,'color':PINK,'label':'Human%'}],'%',0,100,title=nm)
-    fig.text(0.04,0.30,'— OW% vs HUMAN% · '+span,color=SUB,fontsize=9,family='monospace')
+    fig.text(0.04,0.30,'- OW% vs HUMAN% - '+span,color=SUB,fontsize=9,family='monospace')
     out.append(('Volume & Automation',_png(fig)))
 
-    # ---- §2 Resolution TAT ----
-    fig=_fig(); _masthead(fig,title,'RESOLUTION TAT · P50 / P75 / P90',period); ax=_cards(fig)
-    cols=[('Created→OW','ow'),('Esc→Human FRT','hufrt'),('Created→Human FRT','frt')]
+    # ---- S2 Resolution TAT ----
+    fig=_fig(); _masthead(fig,title,'RESOLUTION TAT - P50 / P75 / P90',period); ax=_cards(fig)
+    cols=[('Created->OW','ow'),('Esc->Human FRT','hufrt'),('Created->Human FRT','frt')]
     for r,(tn,sfx) in enumerate(tiers):
-        for cc,(cn,ph) in enumerate(cols): _tat_card(ax[r*3+cc],d,tn+' · '+cn,ph,sfx)
+        for cc,(cn,ph) in enumerate(cols): _tat_card(ax[r*3+cc],d,tn+' - '+cn,ph,sfx)
     cax=_charts(fig,3)
-    _chart(cax[0],labels,[{'data':tat_series('ow_p50'),'color':BLUE}],'m',0,title='CREATED → OW')
-    _chart(cax[1],labels,[{'data':tat_series('hufrt_p50'),'color':AMBERC}],'m',0,title='ESC → HUMAN FRT')
-    _chart(cax[2],labels,[{'data':tat_series('frt_p50'),'color':PINK}],'m',0,title='CREATED → HUMAN FRT')
-    fig.text(0.04,0.30,'— P50 TREND · '+span,color=SUB,fontsize=9,family='monospace')
+    _chart(cax[0],labels,[{'data':tat_series('ow_p50'),'color':BLUE}],'m',0,title='CREATED -> OW')
+    _chart(cax[1],labels,[{'data':tat_series('hufrt_p50'),'color':AMBERC}],'m',0,title='ESC -> HUMAN FRT')
+    _chart(cax[2],labels,[{'data':tat_series('frt_p50'),'color':PINK}],'m',0,title='CREATED -> HUMAN FRT')
+    fig.text(0.04,0.30,'- P50 TREND - '+span,color=SUB,fontsize=9,family='monospace')
     out.append(('Resolution TAT',_png(fig)))
 
-    # ---- §3 CSAT & Reopen ----
+    # ---- S3 CSAT & Reopen ----
     fig=_fig(); _masthead(fig,title,'CSAT & REOPEN',period); ax=_cards(fig, ncols=4)
     def csat_latest(pk,nk):
         arr=_nums(d,pk); na=_nums(d,nk)
@@ -437,15 +428,15 @@ def render_report(payload, mode):
         if weekly:
             v,prev,nv=csat_latest(pk,nk); sub=_fmt_int(nv)+' responses'
         else:  # daily: single-day CSAT too thin -> pool last 7 days
-            v,nv=csat_window(pk,nk,0,7); prev,_=csat_window(pk,nk,7,7); sub=_fmt_int(nv)+' responses · last 7 days'
+            v,nv=csat_window(pk,nk,0,7); prev,_=csat_window(pk,nk,7,7); sub=_fmt_int(nv)+' responses - last 7 days'
         cc,tt=_delta(v,prev,'up_good'); _card(axn,lab,_fmt_pct(v),sub,cc,tt)
     def _reopen_card(axn,lab,rk,nk,dk):
         if weekly:
             val=_y(d,rk); prev=_yprev(d,rk); nv=_y(d,nk); sub=_fmt_int(nv)+' reopened'
         else:
-            val,nv=reopen_window(nk,dk,0,7); prev,_=reopen_window(nk,dk,7,7); sub=_fmt_int(nv)+' reopened · last 7 days'
+            val,nv=reopen_window(nk,dk,0,7); prev,_=reopen_window(nk,dk,7,7); sub=_fmt_int(nv)+' reopened - last 7 days'
         cc,tt=_delta(val,prev,'down_good'); _card(axn,lab,_fmt_pct(val),sub,cc,tt)
-    # 3 rows x 4 columns — each column is a metric group (transposed)
+    # 3 rows x 4 columns - each column is a metric group (transposed)
     col_csat   =[('CSAT Overall','csat_pos','csat_n'),('OW CSAT','csat_pos_ow','csat_n_ow'),('Human CSAT','csat_pos_hu','csat_n_hu')]
     col_csat_t =[('Human CSAT','csat_pos_hu','csat_n_hu'),('L1 Human CSAT','csat_pos_hu_L1','csat_n_hu_L1'),('L2 Human CSAT','csat_pos_hu_L2','csat_n_hu_L2')]
     col_reo    =[('Reopen Overall','reopen_rate','reopen_n','closed'),('OW Reopen','reopen_rate_ow','reopen_n_ow','overwatch_total'),('Human Reopen','reopen_rate_hu','reopen_n_hu','human_total')]
@@ -458,15 +449,15 @@ def render_report(payload, mode):
     cax=_charts(fig,2)
     _chart(cax[0],labels,[{'data':csat_series('csat_pos','csat_n'),'color':GREENC,'label':'Overall'},{'data':csat_series('csat_pos_ow','csat_n_ow'),'color':BLUE,'label':'OW'},{'data':csat_series('csat_pos_hu','csat_n_hu'),'color':PINK,'label':'Human'}],'%',0,100,title='CSAT % POSITIVE')
     _chart(cax[1],labels,[{'data':_series(d,'reopen_rate',n),'color':AMBERC,'label':'Overall'},{'data':_series(d,'reopen_rate_L1',n),'color':BLUE,'label':'L1'},{'data':_series(d,'reopen_rate_L2',n),'color':PURPLE,'label':'L2'}],'%',0,title='REOPEN RATE')
-    fig.text(0.04,0.30,'— TRENDS · '+span,color=SUB,fontsize=9,family='monospace')
+    fig.text(0.04,0.30,'- TRENDS - '+span,color=SUB,fontsize=9,family='monospace')
     out.append(('CSAT & Reopen',_png(fig)))
     return out
 
 def report_caption(payload, mode):
     d=json.loads(payload) if isinstance(payload,str) else payload
     head='WEEKLY CUSTOMER SUCCESS REPORT' if mode=='weekly' else 'CUSTOMER SUCCESS REPORT'
-    return (':bar_chart: *%s — %s*\n' % (head,_split(d,'period_label')[0])
-            + 'Total *%s* tickets handled · Overwatch *%s* / Human *%s* · CSAT *%s* · Reopen *%s*'
+    return (':bar_chart: *%s - %s*\n' % (head,_split(d,'period_label')[0])
+            + 'Total *%s* tickets handled - Overwatch *%s* / Human *%s* - CSAT *%s* - Reopen *%s*'
               % (_fmt_int(_y(d,'closed')),_fmt_pct(_y(d,'pct_overwatch')),_fmt_pct(_y(d,'pct_human')),_fmt_pct(_y(d,'csat_pos')),_fmt_pct(_y(d,'reopen_rate'))))
 
 def slack_upload_v2(token, channel, images, comment):
