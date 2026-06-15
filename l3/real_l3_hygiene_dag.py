@@ -24,7 +24,7 @@ Window: only tickets escalated 1-2 h ago are considered, so at go-live we don't 
 channel with the whole existing backlog; combined with the state table this gives each new
 escalation a single ping ~1-1.5 h after it happens.
 
-Schedule: '*/30 * * * *' in Asia/Kolkata. Channel: cs-associates (override via env for tests).
+Schedule: '*/30 * * * *' in Asia/Kolkata. Channel: community-builders-l2-l1 (override via env for tests).
 Dedup state: support.real_l3_hygiene_pinged (created on first run if absent).
 """
 
@@ -42,8 +42,8 @@ from utils.slack.bigquery_client import get_bigquery_client
 logger = logging.getLogger(__name__)
 
 # ==================== CONFIG ====================
-# Target channel is cs-associates; override to the test channel via env for dry runs.
-SLACK_CHANNEL_ID = os.getenv('REAL_L3_HYGIENE_SLACK_CHANNEL', 'C0B075CBPS7')  # cs-associates
+# Target channel is community-builders-l2-l1; override to the test channel via env for dry runs.
+SLACK_CHANNEL_ID = os.getenv('REAL_L3_HYGIENE_SLACK_CHANNEL', 'C0937QNFJEM')  # community-builders-l2-l1
 REAL_L3_TAG_ID   = '6a1f2e835ad901b459b7665f'
 STATE_TABLE      = 'emergent-default.support.real_l3_hygiene_pinged'
 SLA_MINUTES      = 60    # ping only once the escalation is at least this old
