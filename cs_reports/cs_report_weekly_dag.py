@@ -36,9 +36,7 @@ runs AS (
   WHERE ticket_id IS NOT NULL AND created_at IS NOT NULL GROUP BY ticket_id
 ),
 spam AS (SELECT email, day FROM runs WHERE email IS NOT NULL AND email!='' GROUP BY email, day HAVING COUNT(DISTINCT cid)>10),
-vt AS (SELECT _id, atlas_id FROM `emergent-default.trinity_database.v_tickets` WHERE atlas_id IS NOT NULL QUALIFY ROW_NUMBER() OVER (PARTITION BY _id ORDER BY source_timestamp DESC)=1),
-cpst AS (SELECT id, number FROM `emergent-default.analytics.closed_pending_support_tickets` QUALIFY ROW_NUMBER() OVER (PARTITION BY id ORDER BY sync_timestamp DESC)=1),
-reop AS (SELECT ticket_number, reopen_flag FROM `emergent-default.analytics.support_tickets_tat` QUALIFY ROW_NUMBER() OVER (PARTITION BY ticket_number ORDER BY timestamp DESC)=1),
+vt AS (SELECT _id, atlas_id, COALESCE(stats_reopen_count,0) AS reopen_count FROM `emergent-default.trinity_database.v_tickets` WHERE atlas_id IS NOT NULL QUALIFY ROW_NUMBER() OVER (PARTITION BY _id ORDER BY source_timestamp DESC)=1),
 csat AS (
   SELECT vt2.atlas_id AS ticket_id, CASE WHEN cs.rating='GOOD' THEN 1 WHEN cs.rating='BAD' THEN 0 END AS s
   FROM `emergent-default.trinity_database.v_csat_surveys` cs
@@ -52,13 +50,11 @@ tat AS (
 ),
 c AS (
   SELECT DATE_TRUNC(r.day, WEEK(MONDAY)) AS wk, COALESCE(r.tier,'untagged') AS tier, (NOT r.esc) AS ow_solved,
-    csat.s AS csat_score, IFNULL(reop.reopen_flag,0)=1 AS is_reopened,
+    csat.s AS csat_score, vt.reopen_count>0 AS is_reopened,
     tat.ow_t AS ow_t, IF(r.esc, tat.hufrt_raw, NULL) AS hufrt_t, IF(r.esc, tat.frt_raw, NULL) AS frt_t
   FROM runs r
   LEFT JOIN spam sp ON sp.email=r.email AND sp.day=r.day
   LEFT JOIN vt ON vt._id=r.cid
-  LEFT JOIN cpst ON cpst.id=vt.atlas_id
-  LEFT JOIN reop ON reop.ticket_number=cpst.number
   LEFT JOIN csat ON csat.ticket_id=vt.atlas_id
   LEFT JOIN tat  ON tat.ticket_id=vt.atlas_id
   WHERE r.day BETWEEN start_week AND DATE_ADD(last_week_start, INTERVAL 6 DAY) AND sp.email IS NULL
