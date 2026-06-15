@@ -43,7 +43,7 @@ csat AS (
   WHERE cs.rating IS NOT NULL QUALIFY ROW_NUMBER() OVER (PARTITION BY vt2.atlas_id ORDER BY cs.rated_at DESC)=1
 ),
 tat AS (
-  SELECT vt3.atlas_id AS ticket_id, t.time1 AS ow_t, (COALESCE(t.time2,0)+t.time3) AS hufrt_raw, (t.time1+COALESCE(t.time2,0)+t.time3) AS frt_raw
+  SELECT vt3.atlas_id AS ticket_id, t.time1 AS ow_t, (COALESCE(t.time2,0)+COALESCE(t.time3,0)) AS hufrt_raw, (COALESCE(t.time1,0)+COALESCE(t.time2,0)+COALESCE(t.time3,0)) AS frt_raw
   FROM (SELECT ticket_id,time1,time2,time3 FROM `emergent-default.support.trinity_ticket_tat` QUALIFY ROW_NUMBER() OVER (PARTITION BY ticket_id ORDER BY sync_timestamp DESC)=1) t
   JOIN (SELECT _id,atlas_id FROM `emergent-default.trinity_database.v_tickets` WHERE atlas_id IS NOT NULL QUALIFY ROW_NUMBER() OVER (PARTITION BY _id ORDER BY source_timestamp DESC)=1) vt3 ON vt3._id=t.ticket_id
 ),
