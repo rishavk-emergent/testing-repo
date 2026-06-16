@@ -12,17 +12,16 @@ ago and that still has ANY of those 3 missing, posts ONE Slack message @-mention
 escalator (the person who added the real_l3 tag) listing the missing item(s). Each ticket
 is pinged only once (tracked in a state table).
 
-All three hygiene checks are anchored on the real_l3 tag time and evaluated within a
-+/- GRACE_MINUTES (60 min) window around it. This is deliberate: agents typically reply to
-the customer FIRST and tag real_l3 a few seconds-to-minutes later, so a reply timestamped
-just before the tag is still valid hygiene (the old "strictly after the tag" check produced
-false positives on exactly this ordering). The +60 upper bound matches the 1-hour SLA, so
-work done any time within the hour of escalating counts.
+All three hygiene checks count an action done at any time from GRACE_MINUTES (60 min) BEFORE
+the real_l3 tag onward (i.e. tag_time - 60 min, no upper bound). The 60-min look-back is
+deliberate: agents typically reply to the customer FIRST and tag real_l3 a few seconds-to-
+minutes later, so a reply timestamped just before the tag is still valid hygiene (the old
+"strictly after the tag" check produced false positives on exactly this ordering).
 
 Who/when escalated  -> the `tag_added` 'real_l3' audit event (actor_agent_id + created_at).
-Team done?          -> a team_assigned / team_changed event within tag +/-60 min (any actor).
-Slack link done?    -> a slack_link_updated event within tag +/-60 min (any actor).
-Customer reply done?-> a public outbound message authored by the ESCALATOR within tag +/-60 min.
+Team done?          -> a team_assigned / team_changed event from tag -60 min onward (any actor).
+Slack link done?    -> a slack_link_updated event from tag -60 min onward (any actor).
+Customer reply done?-> a public outbound message authored by the ESCALATOR from tag -60 min onward.
                        (Escalator-specific: if someone else replied, the escalator is still pinged.)
 Escalator -> Slack   -> v_agents.email -> Slack users.lookupByEmail (@mention).
 
@@ -54,7 +53,7 @@ REAL_L3_TAG_ID   = '6a1f2e835ad901b459b7665f'
 STATE_TABLE      = 'emergent-default.support.real_l3_hygiene_pinged'
 SLA_MINUTES      = 60    # ping only once the escalation is at least this old
 WINDOW_MINUTES   = 120   # ...and at most this old (>2h = stale, no nag)
-GRACE_MINUTES    = 60    # hygiene actions count if done within +/- this of the real_l3 tag
+GRACE_MINUTES    = 60    # look-back: hygiene actions count if done at any time from this many min BEFORE the tag onward
 
 # ==================== STATE TABLE (dedup) ====================
 DDL = f"""
@@ -83,30 +82,27 @@ esc AS (  -- escalation event: who added the real_l3 tag, and when
   WHERE type='audit' AND action='tag_added' AND JSON_VALUE(new_value)='real_l3'
   QUALIFY ROW_NUMBER() OVER (PARTITION BY ticket_id ORDER BY created_at)=1
 ),
-team_ok AS (  -- team set within +/-GRACE_MINUTES of the real_l3 tag (any actor)
+team_ok AS (  -- team set from tag -GRACE_MINUTES min onward (any actor)
   SELECT DISTINCT e.ticket_id
   FROM `emergent-default.trinity_database.v_ticket_events` e
   JOIN esc ON esc.ticket_id=e.ticket_id
   WHERE e.action IN ('team_assigned','team_changed')
-    AND e.created_at BETWEEN TIMESTAMP_SUB(esc.esc_ts, INTERVAL {GRACE_MINUTES} MINUTE)
-                         AND TIMESTAMP_ADD(esc.esc_ts, INTERVAL {GRACE_MINUTES} MINUTE)
+    AND e.created_at >= TIMESTAMP_SUB(esc.esc_ts, INTERVAL {GRACE_MINUTES} MINUTE)
 ),
-slack_ok AS (  -- slack link added within +/-GRACE_MINUTES of the real_l3 tag (any actor)
+slack_ok AS (  -- slack link added from tag -GRACE_MINUTES min onward (any actor)
   SELECT DISTINCT e.ticket_id
   FROM `emergent-default.trinity_database.v_ticket_events` e
   JOIN esc ON esc.ticket_id=e.ticket_id
   WHERE e.action='slack_link_updated'
-    AND e.created_at BETWEEN TIMESTAMP_SUB(esc.esc_ts, INTERVAL {GRACE_MINUTES} MINUTE)
-                         AND TIMESTAMP_ADD(esc.esc_ts, INTERVAL {GRACE_MINUTES} MINUTE)
+    AND e.created_at >= TIMESTAMP_SUB(esc.esc_ts, INTERVAL {GRACE_MINUTES} MINUTE)
 ),
-reply AS (  -- the escalator's own public outbound reply within +/-GRACE_MINUTES of the real_l3 tag
+reply AS (  -- the escalator's own public outbound reply from tag -GRACE_MINUTES min onward
   SELECT e.ticket_id
   FROM `emergent-default.trinity_database.v_ticket_events` e
   JOIN esc ON esc.ticket_id=e.ticket_id
   WHERE e.type='message' AND e.direction='outbound' AND e.visibility='public'
     AND e.actor_kind='AGENT' AND e.actor_agent_id=esc.escalator_id
-    AND e.created_at BETWEEN TIMESTAMP_SUB(esc.esc_ts, INTERVAL {GRACE_MINUTES} MINUTE)
-                         AND TIMESTAMP_ADD(esc.esc_ts, INTERVAL {GRACE_MINUTES} MINUTE)
+    AND e.created_at >= TIMESTAMP_SUB(esc.esc_ts, INTERVAL {GRACE_MINUTES} MINUTE)
   GROUP BY e.ticket_id
 ),
 ag AS (
