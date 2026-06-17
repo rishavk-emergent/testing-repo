@@ -1,25 +1,30 @@
 """
 Prod SOS Alert - Slack DAG (every 5 min, IST)
 
-Posts ONE Slack message as soon as a ticket qualifies as a Prod SOS on a live
-production site, i.e.:
+Posts ONE Slack message (with @channel) for every ticket that qualifies as a Prod SOS
+on a live production site and needs pickup, i.e. ALL of:
   * it carries the `Prod SOS` tag  (v_tags label 'Prod SOS', tag_id 6a0c44a4c272432bd9f53bf1), AND
-  * `custom_fields_live_production = TRUE` on the ticket, AND
-  * the ticket is unassigned (`assigned_agent_id IS NULL`).
+  * `custom_fields_live_production = TRUE`, AND
+  * the ticket is unassigned (`assigned_agent_id IS NULL`), AND
+  * status is OPEN or PENDING (closed tickets are already handled).
 
-"Comes to us" = the moment the Prod SOS tag is added. The DAG runs every 5 min and
-fires for any qualifying ticket whose Prod SOS tag was added in the last LOOKBACK_MINUTES,
-so at go-live we don't flood the channel with the whole historical backlog. Each ticket is
-alerted only once (tracked in a state table).
+There is NO time window on qualification - a ticket is alerted whenever it first meets all
+of the above, no matter when the tag was added. Each ticket is alerted exactly once, tracked
+in the dedup state table support.prod_sos_pinged.
+
+Go-live backlog: on the very first run (detected via a SEED_MARKER row), all currently
+qualifying tickets are written to the state table WITHOUT posting - this suppresses the
+existing backlog so we don't flood @channel once. From then on only newly-qualifying tickets
+are alerted.
 
 Sources (all Trinity):
-  Prod SOS tag added  -> v_ticket_events (action='tag_added', JSON_VALUE(new_value)='Prod SOS')
+  Prod SOS tag        -> v_tickets.tag_ids contains the Prod SOS tag_id
   Live Production     -> v_tickets.custom_fields_live_production (BOOL)
-  Ticket fields       -> v_tickets (num, level, status, subject, weekly_average_visitors)
+  Assignment / status -> v_tickets.assigned_agent_id / status
+  Tag time (display)  -> v_ticket_events (action='tag_added', 'Prod SOS'); LEFT JOIN, last 7d
 
 Schedule: '*/5 * * * *' Asia/Kolkata.
 Channel:  PROD_SOS_SLACK_CHANNEL env; defaults to the TEST channel until the live channel is set.
-Dedup state: support.prod_sos_pinged (created on first run if absent).
 """
 
 from datetime import datetime, timedelta, timezone
@@ -40,7 +45,7 @@ logger = logging.getLogger(__name__)
 SLACK_CHANNEL_ID = os.getenv('PROD_SOS_SLACK_CHANNEL', 'C0B4J9RBWDC')  # test channel
 PROD_SOS_TAG_ID  = '6a0c44a4c272432bd9f53bf1'
 STATE_TABLE      = 'emergent-default.support.prod_sos_pinged'
-LOOKBACK_MINUTES = 20    # only alert tickets tagged Prod SOS within this many minutes (+overlap vs the 5-min schedule)
+SEED_MARKER      = '__seed_marker__'   # sentinel row that marks the one-time backlog seed as done
 
 # ==================== STATE TABLE (dedup) ====================
 DDL = f"""
@@ -54,13 +59,16 @@ CREATE TABLE IF NOT EXISTS `{STATE_TABLE}` (
 """
 
 # ==================== BIGQUERY QUERY ====================
+# Qualification is purely on current ticket state (tag + live + unassigned + open/pending) and
+# the dedup table. sos_evt is a LEFT JOIN used only to show the tag time, so it never affects
+# whether a ticket qualifies; it is bounded to the last 7 days for cost.
 QUERY = f"""
 WITH
-sos_evt AS (  -- the "comes to us" moment: first time the Prod SOS tag was added (recent only, for cost)
+sos_evt AS (  -- tag time for display only (last 7d, for cost)
   SELECT ticket_id, MIN(created_at) AS sos_tagged_at
   FROM `emergent-default.trinity_database.v_ticket_events`
   WHERE action='tag_added' AND JSON_VALUE(new_value)='Prod SOS'
-    AND created_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 3 HOUR)
+    AND created_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY)
   GROUP BY 1
 ),
 lt AS (
@@ -75,18 +83,17 @@ SELECT
   CAST(lt.num AS INT64) AS num,
   lt.level, lt.status, lt.subject,
   CAST(lt.weekly_visitors AS INT64) AS weekly_visitors,
-  s.sos_tagged_at,
   FORMAT_TIMESTAMP('%H:%M', s.sos_tagged_at, 'Asia/Kolkata') AS sos_tagged_ist,
   CONCAT('https://trinity-base.internal.emergent.host/tickets/', lt._id) AS ticket_url,
   TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), s.sos_tagged_at, MINUTE) AS mins_since_tagged
 FROM lt
-JOIN sos_evt s ON s.ticket_id=lt._id
+LEFT JOIN sos_evt s ON s.ticket_id=lt._id
 LEFT JOIN `{STATE_TABLE}` p ON p.ticket_id=lt._id
-WHERE '{PROD_SOS_TAG_ID}' IN UNNEST(lt.tag_ids)
-  AND lt.live_prod IS TRUE
-  AND lt.assigned_agent_id IS NULL              -- only unassigned tickets
-  AND TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), s.sos_tagged_at, MINUTE) <= {LOOKBACK_MINUTES}
-  AND p.ticket_id IS NULL
+WHERE '{PROD_SOS_TAG_ID}' IN UNNEST(lt.tag_ids)   -- Prod SOS tag
+  AND lt.live_prod IS TRUE                         -- Live Production
+  AND lt.assigned_agent_id IS NULL                 -- unassigned
+  AND UPPER(lt.status) IN ('OPEN','PENDING')       -- active only
+  AND p.ticket_id IS NULL                          -- not already alerted/seeded
 ORDER BY s.sos_tagged_at
 """
 
@@ -127,41 +134,49 @@ def run_prod_sos(**context):
     logger.info('[1] Ensuring state table exists...')
     client.query(DDL).result()
 
-    logger.info('[2] Querying new Prod SOS + Live Production tickets (last %d min, not yet alerted)...', LOOKBACK_MINUTES)
+    # First run? (seed marker absent) -> seed the backlog silently, don't post.
+    seeded = list(client.query(
+        f"SELECT COUNT(*) AS c FROM `{STATE_TABLE}` WHERE ticket_id='{SEED_MARKER}'"
+    ).result())[0].c > 0
+    mode = 'ALERT' if seeded else 'SEED (first run - suppressing backlog, no posts)'
+
+    logger.info('[2] Querying qualifying Prod SOS + Live Production + unassigned tickets... mode=%s', mode)
     rows = list(client.query(QUERY).result())
-    logger.info('      %d ticket(s) to alert', len(rows))
-    if not rows:
-        logger.info('PROD SOS ALERT: nothing new')
-        return
+    logger.info('      %d qualifying ticket(s)', len(rows))
 
     pinged = []
+    now_iso = datetime.now(timezone.utc).isoformat()
     for r in rows:
         row = {
             'ticket_id': r.ticket_id, 'num': r.num, 'level': r.level, 'status': r.status,
             'subject': r.subject, 'weekly_visitors': r.weekly_visitors, 'ticket_url': r.ticket_url,
             'sos_tagged_ist': r.sos_tagged_ist, 'mins_since_tagged': r.mins_since_tagged,
         }
-        msg = build_message(row)
-        try:
-            notifier.send_message(msg, mrkdwn=True, unfurl_links=False, unfurl_media=False)
-            pinged.append({
-                'ticket_id': row['ticket_id'], 'num': row['num'],
-                'level': row['level'], 'status': row['status'],
-                'pinged_at': datetime.now(timezone.utc).isoformat(),
-            })
-            logger.info('      alerted #%s', row['num'])
-        except Exception as e:
-            logger.error('      failed to post for #%s: %s', row['num'], e)
+        if seeded:
+            try:
+                notifier.send_message(build_message(row), mrkdwn=True, unfurl_links=False, unfurl_media=False)
+                logger.info('      alerted #%s', row['num'])
+            except Exception as e:
+                logger.error('      failed to post for #%s: %s', row['num'], e)
+                continue
+        pinged.append({
+            'ticket_id': row['ticket_id'], 'num': row['num'],
+            'level': row['level'], 'status': row['status'], 'pinged_at': now_iso,
+        })
+
+    if not seeded:
+        # mark the seed as done so future runs alert instead of seeding
+        pinged.append({'ticket_id': SEED_MARKER, 'num': 0, 'level': None, 'status': 'SEED', 'pinged_at': now_iso})
+        logger.info('[3] First run: seeded %d existing qualifier(s) into state, no posts', len(rows))
 
     if pinged:
-        logger.info('[3] Recording %d alerted ticket(s) in state table...', len(pinged))
         table = client.get_table(STATE_TABLE)
         errors = client.insert_rows_json(table, pinged)
         if errors:
             logger.error('      state-table insert errors: %s', errors)
 
     logger.info('=' * 60)
-    logger.info('PROD SOS ALERT: COMPLETE (%d alerted)', len(pinged))
+    logger.info('PROD SOS ALERT: COMPLETE (mode=%s, %d alerted)', mode, (0 if not seeded else len(pinged)))
     logger.info('=' * 60)
 
 
@@ -180,7 +195,7 @@ default_args = {
 dag = DAG(
     'prod_sos_slack',
     default_args=default_args,
-    description='Alert in Slack when a ticket gets the Prod SOS tag while Live Production is true',
+    description='Alert @channel when an unassigned OPEN/PENDING ticket is Prod SOS + Live Production',
     schedule_interval='*/5 * * * *',  # every 5 min, Asia/Kolkata
     catchup=False,
     is_paused_upon_creation=True,  # keep paused until verified + live channel set
