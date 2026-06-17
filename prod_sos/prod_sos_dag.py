@@ -24,7 +24,7 @@ Sources (all Trinity):
   Tag time (display)  -> v_ticket_events (action='tag_added', 'Prod SOS'); LEFT JOIN, last 7d
 
 Schedule: '*/5 * * * *' Asia/Kolkata.
-Channel:  PROD_SOS_SLACK_CHANNEL env; defaults to the TEST channel until the live channel is set.
+Channel:  community-builders-l2-l1 (C0937QNFJEM); override PROD_SOS_SLACK_CHANNEL env for testing.
 """
 
 from datetime import datetime, timedelta, timezone
@@ -41,8 +41,8 @@ from utils.slack.bigquery_client import get_bigquery_client
 logger = logging.getLogger(__name__)
 
 # ==================== CONFIG ====================
-# Defaults to the TEST channel for now; set to the real channel (and/or override via env) once decided.
-SLACK_CHANNEL_ID = os.getenv('PROD_SOS_SLACK_CHANNEL', 'C0B4J9RBWDC')  # test channel
+# Live channel: community-builders-l2-l1. For testing, override PROD_SOS_SLACK_CHANNEL to the test channel.
+SLACK_CHANNEL_ID = os.getenv('PROD_SOS_SLACK_CHANNEL', 'C0937QNFJEM')  # community-builders-l2-l1
 PROD_SOS_TAG_ID  = '6a0c44a4c272432bd9f53bf1'
 STATE_TABLE      = 'emergent-default.support.prod_sos_pinged'
 SEED_MARKER      = '__seed_marker__'   # sentinel row that marks the one-time backlog seed as done
