@@ -1,12 +1,12 @@
 """
-Prod SOS Alert - Slack DAG (every 10 min, IST)
+Prod SOS Alert - Slack DAG (every 5 min, IST)
 
 Posts ONE Slack message as soon as a ticket qualifies as a Prod SOS on a live
 production site, i.e.:
   * it carries the `Prod SOS` tag  (v_tags label 'Prod SOS', tag_id 6a0c44a4c272432bd9f53bf1), AND
   * `custom_fields_live_production = TRUE` on the ticket.
 
-"Comes to us" = the moment the Prod SOS tag is added. The DAG runs every 10 min and
+"Comes to us" = the moment the Prod SOS tag is added. The DAG runs every 5 min and
 fires for any qualifying ticket whose Prod SOS tag was added in the last LOOKBACK_MINUTES,
 so at go-live we don't flood the channel with the whole historical backlog. Each ticket is
 alerted only once (tracked in a state table).
@@ -16,7 +16,7 @@ Sources (all Trinity):
   Live Production     -> v_tickets.custom_fields_live_production (BOOL)
   Ticket fields       -> v_tickets (num, level, status, subject, weekly_average_visitors)
 
-Schedule: '*/10 * * * *' Asia/Kolkata.
+Schedule: '*/5 * * * *' Asia/Kolkata.
 Channel:  PROD_SOS_SLACK_CHANNEL env; defaults to the TEST channel until the live channel is set.
 Dedup state: support.prod_sos_pinged (created on first run if absent).
 """
@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 SLACK_CHANNEL_ID = os.getenv('PROD_SOS_SLACK_CHANNEL', 'C0B4J9RBWDC')  # test channel
 PROD_SOS_TAG_ID  = '6a0c44a4c272432bd9f53bf1'
 STATE_TABLE      = 'emergent-default.support.prod_sos_pinged'
-LOOKBACK_MINUTES = 20    # only alert tickets tagged Prod SOS within this many minutes (+overlap vs the 10-min schedule)
+LOOKBACK_MINUTES = 20    # only alert tickets tagged Prod SOS within this many minutes (+overlap vs the 5-min schedule)
 
 # ==================== STATE TABLE (dedup) ====================
 DDL = f"""
@@ -55,10 +55,11 @@ CREATE TABLE IF NOT EXISTS `{STATE_TABLE}` (
 # ==================== BIGQUERY QUERY ====================
 QUERY = f"""
 WITH
-sos_evt AS (  -- the "comes to us" moment: first time the Prod SOS tag was added
+sos_evt AS (  -- the "comes to us" moment: first time the Prod SOS tag was added (recent only, for cost)
   SELECT ticket_id, MIN(created_at) AS sos_tagged_at
   FROM `emergent-default.trinity_database.v_ticket_events`
   WHERE action='tag_added' AND JSON_VALUE(new_value)='Prod SOS'
+    AND created_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 3 HOUR)
   GROUP BY 1
 ),
 lt AS (
@@ -74,6 +75,7 @@ SELECT
   lt.level, lt.status, lt.subject,
   CAST(lt.weekly_visitors AS INT64) AS weekly_visitors,
   s.sos_tagged_at,
+  FORMAT_TIMESTAMP('%H:%M', s.sos_tagged_at, 'Asia/Kolkata') AS sos_tagged_ist,
   CONCAT('https://trinity-base.internal.emergent.host/tickets/', lt._id) AS ticket_url,
   TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), s.sos_tagged_at, MINUTE) AS mins_since_tagged
 FROM lt
@@ -96,11 +98,17 @@ def build_message(row):
         subj = subj[:90] + '...'
     visitors = row.get('weekly_visitors')
     vis_txt = (' · weekly visitors: *%s*' % f'{visitors:,}') if visitors else ''
+    mins = row.get('mins_since_tagged')
+    when = row.get('sos_tagged_ist')
+    when_txt = ''
+    if when is not None:
+        ago = ('%d min ago' % mins) if mins is not None else ''
+        when_txt = '\ntagged %s IST%s' % (when, (' · ' + ago) if ago else '')
     return (
-        ':rotating_light: *Prod SOS — Live Production*\n'
+        '<!here> :rotating_light: *Prod SOS — Live Production*\n'
         '%s · %s · %s%s\n'
-        '%s'
-        % (link, row['level'] or '—', row['status'] or '—', vis_txt, subj)
+        '%s%s'
+        % (link, row['level'] or '—', row['status'] or '—', vis_txt, subj, when_txt)
     )
 
 
@@ -129,6 +137,7 @@ def run_prod_sos(**context):
         row = {
             'ticket_id': r.ticket_id, 'num': r.num, 'level': r.level, 'status': r.status,
             'subject': r.subject, 'weekly_visitors': r.weekly_visitors, 'ticket_url': r.ticket_url,
+            'sos_tagged_ist': r.sos_tagged_ist, 'mins_since_tagged': r.mins_since_tagged,
         }
         msg = build_message(row)
         try:
@@ -170,7 +179,7 @@ dag = DAG(
     'prod_sos_slack',
     default_args=default_args,
     description='Alert in Slack when a ticket gets the Prod SOS tag while Live Production is true',
-    schedule_interval='*/10 * * * *',  # every 10 min, Asia/Kolkata
+    schedule_interval='*/5 * * * *',  # every 5 min, Asia/Kolkata
     catchup=False,
     is_paused_upon_creation=True,  # keep paused until verified + live channel set
     tags=['slack', 'trinity', 'prod_sos', 'alert', 'cs_team'],
