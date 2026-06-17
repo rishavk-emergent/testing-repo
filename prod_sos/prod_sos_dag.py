@@ -4,7 +4,8 @@ Prod SOS Alert - Slack DAG (every 5 min, IST)
 Posts ONE Slack message as soon as a ticket qualifies as a Prod SOS on a live
 production site, i.e.:
   * it carries the `Prod SOS` tag  (v_tags label 'Prod SOS', tag_id 6a0c44a4c272432bd9f53bf1), AND
-  * `custom_fields_live_production = TRUE` on the ticket.
+  * `custom_fields_live_production = TRUE` on the ticket, AND
+  * the ticket is unassigned (`assigned_agent_id IS NULL`).
 
 "Comes to us" = the moment the Prod SOS tag is added. The DAG runs every 5 min and
 fires for any qualifying ticket whose Prod SOS tag was added in the last LOOKBACK_MINUTES,
@@ -63,7 +64,7 @@ sos_evt AS (  -- the "comes to us" moment: first time the Prod SOS tag was added
   GROUP BY 1
 ),
 lt AS (
-  SELECT _id, num, level, status, subject, tag_ids,
+  SELECT _id, num, level, status, subject, tag_ids, assigned_agent_id,
          custom_fields_live_production AS live_prod,
          custom_fields_weekly_average_visitors AS weekly_visitors
   FROM `emergent-default.trinity_database.v_tickets`
@@ -83,6 +84,7 @@ JOIN sos_evt s ON s.ticket_id=lt._id
 LEFT JOIN `{STATE_TABLE}` p ON p.ticket_id=lt._id
 WHERE '{PROD_SOS_TAG_ID}' IN UNNEST(lt.tag_ids)
   AND lt.live_prod IS TRUE
+  AND lt.assigned_agent_id IS NULL              -- only unassigned tickets
   AND TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), s.sos_tagged_at, MINUTE) <= {LOOKBACK_MINUTES}
   AND p.ticket_id IS NULL
 ORDER BY s.sos_tagged_at
@@ -105,7 +107,7 @@ def build_message(row):
         ago = ('%d min ago' % mins) if mins is not None else ''
         when_txt = '\ntagged %s IST%s' % (when, (' · ' + ago) if ago else '')
     return (
-        '<!here> :rotating_light: *Prod SOS — Live Production*\n'
+        '<!channel> :rotating_light: *Prod SOS — Live Production*\n'
         '%s · %s · %s%s\n'
         '%s%s'
         % (link, row['level'] or '—', row['status'] or '—', vis_txt, subj, when_txt)
