@@ -198,7 +198,7 @@ dag = DAG(
     description='Alert @channel when an unassigned OPEN/PENDING ticket is Prod SOS + Live Production',
     schedule_interval='*/5 * * * *',  # every 5 min, Asia/Kolkata
     catchup=False,
-    is_paused_upon_creation=True,  # keep paused until verified + live channel set
+    is_paused_upon_creation=False,  # active on merge so no new incoming ticket is missed (first run silently seeds the backlog)
     tags=['slack', 'trinity', 'prod_sos', 'alert', 'cs_team'],
 )
 
