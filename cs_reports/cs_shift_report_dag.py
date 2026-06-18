@@ -134,7 +134,7 @@ def render_tier(rows, tier, mode, period_label):
         ('TOTAL OPENED',      _fmt_int(g('total_opened')), None, INK),
         ('TOTAL CLOSED',      _fmt_int(g('total_closed')), None, INK),
         ('HUMAN CLOSED',      _fmt_int(g('human_count')), _fmt_pct(g('human_pct')), AMBER),
-        ('REOPEN (LAST 7 DAYS)', _fmt_int(g('reopen_count')), _fmt_pct(g('reopen_rate')), _reopen_color(g('reopen_rate'))),
+        ('HUMAN REOPEN (LAST 7 DAYS)', _fmt_int(g('reopen_count')), _fmt_pct(g('reopen_rate')), _reopen_color(g('reopen_rate'))),
         ('CSAT+ (LAST 7 DAYS)', _fmt_int(g('csat_pos')), _fmt_pct(g('csat_pct')), _csat_color(g('csat_pct'), g('csat_n'))),
         ('ESC→HUMAN FRT',     _fmt_tat(g('esc_human_p50')), None, GREEN),
         ('CREATED→HUMAN FRT', _fmt_tat(g('created_human_p50')), None, GREEN),
