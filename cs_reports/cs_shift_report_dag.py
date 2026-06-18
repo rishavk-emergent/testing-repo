@@ -11,7 +11,7 @@ Each run renders TWO PNGs with Pillow (no matplotlib): one for L1, one for L2. E
 Both PNGs are posted to one Slack message.
 
 Standalone: DejaVu font embedded as base64 (reused from the cs_report DAGs); Pillow >= 8.0.
-Channel via CS_SHIFT_REPORT_SLACK_CHANNEL env (defaults to the TEST channel for now).
+Channel: cs-associates (C0B075CBPS7); override CS_SHIFT_REPORT_SLACK_CHANNEL env for testing.
 """
 from datetime import timedelta
 import io, os, logging
@@ -26,7 +26,7 @@ from utils.slack.slack_config import REDASH_API_KEY, REDASH_BASE_URL, SLACK_BOT_
 logger = logging.getLogger(__name__)
 
 # ==================== CONFIG ====================
-SLACK_CHANNEL  = os.getenv('CS_SHIFT_REPORT_SLACK_CHANNEL', 'C0B4J9RBWDC')  # TEST channel for now
+SLACK_CHANNEL  = os.getenv('CS_SHIFT_REPORT_SLACK_CHANNEL', 'C0B075CBPS7')  # cs-associates (override via env for tests)
 DAILY_QUERY_ID  = 37455
 WEEKLY_QUERY_ID = 37461
 
