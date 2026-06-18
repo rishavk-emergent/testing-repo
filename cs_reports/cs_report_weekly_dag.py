@@ -218,7 +218,16 @@ def render_report(payload, mode):
     weekly = (mode=='weekly')
     n = 5 if weekly else 7
     title = 'WEEKLY CS REPORT' if weekly else 'CUSTOMER SUCCESS REPORT'
-    period = _split(d,'period_label')[0]
+    if weekly:
+        _ps = _split(d,'period_start')[0]
+        try:
+            import datetime as _dt
+            _sd = _dt.date.fromisoformat(_ps); _ed = _sd + _dt.timedelta(days=6)
+            period = '%s - %s' % (_sd.strftime('%d/%m'), _ed.strftime('%d/%m'))
+        except Exception:
+            period = _split(d,'period_label')[0]
+    else:
+        period = _split(d,'period_label')[0]
     span = 'LAST 5 WEEKS' if weekly else 'LAST 7 DAYS'
     if weekly:
         # weekly: label each point with the week-END date only (e.g. 07/06). The end
