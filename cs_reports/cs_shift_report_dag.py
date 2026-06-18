@@ -81,7 +81,7 @@ def _csat_color(v, csat_n):
     return RED
 
 # ==================== RENDER ====================
-COLS = [('Closed', 'closed'), ('Med TAT', 'tat'), ('Reopen (7d avg)', 'reopen'), ('Reopen% (7d avg)', 'reopenp'), ('CSAT% (7d avg)', 'csat')]
+COLS = [('Closed', 'closed'), ('Med TAT', 'tat'), ('Reopen (last 7d)', 'reopen'), ('Reopen% (last 7d)', 'reopenp'), ('CSAT% (last 7d)', 'csat')]
 
 def _split_rows(rows, tier):
     summ = next((r for r in rows if r.get('section') == 'summary' and r.get('tier') == tier), None)
@@ -134,8 +134,8 @@ def render_tier(rows, tier, mode, period_label):
         ('TOTAL OPENED',      _fmt_int(g('total_opened')), None, INK),
         ('TOTAL CLOSED',      _fmt_int(g('total_closed')), None, INK),
         ('HUMAN CLOSED',      _fmt_int(g('human_count')), _fmt_pct(g('human_pct')), AMBER),
-        ('REOPEN (7 DAY AVG)', _fmt_int(g('reopen_count')), _fmt_pct(g('reopen_rate')), _reopen_color(g('reopen_rate'))),
-        ('CSAT+ (7 DAY AVG)',  _fmt_int(g('csat_pos')), _fmt_pct(g('csat_pct')), _csat_color(g('csat_pct'), g('csat_n'))),
+        ('REOPEN (LAST 7 DAYS)', _fmt_int(g('reopen_count')), _fmt_pct(g('reopen_rate')), _reopen_color(g('reopen_rate'))),
+        ('CSAT+ (LAST 7 DAYS)', _fmt_int(g('csat_pos')), _fmt_pct(g('csat_pct')), _csat_color(g('csat_pct'), g('csat_n'))),
         ('ESC→HUMAN FRT',     _fmt_tat(g('esc_human_p50')), None, GREEN),
         ('CREATED→HUMAN FRT', _fmt_tat(g('created_human_p50')), None, GREEN),
     ]
@@ -148,7 +148,7 @@ def render_tier(rows, tier, mode, period_label):
         text(tx + 13, y + 52, val, 17, bold=True, color=col)
         if sub is not None:
             text(tx + 13, y + 72, sub, 10, bold=True, color=col)
-    text(margin, y + th + 14, 'Closed & Med TAT = report period   ·   Reopen, Reopen%, CSAT = 7 day average', 8.5, color=SUB)
+    text(margin, y + th + 14, 'Closed & Med TAT = report period   ·   Reopen, Reopen%, CSAT = last 7 days', 8.5, color=SUB)
     y += sec1_h
 
     # ---- Section 2 : shift tables ----
