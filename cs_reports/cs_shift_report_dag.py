@@ -44,8 +44,8 @@ def _font(bold, px):
 
 # ==================== THEME ====================
 SS = 2                       # supersample then LANCZOS-downscale for anti-aliasing
-BG='#0d1117'; CARD='#161b22'; BORDER='#30363d'; INK='#e6edf3'; SUB='#8b949e'
-BLUE='#58a6ff'; GREEN='#3fb950'; AMBER='#d29922'; RED='#f85149'; HEAD='#1f2630'
+BG='#0d1117'; CARD='#1b212b'; BORDER='#3d4654'; INK='#ffffff'; SUB='#c9d1d9'
+BLUE='#79c0ff'; GREEN='#56d364'; AMBER='#e3b341'; RED='#ff7b72'; HEAD='#222b38'
 
 def _px(v): return int(round(v * SS))
 
@@ -81,7 +81,7 @@ def _csat_color(v, csat_n):
     return RED
 
 # ==================== RENDER ====================
-COLS = [('Closed', 'closed'), ('Med TAT', 'tat'), ('Reopen', 'reopen'), ('Reopen%', 'reopenp'), ('CSAT%', 'csat')]
+COLS = [('Closed', 'closed'), ('Med TAT', 'tat'), ('Reopen (7d avg)', 'reopen'), ('Reopen% (7d avg)', 'reopenp'), ('CSAT% (7d avg)', 'csat')]
 
 def _split_rows(rows, tier):
     summ = next((r for r in rows if r.get('section') == 'summary' and r.get('tier') == tier), None)
@@ -134,8 +134,8 @@ def render_tier(rows, tier, mode, period_label):
         ('TOTAL OPENED',      _fmt_int(g('total_opened')), None, INK),
         ('TOTAL CLOSED',      _fmt_int(g('total_closed')), None, INK),
         ('HUMAN CLOSED',      _fmt_int(g('human_count')), _fmt_pct(g('human_pct')), AMBER),
-        ('REOPEN · 7d',       _fmt_int(g('reopen_count')), _fmt_pct(g('reopen_rate')), _reopen_color(g('reopen_rate'))),
-        ('CSAT+ · 7d',        _fmt_int(g('csat_pos')), _fmt_pct(g('csat_pct')), _csat_color(g('csat_pct'), g('csat_n'))),
+        ('REOPEN (7 DAY AVG)', _fmt_int(g('reopen_count')), _fmt_pct(g('reopen_rate')), _reopen_color(g('reopen_rate'))),
+        ('CSAT+ (7 DAY AVG)',  _fmt_int(g('csat_pos')), _fmt_pct(g('csat_pct')), _csat_color(g('csat_pct'), g('csat_n'))),
         ('ESC→HUMAN FRT',     _fmt_tat(g('esc_human_p50')), None, GREEN),
         ('CREATED→HUMAN FRT', _fmt_tat(g('created_human_p50')), None, GREEN),
     ]
@@ -148,7 +148,7 @@ def render_tier(rows, tier, mode, period_label):
         text(tx + 13, y + 52, val, 17, bold=True, color=col)
         if sub is not None:
             text(tx + 13, y + 72, sub, 10, bold=True, color=col)
-    text(margin, y + th + 14, 'Closed & Med TAT = report period   ·   Reopen, Reopen%, CSAT = trailing 7-day', 8.5, color=SUB)
+    text(margin, y + th + 14, 'Closed & Med TAT = report period   ·   Reopen, Reopen%, CSAT = 7 day average', 8.5, color=SUB)
     y += sec1_h
 
     # ---- Section 2 : shift tables ----
