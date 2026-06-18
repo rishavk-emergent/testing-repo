@@ -27,8 +27,7 @@ logger = logging.getLogger(__name__)
 
 # ==================== CONFIG ====================
 SLACK_CHANNEL  = os.getenv('CS_SHIFT_REPORT_SLACK_CHANNEL', 'C0B075CBPS7')  # cs-associates (override via env for tests)
-DAILY_QUERY_ID  = 37455
-WEEKLY_QUERY_ID = 37461
+SHIFT_QUERY_ID = 37455  # combined daily+weekly query (rows tagged by mode); edit shift_config there
 
 # ==================== EMBEDDED FONT (base64, DejaVu - reused from cs_report) ====================
 import base64
@@ -215,11 +214,14 @@ def _period_label(mode):
         return '%s - %s' % (last_mon.format('DD/MM'), this_mon.subtract(days=1).format('DD/MM'))
     return now.subtract(days=1).format('DD/MM/YYYY')
 
-def run_shift_report(mode, query_id, **context):
+def run_shift_report(mode, **context):
     redash = RedashClient(api_key=REDASH_API_KEY, base_url=REDASH_BASE_URL)
-    rows = redash.fetch_query_results(query_id=query_id, max_retries=3)
+    rows = redash.fetch_query_results(query_id=SHIFT_QUERY_ID, max_retries=3)
     if not rows:
-        raise Exception('Redash query %s returned no rows' % query_id)
+        raise Exception('Redash query %s returned no rows' % SHIFT_QUERY_ID)
+    rows = [r for r in rows if r.get('mode') == mode]   # combined query: keep this mode's rows
+    if not rows:
+        raise Exception('no %s rows from query %s' % (mode, SHIFT_QUERY_ID))
     period = _period_label(mode)
     images = [('L1 Shift Report', render_tier(rows, 'L1', mode, period)),
               ('L2 Shift Report', render_tier(rows, 'L2', mode, period))]
@@ -241,11 +243,11 @@ dag_daily = DAG('cs_shift_report_daily', default_args=_default_args,
     schedule_interval='0 10 * * *', catchup=False, is_paused_upon_creation=False,
     tags=['slack', 'trinity', 'cs_metrics', 'shift_report', 'images'])
 PythonOperator(task_id='build_and_post_shift_report_daily', python_callable=run_shift_report,
-    op_kwargs={'mode': 'daily', 'query_id': DAILY_QUERY_ID}, dag=dag_daily)
+    op_kwargs={'mode': 'daily'}, dag=dag_daily)
 
 dag_weekly = DAG('cs_shift_report_weekly', default_args=_default_args,
     description='Weekly L1/L2 shift report (per-agent closures) rendered in Python and posted to Slack',
     schedule_interval='0 10 * * 1', catchup=False, is_paused_upon_creation=False,
     tags=['slack', 'trinity', 'cs_metrics', 'shift_report', 'images'])
 PythonOperator(task_id='build_and_post_shift_report_weekly', python_callable=run_shift_report,
-    op_kwargs={'mode': 'weekly', 'query_id': WEEKLY_QUERY_ID}, dag=dag_weekly)
+    op_kwargs={'mode': 'weekly'}, dag=dag_weekly)
