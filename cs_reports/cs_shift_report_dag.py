@@ -81,7 +81,7 @@ def _csat_color(v, csat_n):
     return RED
 
 # ==================== RENDER ====================
-COLS = [('Closed', 'closed'), ('Reopen', 'reopen'), ('Reopen%', 'reopenp'), ('Med TAT', 'tat'), ('CSAT%', 'csat')]
+COLS = [('Closed', 'closed'), ('Med TAT', 'tat'), ('Reopen', 'reopen'), ('Reopen%', 'reopenp'), ('CSAT%', 'csat')]
 
 def _split_rows(rows, tier):
     summ = next((r for r in rows if r.get('section') == 'summary' and r.get('tier') == tier), None)
@@ -101,7 +101,7 @@ def render_tier(rows, tier, mode, period_label):
     margin = 44
     row_h = 34
     title_h = 70
-    sec1_h = 104
+    sec1_h = 124
     shift_hdr_h = 36
     col_hdr_h = 30
     gap = 22
@@ -129,24 +129,26 @@ def render_tier(rows, tier, mode, period_label):
     hline(y); y += 24
 
     # ---- Section 1 : summary tiles (span full width) ----
-    total = summ.get('total_closed') if summ else None
-    ow    = summ.get('ow_count') if summ else None
-    hu    = summ.get('human_count') if summ else None
+    g = (lambda k: summ.get(k) if summ else None)
     tiles = [
-        ('TOTAL CLOSED',      _fmt_int(total), INK),
-        ('OVERWATCH',         _fmt_int(ow),    BLUE),
-        ('HUMAN',             _fmt_int(hu),    AMBER),
-        ('CREATED→OW p50',    _fmt_tat(summ.get('ow_p50') if summ else None),            GREEN),
-        ('ESC→HUMAN p50',     _fmt_tat(summ.get('esc_human_p50') if summ else None),     GREEN),
-        ('CREATED→HUMAN p50', _fmt_tat(summ.get('created_human_p50') if summ else None), GREEN),
+        ('TOTAL OPENED',      _fmt_int(g('total_opened')), None, INK),
+        ('TOTAL CLOSED',      _fmt_int(g('total_closed')), None, INK),
+        ('HUMAN CLOSED',      _fmt_int(g('human_count')), _fmt_pct(g('human_pct')), AMBER),
+        ('REOPEN · 7d',       _fmt_int(g('reopen_count')), _fmt_pct(g('reopen_rate')), _reopen_color(g('reopen_rate'))),
+        ('CSAT+ · 7d',        _fmt_int(g('csat_pos')), _fmt_pct(g('csat_pct')), _csat_color(g('csat_pct'), g('csat_n'))),
+        ('ESC→HUMAN FRT',     _fmt_tat(g('esc_human_p50')), None, GREEN),
+        ('CREATED→HUMAN FRT', _fmt_tat(g('created_human_p50')), None, GREEN),
     ]
-    tile_gap = 12; th = 80
+    tile_gap = 10; th = 86
     tw = (Wb - 2 * margin - (len(tiles) - 1) * tile_gap) / len(tiles)
-    for i, (lab, val, col) in enumerate(tiles):
+    for i, (lab, val, sub, col) in enumerate(tiles):
         tx = margin + i * (tw + tile_gap)
         d.rounded_rectangle([_px(tx), _px(y), _px(tx + tw), _px(y + th)], radius=_px(8), fill=CARD, outline=BORDER, width=SS)
-        text(tx + 14, y + 28, lab, 8.5, color=SUB)
-        text(tx + 14, y + 56, val, 18, bold=True, color=col)
+        text(tx + 13, y + 24, lab, 8, color=SUB)
+        text(tx + 13, y + 52, val, 17, bold=True, color=col)
+        if sub is not None:
+            text(tx + 13, y + 72, sub, 10, bold=True, color=col)
+    text(margin, y + th + 14, 'Closed & Med TAT = report period   ·   Reopen, Reopen%, CSAT = trailing 7-day', 8.5, color=SUB)
     y += sec1_h
 
     # ---- Section 2 : shift tables ----
@@ -171,10 +173,10 @@ def render_tier(rows, tier, mode, period_label):
             text(name_x, cy, (r.get('agent_name') or '-')[:34], 11.5, color=INK)
             vals = [
                 (_fmt_int(r.get('total_closed')), INK),
+                (_fmt_tat(r.get('median_tat')), INK),
                 (_fmt_int(r.get('reopen_count')), INK),
                 (_fmt_pct(r.get('reopen_rate')), _reopen_color(r.get('reopen_rate'))),
-                (_fmt_tat(r.get('median_tat')), INK),
-                (_fmt_pct(r.get('csat_pos_pct')), _csat_color(r.get('csat_pos_pct'), r.get('csat_n'))),
+                (_fmt_pct(r.get('csat_pct')), _csat_color(r.get('csat_pct'), r.get('csat_n'))),
             ]
             for (s, col), rx in zip(vals, col_rx):
                 text(rx, cy, s, 11.5, color=col, anchor='rm')
