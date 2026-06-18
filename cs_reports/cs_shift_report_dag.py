@@ -128,21 +128,25 @@ def render_tier(rows, tier, mode, period_label):
     y += 36
     hline(y); y += 24
 
-    # ---- Section 1 : summary ----
-    def stat(x, label, val, color=INK):
-        text(x, y, label, 9, color=SUB)
-        text(x, y + 24, val, 19, bold=True, color=color)
+    # ---- Section 1 : summary tiles (span full width) ----
     total = summ.get('total_closed') if summ else None
-    ow = summ.get('ow_count') if summ else None
-    hu = summ.get('human_count') if summ else None
-    stat(name_x, 'TOTAL CLOSED', _fmt_int(total))
-    stat(name_x + 200, 'OVERWATCH', _fmt_int(ow), BLUE)
-    stat(name_x + 360, 'HUMAN', _fmt_int(hu), AMBER)
-    text(name_x, y + 64, 'p50 TAT', 9, color=SUB)
-    text(name_x + 86, y + 64, 'Created→OW  %s        Esc→Human  %s        Created→Human  %s' % (
-        _fmt_tat(summ.get('ow_p50') if summ else None),
-        _fmt_tat(summ.get('esc_human_p50') if summ else None),
-        _fmt_tat(summ.get('created_human_p50') if summ else None)), 11.5, color=INK)
+    ow    = summ.get('ow_count') if summ else None
+    hu    = summ.get('human_count') if summ else None
+    tiles = [
+        ('TOTAL CLOSED',      _fmt_int(total), INK),
+        ('OVERWATCH',         _fmt_int(ow),    BLUE),
+        ('HUMAN',             _fmt_int(hu),    AMBER),
+        ('CREATED→OW p50',    _fmt_tat(summ.get('ow_p50') if summ else None),            GREEN),
+        ('ESC→HUMAN p50',     _fmt_tat(summ.get('esc_human_p50') if summ else None),     GREEN),
+        ('CREATED→HUMAN p50', _fmt_tat(summ.get('created_human_p50') if summ else None), GREEN),
+    ]
+    tile_gap = 12; th = 80
+    tw = (Wb - 2 * margin - (len(tiles) - 1) * tile_gap) / len(tiles)
+    for i, (lab, val, col) in enumerate(tiles):
+        tx = margin + i * (tw + tile_gap)
+        d.rounded_rectangle([_px(tx), _px(y), _px(tx + tw), _px(y + th)], radius=_px(8), fill=CARD, outline=BORDER, width=SS)
+        text(tx + 14, y + 28, lab, 8.5, color=SUB)
+        text(tx + 14, y + 56, val, 18, bold=True, color=col)
     y += sec1_h
 
     # ---- Section 2 : shift tables ----
