@@ -99,48 +99,50 @@ def render_tier(rows, tier, mode, period_label):
     # ---- geometry (base px) ----
     Wb = 1180
     margin = 44
-    row_h = 30
-    title_h = 64
-    sec1_h = 96
-    shift_hdr_h = 34
-    col_hdr_h = 28
-    gap = 16
-    body = sum(shift_hdr_h + col_hdr_h + max(1, len(g)) * row_h + gap for g in shift_groups)
-    Hb = title_h + sec1_h + 18 + body + 30
+    row_h = 34
+    title_h = 70
+    sec1_h = 104
+    shift_hdr_h = 36
+    col_hdr_h = 30
+    gap = 22
+    body = sum(shift_hdr_h + 6 + col_hdr_h + max(1, len(g)) * row_h + gap for g in shift_groups)
+    Hb = title_h + sec1_h + body + 28
     W, H = _px(Wb), _px(Hb)
     img = Image.new('RGB', (W, H), BG)
     d = ImageDraw.Draw(img)
 
     def text(x, y, s, px, bold=False, color=INK, anchor='lm'):
         d.text((_px(x), _px(y)), s, font=_font(bold, _px(px)), fill=color, anchor=anchor)
+    def hline(yy, color=BORDER):
+        d.line([(_px(margin), _px(yy)), (_px(Wb - margin), _px(yy))], fill=color, width=SS)
 
-    # numeric column right edges
-    name_x = margin + 6
-    col_rx = [Wb - margin - i * 150 for i in range(len(COLS))][::-1]  # rightmost first -> reverse
+    # numeric columns: evenly spaced right edges, inset from the right margin
+    name_x = margin + 8
+    n = len(COLS); col_w = 132; right_edge = Wb - margin - 8
+    col_rx = [right_edge - (n - 1 - i) * col_w for i in range(n)]
 
-    y = 30
+    y = 32
     # ---- title ----
-    text(margin, y, '%s  Shift Report' % tier, 22, bold=True, color=INK)
-    text(Wb - margin, y, '%s  %s' % (mode.upper(), period_label), 11, color=SUB, anchor='rm')
-    y += 34
-    d.line([(_px(margin), _px(y)), (_px(Wb - margin), _px(y))], fill=BORDER, width=SS)
-    y += 22
+    text(margin, y, '%s  Shift Report' % tier, 23, bold=True, color=INK)
+    text(Wb - margin, y, '%s  ·  %s' % (mode.upper(), period_label), 11, color=SUB, anchor='rm')
+    y += 36
+    hline(y); y += 24
 
     # ---- Section 1 : summary ----
     def stat(x, label, val, color=INK):
         text(x, y, label, 9, color=SUB)
-        text(x, y + 22, val, 18, bold=True, color=color)
+        text(x, y + 24, val, 19, bold=True, color=color)
     total = summ.get('total_closed') if summ else None
     ow = summ.get('ow_count') if summ else None
     hu = summ.get('human_count') if summ else None
-    stat(margin + 6, 'TOTAL CLOSED', _fmt_int(total))
-    stat(margin + 196, 'OVERWATCH', _fmt_int(ow), BLUE)
-    stat(margin + 356, 'HUMAN', _fmt_int(hu), AMBER)
-    # TAT p50 trio (right of summary)
-    text(margin + 6, y + 56, 'p50 TAT (min):  Created->OW  %s    Esc->Human  %s    Created->Human  %s' % (
+    stat(name_x, 'TOTAL CLOSED', _fmt_int(total))
+    stat(name_x + 200, 'OVERWATCH', _fmt_int(ow), BLUE)
+    stat(name_x + 360, 'HUMAN', _fmt_int(hu), AMBER)
+    text(name_x, y + 64, 'p50 TAT', 9, color=SUB)
+    text(name_x + 86, y + 64, 'Created→OW  %s        Esc→Human  %s        Created→Human  %s' % (
         _fmt_tat(summ.get('ow_p50') if summ else None),
         _fmt_tat(summ.get('esc_human_p50') if summ else None),
-        _fmt_tat(summ.get('created_human_p50') if summ else None)), 11, color=INK)
+        _fmt_tat(summ.get('created_human_p50') if summ else None)), 11.5, color=INK)
     y += sec1_h
 
     # ---- Section 2 : shift tables ----
@@ -148,20 +150,21 @@ def render_tier(rows, tier, mode, period_label):
         shift_name = grp[0].get('shift') if grp else '-'
         # shift header bar
         d.rounded_rectangle([_px(margin), _px(y), _px(Wb - margin), _px(y + shift_hdr_h)], radius=_px(6), fill=HEAD)
-        text(margin + 10, y + shift_hdr_h / 2, 'Shift  %s' % shift_name, 12, bold=True, color=INK)
-        text(Wb - margin - 10, y + shift_hdr_h / 2, '%d agents' % len(grp), 10, color=SUB, anchor='rm')
-        y += shift_hdr_h + 4
+        text(margin + 12, y + shift_hdr_h / 2, 'Shift  %s' % shift_name, 12.5, bold=True, color=INK)
+        text(Wb - margin - 12, y + shift_hdr_h / 2, '%d agents' % len(grp), 10, color=SUB, anchor='rm')
+        y += shift_hdr_h + 6
         # column header
-        text(name_x, y + col_hdr_h / 2, 'Agent', 9.5, bold=True, color=SUB)
+        text(name_x, y + col_hdr_h / 2, 'AGENT', 9, bold=True, color=SUB)
         for (label, _), rx in zip(COLS, col_rx):
-            text(rx, y + col_hdr_h / 2, label, 9.5, bold=True, color=SUB, anchor='rm')
+            text(rx, y + col_hdr_h / 2, label.upper(), 9, bold=True, color=SUB, anchor='rm')
         y += col_hdr_h
+        hline(y)
         # rows
         for i, r in enumerate(grp):
             cy = y + row_h / 2
             if i % 2 == 0:
                 d.rectangle([_px(margin), _px(y), _px(Wb - margin), _px(y + row_h)], fill=CARD)
-            text(name_x, cy, (r.get('agent_name') or '-')[:34], 11, color=INK)
+            text(name_x, cy, (r.get('agent_name') or '-')[:34], 11.5, color=INK)
             vals = [
                 (_fmt_int(r.get('total_closed')), INK),
                 (_fmt_int(r.get('reopen_count')), INK),
@@ -170,7 +173,7 @@ def render_tier(rows, tier, mode, period_label):
                 (_fmt_pct(r.get('csat_pos_pct')), _csat_color(r.get('csat_pos_pct'), r.get('csat_n'))),
             ]
             for (s, col), rx in zip(vals, col_rx):
-                text(rx, cy, s, 11, color=col)
+                text(rx, cy, s, 11.5, color=col, anchor='rm')
             y += row_h
         y += gap
 
