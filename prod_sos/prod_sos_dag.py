@@ -1,52 +1,61 @@
 """
 Prod SOS Alert - Slack DAG (every 5 min, IST)
 
-Posts ONE Slack message (with @channel) for a NEW ticket that qualifies as a Prod SOS on a
-live production site and needs pickup, i.e. ALL of:
-  * it carries the `Prod SOS` tag  (v_tags label 'Prod SOS', tag_id 6a0c44a4c272432bd9f53bf1), AND
+Posts a Slack alert for every NEW ticket that qualifies as a Prod SOS on a live production site:
+  * carries the `Prod SOS` tag, AND
   * `custom_fields_live_production = TRUE`, AND
-  * the ticket is unassigned (`assigned_agent_id IS NULL`), AND
-  * status is OPEN or PENDING, AND
-  * the Prod SOS tag was added within the last LOOKBACK_MINUTES (only NEW tickets; anything
-    older is ignored - this is what keeps the existing backlog out).
+  * unassigned (`assigned_agent_id IS NULL`), AND
+  * status OPEN or PENDING, AND
+  * the Prod SOS tag was added within the last LOOKBACK_MINUTES (NEW only; backlog excluded).
 
-Each ticket is alerted exactly once (dedup state table support.prod_sos_pinged). The DAG runs
-every 5 min, so a ticket is alerted within ~5 min of being tagged. Because only recently-tagged
-tickets fire, the DAG is safe to run active immediately on merge (no backlog flood).
+ARCHITECTURE (per IST date):
+  * The FIRST qualifying ticket of the day posts a MASTER message to the channel WITH @channel:
+        <!channel> :rotating_light: *Prod SOS — Live Production* (29 Jun 2026)
+  * EVERY qualifying ticket (including that first one) is then posted as a THREADED REPLY under
+    that day's master message (no @channel on the replies, so the channel is pinged once/day):
+        #27709 · L3 · OPEN · weekly visitors: 30
+        Production MongoDB data deletion & credit consumption issue
+        tagged 15:52 IST · 4 min ago
 
-Sources (all Trinity):
-  Prod SOS tag added  -> v_ticket_events (action='tag_added', JSON_VALUE(new_value)='Prod SOS')
-  Live Production     -> v_tickets.custom_fields_live_production (BOOL)
-  Assignment / status -> v_tickets.assigned_agent_id / status
-  Ticket fields       -> v_tickets (num, level, status, subject, weekly_average_visitors)
+WHERE THE LOGIC LIVES:
+  * QUALIFYING FILTER LOGIC  -> Redash query #PROD_SOS_QUERY_ID  (edit there, no DAG change needed)
+  * dedup + master/thread plumbing -> this DAG (support.prod_sos_pinged + support.prod_sos_master)
+
+Each ticket is alerted exactly once (dedup state table support.prod_sos_pinged). The DAG runs every
+5 min, so a ticket is alerted within ~5 min of being tagged. Because only recently-tagged tickets
+fire, the DAG is safe to run active immediately on merge (no backlog flood).
 
 Schedule: '*/5 * * * *' Asia/Kolkata.
 Channel:  community-builders-l2-l1 (C0937QNFJEM); override PROD_SOS_SLACK_CHANNEL env for testing.
 """
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone, timedelta
 import logging, os
 
 import pendulum
+import requests
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 
-from utils.slack.slack_config import SLACK_BOT_TOKEN_ALERTS as SLACK_BOT_TOKEN
-from utils.slack.slack_client import SlackNotifier
+from utils.slack import RedashClient
+from utils.slack.slack_config import (
+    REDASH_API_KEY, REDASH_BASE_URL,
+    SLACK_BOT_TOKEN_ALERTS as SLACK_BOT_TOKEN,
+)
 from utils.slack.bigquery_client import get_bigquery_client
 
 logger = logging.getLogger(__name__)
 
 # ==================== CONFIG ====================
 # Live channel: community-builders-l2-l1. For testing, override PROD_SOS_SLACK_CHANNEL to the test channel.
-SLACK_CHANNEL_ID = os.getenv('PROD_SOS_SLACK_CHANNEL', 'C0937QNFJEM')  # community-builders-l2-l1
-PROD_SOS_TAG_ID  = '6a0c44a4c272432bd9f53bf1'
-STATE_TABLE      = 'emergent-default.support.prod_sos_pinged'
-LOOKBACK_MINUTES = 20    # only alert tickets tagged Prod SOS within this many minutes; ignore anything older
+SLACK_CHANNEL_ID   = os.getenv('PROD_SOS_SLACK_CHANNEL', 'C0937QNFJEM')  # community-builders-l2-l1
+PROD_SOS_QUERY_ID  = 38606          # Redash: "[Prod SOS] Live Production alert feed" (edit filters there)
+PING_TABLE         = 'emergent-default.support.prod_sos_pinged'   # per-ticket dedup
+MASTER_TABLE       = 'emergent-default.support.prod_sos_master'   # one master message per (IST date, channel)
 
-# ==================== STATE TABLE (dedup) ====================
-DDL = f"""
-CREATE TABLE IF NOT EXISTS `{STATE_TABLE}` (
+# ==================== STATE TABLES ====================
+DDL_PING = f"""
+CREATE TABLE IF NOT EXISTS `{PING_TABLE}` (
   ticket_id STRING,
   num INT64,
   level STRING,
@@ -54,48 +63,46 @@ CREATE TABLE IF NOT EXISTS `{STATE_TABLE}` (
   pinged_at TIMESTAMP
 )
 """
-
-# ==================== BIGQUERY QUERY ====================
-QUERY = f"""
-WITH
-sos_evt AS (  -- when the Prod SOS tag was added (recent only, for cost)
-  SELECT ticket_id, MIN(created_at) AS sos_tagged_at
-  FROM `emergent-default.trinity_database.v_ticket_events`
-  WHERE action='tag_added' AND JSON_VALUE(new_value)='Prod SOS'
-    AND created_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 3 HOUR)
-  GROUP BY 1
-),
-lt AS (
-  SELECT _id, num, level, status, subject, tag_ids, assigned_agent_id,
-         custom_fields_live_production AS live_prod,
-         custom_fields_weekly_average_visitors AS weekly_visitors
-  FROM `emergent-default.trinity_database.v_tickets`
-  QUALIFY ROW_NUMBER() OVER (PARTITION BY _id ORDER BY source_timestamp DESC)=1
+DDL_MASTER = f"""
+CREATE TABLE IF NOT EXISTS `{MASTER_TABLE}` (
+  ist_date STRING,
+  channel STRING,
+  thread_ts STRING,
+  created_at TIMESTAMP
 )
-SELECT
-  lt._id AS ticket_id,
-  CAST(lt.num AS INT64) AS num,
-  lt.level, lt.status, lt.subject,
-  CAST(lt.weekly_visitors AS INT64) AS weekly_visitors,
-  FORMAT_TIMESTAMP('%H:%M', s.sos_tagged_at, 'Asia/Kolkata') AS sos_tagged_ist,
-  CONCAT('https://trinity-base.internal.emergent.host/tickets/', lt._id) AS ticket_url,
-  TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), s.sos_tagged_at, MINUTE) AS mins_since_tagged
-FROM lt
-JOIN sos_evt s ON s.ticket_id=lt._id                  -- must have a (recent) Prod SOS tag event
-LEFT JOIN `{STATE_TABLE}` p ON p.ticket_id=lt._id
-WHERE '{PROD_SOS_TAG_ID}' IN UNNEST(lt.tag_ids)        -- Prod SOS tag
-  AND lt.live_prod IS TRUE                             -- Live Production
-  AND lt.assigned_agent_id IS NULL                     -- unassigned
-  AND UPPER(lt.status) IN ('OPEN','PENDING')           -- active only
-  AND TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), s.sos_tagged_at, MINUTE) <= {LOOKBACK_MINUTES}  -- new only
-  AND p.ticket_id IS NULL                              -- not already alerted
-ORDER BY s.sos_tagged_at
 """
 
 
-# ==================== HELPERS ====================
+# ==================== SLACK ====================
 
-def build_message(row):
+def slack_post(channel, text, thread_ts=None):
+    """Post a message via chat.postMessage; returns the message ts. Raises on failure."""
+    payload = {'channel': channel, 'text': text, 'unfurl_links': False, 'unfurl_media': False}
+    if thread_ts:
+        payload['thread_ts'] = thread_ts
+    resp = requests.post(
+        'https://slack.com/api/chat.postMessage',
+        headers={'Authorization': 'Bearer %s' % SLACK_BOT_TOKEN,
+                 'Content-Type': 'application/json; charset=utf-8'},
+        json=payload, timeout=30,
+    )
+    data = resp.json()
+    if not data.get('ok'):
+        raise Exception('chat.postMessage failed: %s' % data.get('error'))
+    return data['ts']
+
+
+def build_master_text(ist_date):
+    """ist_date is 'YYYY-MM-DD' (IST). -> '<!channel> ... (29 Jun 2026)'."""
+    try:
+        label = datetime.strptime(ist_date, '%Y-%m-%d').strftime('%-d %b %Y')
+    except Exception:
+        label = ist_date
+    return '<!channel> :rotating_light: *Prod SOS — Live Production* (%s)' % label
+
+
+def build_alert_text(row):
+    """Threaded reply for a single ticket (no @channel)."""
     link = '<%s|#%s>' % (row['ticket_url'], row['num'])
     subj = (row['subject'] or '').strip()
     if len(subj) > 90:
@@ -108,61 +115,86 @@ def build_message(row):
     if when is not None:
         ago = ('%d min ago' % mins) if mins is not None else ''
         when_txt = '\ntagged %s IST%s' % (when, (' · ' + ago) if ago else '')
-    return (
-        '<!channel> :rotating_light: *Prod SOS — Live Production*\n'
-        '%s · %s · %s%s\n'
-        '%s%s'
-        % (link, row['level'] or '—', row['status'] or '—', vis_txt, subj, when_txt)
-    )
+    return ('%s · %s · %s%s\n%s%s'
+            % (link, row['level'] or '—', row['status'] or '—', vis_txt, subj, when_txt))
 
 
 # ==================== MAIN TASK ====================
 
 def run_prod_sos(**context):
     logger.info('=' * 60)
-    logger.info('PROD SOS ALERT: QUERY & POST')
+    logger.info('PROD SOS ALERT: FETCH (Redash #%s) & POST', PROD_SOS_QUERY_ID)
     logger.info('=' * 60)
 
-    client   = get_bigquery_client()
-    notifier = SlackNotifier(SLACK_BOT_TOKEN, SLACK_CHANNEL_ID)
+    client = get_bigquery_client()
 
-    logger.info('[1] Ensuring state table exists...')
-    client.query(DDL).result()
+    logger.info('[1] Ensuring state tables exist...')
+    client.query(DDL_PING).result()
+    client.query(DDL_MASTER).result()
 
-    logger.info('[2] Querying NEW Prod SOS + Live Production + unassigned tickets (tagged <= %d min ago)...', LOOKBACK_MINUTES)
-    rows = list(client.query(QUERY).result())
-    logger.info('      %d ticket(s) to alert', len(rows))
+    logger.info('[2] Fetching qualifying tickets from Redash #%s ...', PROD_SOS_QUERY_ID)
+    redash = RedashClient(api_key=REDASH_API_KEY, base_url=REDASH_BASE_URL)
+    rows = redash.fetch_query_results(query_id=PROD_SOS_QUERY_ID, max_retries=3) or []
+    logger.info('      %d qualifying ticket(s) from Redash', len(rows))
     if not rows:
+        logger.info('PROD SOS ALERT: nothing qualifying')
+        return
+
+    # [3] dedup against tickets already alerted
+    already = {r.ticket_id for r in client.query(
+        f"SELECT ticket_id FROM `{PING_TABLE}`").result()}
+    new_rows = [r for r in rows if r.get('ticket_id') not in already]
+    logger.info('      %d new ticket(s) after dedup (%d already alerted)',
+                len(new_rows), len(rows) - len(new_rows))
+    if not new_rows:
         logger.info('PROD SOS ALERT: nothing new')
         return
 
-    pinged = []
-    now_iso = datetime.now(timezone.utc).isoformat()
-    for r in rows:
-        row = {
-            'ticket_id': r.ticket_id, 'num': r.num, 'level': r.level, 'status': r.status,
-            'subject': r.subject, 'weekly_visitors': r.weekly_visitors, 'ticket_url': r.ticket_url,
-            'sos_tagged_ist': r.sos_tagged_ist, 'mins_since_tagged': r.mins_since_tagged,
-        }
-        try:
-            notifier.send_message(build_message(row), mrkdwn=True, unfurl_links=False, unfurl_media=False)
-            pinged.append({
-                'ticket_id': row['ticket_id'], 'num': row['num'],
-                'level': row['level'], 'status': row['status'], 'pinged_at': now_iso,
-            })
-            logger.info('      alerted #%s', row['num'])
-        except Exception as e:
-            logger.error('      failed to post for #%s: %s', row['num'], e)
+    # [4] load existing master threads for this channel: {ist_date: thread_ts}
+    masters = {r.ist_date: r.thread_ts for r in client.query(
+        f"SELECT ist_date, thread_ts FROM `{MASTER_TABLE}` WHERE channel='{SLACK_CHANNEL_ID}'"
+    ).result()}
 
+    pinged, new_masters = [], []
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    for r in new_rows:
+        ist_date = r.get('sos_tagged_date_ist')
+
+        # ensure a master message exists for this IST date + channel
+        thread_ts = masters.get(ist_date)
+        if not thread_ts:
+            try:
+                thread_ts = slack_post(SLACK_CHANNEL_ID, build_master_text(ist_date))
+                masters[ist_date] = thread_ts
+                new_masters.append({'ist_date': ist_date, 'channel': SLACK_CHANNEL_ID,
+                                    'thread_ts': thread_ts, 'created_at': now_iso})
+                logger.info('      posted master for %s (ts=%s)', ist_date, thread_ts)
+            except Exception as e:
+                logger.error('      failed to post master for %s: %s — skipping its tickets', ist_date, e)
+                continue
+
+        # post the ticket as a threaded reply
+        try:
+            slack_post(SLACK_CHANNEL_ID, build_alert_text(r), thread_ts=thread_ts)
+            pinged.append({'ticket_id': r.get('ticket_id'), 'num': r.get('num'),
+                           'level': r.get('level'), 'status': r.get('status'), 'pinged_at': now_iso})
+            logger.info('      alerted #%s under %s', r.get('num'), ist_date)
+        except Exception as e:
+            logger.error('      failed to post for #%s: %s', r.get('num'), e)
+
+    # [5] persist state
+    if new_masters:
+        errs = client.insert_rows_json(client.get_table(MASTER_TABLE), new_masters)
+        if errs:
+            logger.error('      master-table insert errors: %s', errs)
     if pinged:
-        logger.info('[3] Recording %d alerted ticket(s) in state table...', len(pinged))
-        table = client.get_table(STATE_TABLE)
-        errors = client.insert_rows_json(table, pinged)
-        if errors:
-            logger.error('      state-table insert errors: %s', errors)
+        errs = client.insert_rows_json(client.get_table(PING_TABLE), pinged)
+        if errs:
+            logger.error('      ping-table insert errors: %s', errs)
 
     logger.info('=' * 60)
-    logger.info('PROD SOS ALERT: COMPLETE (%d alerted)', len(pinged))
+    logger.info('PROD SOS ALERT: COMPLETE (%d alerted, %d master(s) posted)', len(pinged), len(new_masters))
     logger.info('=' * 60)
 
 
@@ -181,7 +213,7 @@ default_args = {
 dag = DAG(
     'prod_sos_slack',
     default_args=default_args,
-    description='Alert @channel when a NEW unassigned OPEN/PENDING ticket is Prod SOS + Live Production',
+    description='Alert when a NEW unassigned OPEN/PENDING ticket is Prod SOS + Live Production (master+thread, Redash-backed)',
     schedule_interval='*/5 * * * *',  # every 5 min, Asia/Kolkata
     catchup=False,
     is_paused_upon_creation=False,  # active on merge; only recently-tagged tickets fire, so no backlog flood
