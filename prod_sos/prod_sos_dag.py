@@ -168,6 +168,7 @@ def run_prod_sos(**context):
         # channel + tag come from the query row; env override forces a single channel (testing)
         channel = ENV_CHANNEL_OVERRIDE or r.get('channel_id') or FALLBACK_CHANNEL
         tag     = r.get('channel_tag') or DEFAULT_TAG
+        chan_name = r.get('channel_name') or channel   # for log clarity only
         key     = (ist_date, channel)
 
         # ensure a master message exists for this IST date + channel
@@ -178,7 +179,7 @@ def run_prod_sos(**context):
                 masters[key] = thread_ts
                 new_masters.append({'ist_date': ist_date, 'channel': channel,
                                     'thread_ts': thread_ts, 'created_at': now_iso})
-                logger.info('      posted master for %s in %s (ts=%s)', ist_date, channel, thread_ts)
+                logger.info('      posted master for %s in %s [%s] (ts=%s)', ist_date, chan_name, channel, thread_ts)
             except Exception as e:
                 logger.error('      failed to post master for %s/%s: %s — skipping its tickets',
                              ist_date, channel, e)
