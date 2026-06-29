@@ -47,8 +47,13 @@ from utils.slack.bigquery_client import get_bigquery_client
 logger = logging.getLogger(__name__)
 
 # ==================== CONFIG ====================
-# Live channel: community-builders-l2-l1. For testing, override PROD_SOS_SLACK_CHANNEL to the test channel.
-SLACK_CHANNEL_ID   = os.getenv('PROD_SOS_SLACK_CHANNEL', 'C0937QNFJEM')  # community-builders-l2-l1
+# Channel + @-mention come from the Redash query (channel_id / channel_name / channel_tag), so
+# rerouting or changing the POC is a query edit, not a code change.
+#   * ENV_CHANNEL_OVERRIDE: set PROD_SOS_SLACK_CHANNEL to force ALL alerts to one channel (testing).
+#   * FALLBACK_CHANNEL / DEFAULT_TAG: used only if the query row leaves them blank.
+ENV_CHANNEL_OVERRIDE = os.getenv('PROD_SOS_SLACK_CHANNEL')  # testing override; prod leaves this unset
+FALLBACK_CHANNEL     = 'C0937QNFJEM'   # community-builders-l2-l1
+DEFAULT_TAG          = '<!channel>'
 PROD_SOS_QUERY_ID  = 38606          # Redash: "[Prod SOS] Live Production alert feed" (edit filters there)
 PING_TABLE         = 'emergent-default.support.prod_sos_pinged'   # per-ticket dedup
 MASTER_TABLE       = 'emergent-default.support.prod_sos_master'   # one master message per (IST date, channel)
@@ -92,13 +97,13 @@ def slack_post(channel, text, thread_ts=None):
     return data['ts']
 
 
-def build_master_text(ist_date):
-    """ist_date is 'YYYY-MM-DD' (IST). -> '<!channel> ... (29 Jun 2026)'."""
+def build_master_text(ist_date, tag):
+    """ist_date is 'YYYY-MM-DD' (IST); tag is the @-mention (from the query). -> master text."""
     try:
         label = datetime.strptime(ist_date, '%Y-%m-%d').strftime('%-d %b %Y')
     except Exception:
         label = ist_date
-    return '<!channel> :rotating_light: *Prod SOS — Live Production* (%s)' % label
+    return '%s :rotating_light: *Prod SOS — Live Production* (%s)' % (tag or DEFAULT_TAG, label)
 
 
 def build_alert_text(row):
@@ -150,9 +155,9 @@ def run_prod_sos(**context):
         logger.info('PROD SOS ALERT: nothing new')
         return
 
-    # [4] load existing master threads for this channel: {ist_date: thread_ts}
-    masters = {r.ist_date: r.thread_ts for r in client.query(
-        f"SELECT ist_date, thread_ts FROM `{MASTER_TABLE}` WHERE channel='{SLACK_CHANNEL_ID}'"
+    # [4] load existing master threads: {(ist_date, channel): thread_ts}
+    masters = {(r.ist_date, r.channel): r.thread_ts for r in client.query(
+        f"SELECT ist_date, channel, thread_ts FROM `{MASTER_TABLE}`"
     ).result()}
 
     pinged, new_masters = [], []
@@ -160,26 +165,31 @@ def run_prod_sos(**context):
 
     for r in new_rows:
         ist_date = r.get('sos_tagged_date_ist')
+        # channel + tag come from the query row; env override forces a single channel (testing)
+        channel = ENV_CHANNEL_OVERRIDE or r.get('channel_id') or FALLBACK_CHANNEL
+        tag     = r.get('channel_tag') or DEFAULT_TAG
+        key     = (ist_date, channel)
 
         # ensure a master message exists for this IST date + channel
-        thread_ts = masters.get(ist_date)
+        thread_ts = masters.get(key)
         if not thread_ts:
             try:
-                thread_ts = slack_post(SLACK_CHANNEL_ID, build_master_text(ist_date))
-                masters[ist_date] = thread_ts
-                new_masters.append({'ist_date': ist_date, 'channel': SLACK_CHANNEL_ID,
+                thread_ts = slack_post(channel, build_master_text(ist_date, tag))
+                masters[key] = thread_ts
+                new_masters.append({'ist_date': ist_date, 'channel': channel,
                                     'thread_ts': thread_ts, 'created_at': now_iso})
-                logger.info('      posted master for %s (ts=%s)', ist_date, thread_ts)
+                logger.info('      posted master for %s in %s (ts=%s)', ist_date, channel, thread_ts)
             except Exception as e:
-                logger.error('      failed to post master for %s: %s — skipping its tickets', ist_date, e)
+                logger.error('      failed to post master for %s/%s: %s — skipping its tickets',
+                             ist_date, channel, e)
                 continue
 
-        # post the ticket as a threaded reply
+        # post the ticket as a threaded reply (no @-mention on replies)
         try:
-            slack_post(SLACK_CHANNEL_ID, build_alert_text(r), thread_ts=thread_ts)
+            slack_post(channel, build_alert_text(r), thread_ts=thread_ts)
             pinged.append({'ticket_id': r.get('ticket_id'), 'num': r.get('num'),
                            'level': r.get('level'), 'status': r.get('status'), 'pinged_at': now_iso})
-            logger.info('      alerted #%s under %s', r.get('num'), ist_date)
+            logger.info('      alerted #%s under %s in %s', r.get('num'), ist_date, channel)
         except Exception as e:
             logger.error('      failed to post for #%s: %s', r.get('num'), e)
 
