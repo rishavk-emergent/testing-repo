@@ -1,63 +1,61 @@
 """
 RealL3 Escalation Hygiene Nag - Slack DAG (every 30 min, IST)
 
-When an agent escalates a ticket to L3 and tags it `real_l3`, they are expected to,
-within 1 hour of that escalation:
-  1. set the team,
-  2. add the Slack link,
-  3. reply to the customer themselves.
+When an agent escalates a ticket to L3 and tags it `real_l3`, they are expected to, within 1
+hour of that escalation: (1) set the team, (2) add the Slack link, (3) reply to the customer
+themselves. This DAG runs every 30 min and, for each real_l3 ticket whose escalation was
+SLA..WINDOW min ago and that still has ANY of those 3 missing, posts a Slack message
+@-mentioning the escalator listing the missing item(s). Each ticket is pinged only once
+(support.real_l3_hygiene_pinged).
 
-This DAG runs every 30 min and, for each real_l3 ticket whose escalation was 1-3 hours
-ago and that still has ANY of those 3 missing, posts ONE Slack message @-mentioning the
-escalator (the person who added the real_l3 tag) listing the missing item(s). Each ticket
-is pinged only once (tracked in a state table).
+ARCHITECTURE (per IST date, like prod_sos):
+  * The first hygiene ping of the day posts a MASTER message to the channel:
+        :rotating_light: *real_l3 escalation hygiene* (1 Jul 2026)
+  * Every ping is posted as a THREADED REPLY under that day's master, @-mentioning the escalator:
+        @escalator · #12345 — missing: *team, slack link*
+        Please complete: set the team, add the Slack link, and reply to the customer.
 
-All three hygiene checks count an action done at any time from GRACE_MINUTES (60 min) BEFORE
-the real_l3 tag onward (i.e. tag_time - 60 min, no upper bound). The 60-min look-back is
-deliberate: agents typically reply to the customer FIRST and tag real_l3 a few seconds-to-
-minutes later, so a reply timestamped just before the tag is still valid hygiene (the old
-"strictly after the tag" check produced false positives on exactly this ordering).
+WHERE THE LOGIC LIVES:
+  * QUALIFYING FILTER + SLA/WINDOW/GRACE + ROUTING -> Redash query #HYGIENE_QUERY_ID
+    (channel_id / channel_name / channel_tag are columns there; edit filters/routing there,
+     no DAG change needed).
+  * dedup + master/thread plumbing + escalator Slack lookup -> this DAG.
 
-Who/when escalated  -> the `tag_added` 'real_l3' audit event (actor_agent_id + created_at).
-Team done?          -> a team_assigned / team_changed event from tag -60 min onward (any actor).
-Slack link done?    -> a slack_link_updated event from tag -60 min onward (any actor).
-Customer reply done?-> a public outbound message authored by the ESCALATOR from tag -60 min onward.
-                       (Escalator-specific: if someone else replied, the escalator is still pinged.)
-Escalator -> Slack   -> v_agents.email -> Slack users.lookupByEmail (@mention).
-
-Window: only tickets escalated 1-2 h ago are considered, so at go-live we don't flood the
-channel with the whole existing backlog; combined with the state table this gives each new
-escalation a single ping ~1-1.5 h after it happens.
-
-Schedule: '*/30 * * * *' in Asia/Kolkata. Channel: community-builders-l2-l1 (override via env for tests).
-Dedup state: support.real_l3_hygiene_pinged (created on first run if absent).
+Schedule: '*/30 * * * *' Asia/Kolkata. Channel: from the query (community-builders-l2-l1);
+override REAL_L3_HYGIENE_SLACK_CHANNEL env to force the test channel.
 """
 
 from datetime import datetime, timedelta, timezone
 import logging, os, json, urllib.request, urllib.parse
 
 import pendulum
+import requests
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 
-from utils.slack.slack_config import SLACK_BOT_TOKEN_ALERTS as SLACK_BOT_TOKEN
-from utils.slack.slack_client import SlackNotifier
+from utils.slack import RedashClient
+from utils.slack.slack_config import (
+    REDASH_API_KEY, REDASH_BASE_URL,
+    SLACK_BOT_TOKEN_ALERTS as SLACK_BOT_TOKEN,
+)
 from utils.slack.bigquery_client import get_bigquery_client
 
 logger = logging.getLogger(__name__)
 
 # ==================== CONFIG ====================
-# Target channel is community-builders-l2-l1; override to the test channel via env for dry runs.
-SLACK_CHANNEL_ID = os.getenv('REAL_L3_HYGIENE_SLACK_CHANNEL', 'C0937QNFJEM')  # community-builders-l2-l1
-REAL_L3_TAG_ID   = '6a1f2e835ad901b459b7665f'
-STATE_TABLE      = 'emergent-default.support.real_l3_hygiene_pinged'
-SLA_MINUTES      = 60    # ping only once the escalation is at least this old
-WINDOW_MINUTES   = 120   # ...and at most this old (>2h = stale, no nag)
-GRACE_MINUTES    = 60    # look-back: hygiene actions count if done at any time from this many min BEFORE the tag onward
+# Channel + master @-mention come from the Redash query (channel_id / channel_name / channel_tag).
+#   * ENV override forces ALL pings to one channel (testing).
+#   * FALLBACK_CHANNEL / DEFAULT_TAG used only if the query row leaves them blank.
+ENV_CHANNEL_OVERRIDE = os.getenv('REAL_L3_HYGIENE_SLACK_CHANNEL')  # testing override; prod leaves unset
+FALLBACK_CHANNEL     = 'C0937QNFJEM'   # community-builders-l2-l1
+DEFAULT_TAG          = ''              # blank = no group @-mention on the master (escalator is pinged in-thread)
+HYGIENE_QUERY_ID     = 38914           # Redash: "[Real L3] escalation hygiene feed"
+PING_TABLE           = 'emergent-default.support.real_l3_hygiene_pinged'   # per-ticket dedup
+MASTER_TABLE         = 'emergent-default.support.real_l3_hygiene_master'   # one master per (IST date, channel)
 
-# ==================== STATE TABLE (dedup) ====================
-DDL = f"""
-CREATE TABLE IF NOT EXISTS `{STATE_TABLE}` (
+# ==================== STATE TABLES ====================
+DDL_PING = f"""
+CREATE TABLE IF NOT EXISTS `{PING_TABLE}` (
   ticket_id STRING,
   num INT64,
   escalator_email STRING,
@@ -65,79 +63,34 @@ CREATE TABLE IF NOT EXISTS `{STATE_TABLE}` (
   pinged_at TIMESTAMP
 )
 """
-
-# ==================== BIGQUERY QUERY ====================
-# Candidates: real_l3, OPEN/PENDING, escalated SLA_MINUTES..WINDOW_MINUTES ago, with a gap,
-# and not already pinged (LEFT JOIN the state table).
-QUERY = f"""
-WITH
-lt AS (
-  SELECT _id, num, level, status, tag_ids
-  FROM `emergent-default.trinity_database.v_tickets`
-  QUALIFY ROW_NUMBER() OVER (PARTITION BY _id ORDER BY source_timestamp DESC)=1
-),
-esc AS (  -- escalation event: who added the real_l3 tag, and when
-  SELECT ticket_id, actor_agent_id AS escalator_id, created_at AS esc_ts
-  FROM `emergent-default.trinity_database.v_ticket_events`
-  WHERE type='audit' AND action='tag_added' AND JSON_VALUE(new_value)='real_l3'
-  QUALIFY ROW_NUMBER() OVER (PARTITION BY ticket_id ORDER BY created_at)=1
-),
-team_ok AS (  -- team set from tag -GRACE_MINUTES min onward (any actor)
-  SELECT DISTINCT e.ticket_id
-  FROM `emergent-default.trinity_database.v_ticket_events` e
-  JOIN esc ON esc.ticket_id=e.ticket_id
-  WHERE e.action IN ('team_assigned','team_changed')
-    AND e.created_at >= TIMESTAMP_SUB(esc.esc_ts, INTERVAL {GRACE_MINUTES} MINUTE)
-),
-slack_ok AS (  -- slack link added from tag -GRACE_MINUTES min onward (any actor)
-  SELECT DISTINCT e.ticket_id
-  FROM `emergent-default.trinity_database.v_ticket_events` e
-  JOIN esc ON esc.ticket_id=e.ticket_id
-  WHERE e.action='slack_link_updated'
-    AND e.created_at >= TIMESTAMP_SUB(esc.esc_ts, INTERVAL {GRACE_MINUTES} MINUTE)
-),
-reply AS (  -- the escalator's own public outbound reply from tag -GRACE_MINUTES min onward
-  SELECT e.ticket_id
-  FROM `emergent-default.trinity_database.v_ticket_events` e
-  JOIN esc ON esc.ticket_id=e.ticket_id
-  WHERE e.type='message' AND e.direction='outbound' AND e.visibility='public'
-    AND e.actor_kind='AGENT' AND e.actor_agent_id=esc.escalator_id
-    AND e.created_at >= TIMESTAMP_SUB(esc.esc_ts, INTERVAL {GRACE_MINUTES} MINUTE)
-  GROUP BY e.ticket_id
-),
-ag AS (
-  SELECT _id, email, first_name, last_name
-  FROM `emergent-default.trinity_database.v_agents`
-  QUALIFY ROW_NUMBER() OVER (PARTITION BY _id ORDER BY source_timestamp DESC)=1
+DDL_MASTER = f"""
+CREATE TABLE IF NOT EXISTS `{MASTER_TABLE}` (
+  ist_date STRING,
+  channel STRING,
+  thread_ts STRING,
+  created_at TIMESTAMP
 )
-SELECT
-  lt._id AS ticket_id,
-  CAST(lt.num AS INT64) AS num,
-  CONCAT('https://trinity-base.internal.emergent.host/tickets/', lt._id) AS ticket_url,
-  ag.email AS escalator_email,
-  NULLIF(TRIM(CONCAT(IFNULL(ag.first_name,''),' ',IFNULL(ag.last_name,''))),'') AS escalator_name,
-  (team_ok.ticket_id IS NOT NULL)  AS team_done,
-  (slack_ok.ticket_id IS NOT NULL) AS slack_done,
-  (reply.ticket_id IS NOT NULL)    AS reply_done,
-  TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), esc.esc_ts, MINUTE) AS mins_since_esc
-FROM lt
-JOIN esc ON esc.ticket_id=lt._id
-LEFT JOIN team_ok  ON team_ok.ticket_id=lt._id
-LEFT JOIN slack_ok ON slack_ok.ticket_id=lt._id
-LEFT JOIN reply    ON reply.ticket_id=lt._id
-LEFT JOIN ag       ON ag._id=esc.escalator_id
-LEFT JOIN `{STATE_TABLE}` p ON p.ticket_id=lt._id
-WHERE lt.level='L3'
-  AND UPPER(lt.status) IN ('OPEN','PENDING')
-  AND '{REAL_L3_TAG_ID}' IN UNNEST(lt.tag_ids)
-  AND TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), esc.esc_ts, MINUTE) BETWEEN {SLA_MINUTES} AND {WINDOW_MINUTES}
-  AND NOT ((team_ok.ticket_id IS NOT NULL) AND (slack_ok.ticket_id IS NOT NULL) AND (reply.ticket_id IS NOT NULL))
-  AND p.ticket_id IS NULL
-ORDER BY esc.esc_ts
 """
 
 
-# ==================== HELPERS ====================
+# ==================== SLACK ====================
+
+def slack_post(channel, text, thread_ts=None):
+    """Post via chat.postMessage; returns the message ts. Raises on failure."""
+    payload = {'channel': channel, 'text': text, 'unfurl_links': False, 'unfurl_media': False}
+    if thread_ts:
+        payload['thread_ts'] = thread_ts
+    resp = requests.post(
+        'https://slack.com/api/chat.postMessage',
+        headers={'Authorization': 'Bearer %s' % SLACK_BOT_TOKEN,
+                 'Content-Type': 'application/json; charset=utf-8'},
+        json=payload, timeout=30,
+    )
+    data = resp.json()
+    if not data.get('ok'):
+        raise Exception('chat.postMessage failed: %s' % data.get('error'))
+    return data['ts']
+
 
 def _slack_uid(email, token):
     """Resolve an email to a Slack user id (needs users:read.email). None if not found."""
@@ -155,74 +108,114 @@ def _slack_uid(email, token):
 
 def _missing_list(row):
     miss = []
-    if not row['team_done']:  miss.append('team')
-    if not row['slack_done']: miss.append('slack link')
-    if not row['reply_done']: miss.append('customer response')
+    if not row.get('team_done'):  miss.append('team')
+    if not row.get('slack_done'): miss.append('slack link')
+    if not row.get('reply_done'): miss.append('customer response')
     return miss
 
 
-def build_message(row, uid):
+def build_master_text(ist_date, tag):
+    """Day's master header; tag (from query) is blank by default -> no group @-mention."""
+    try:
+        label = datetime.strptime(ist_date, '%Y-%m-%d').strftime('%-d %b %Y')
+    except Exception:
+        label = ist_date
+    prefix = (tag + ' ') if tag else ''
+    return '%s:rotating_light: *real_l3 escalation hygiene* (%s)' % (prefix, label)
+
+
+def build_reply_text(row, uid):
+    """Threaded hygiene ping for one ticket (@-mentions the escalator)."""
     who  = '<@%s>' % uid if uid else (row.get('escalator_name') or row.get('escalator_email') or 'escalator')
     miss = ', '.join(_missing_list(row))
     link = '<%s|#%s>' % (row['ticket_url'], row['num'])
-    return (
-        ':rotating_light: *real_l3 escalation hygiene*\n'
-        '%s · %s — missing: *%s*\n'
-        'Please complete: set the team, add the Slack link, and reply to the customer if you are escalating a ticket to real_l3'
-        % (who, link, miss)
-    )
+    return ('%s · %s — missing: *%s*\n'
+            'Please complete: set the team, add the Slack link, and reply to the customer.'
+            % (who, link, miss))
 
 
 # ==================== MAIN TASK ====================
 
 def run_real_l3_hygiene(**context):
     logger.info('=' * 60)
-    logger.info('REAL_L3 HYGIENE: QUERY & PING')
+    logger.info('REAL_L3 HYGIENE: FETCH (Redash #%s) & PING', HYGIENE_QUERY_ID)
     logger.info('=' * 60)
 
-    client   = get_bigquery_client()
-    notifier = SlackNotifier(SLACK_BOT_TOKEN, SLACK_CHANNEL_ID)
+    client = get_bigquery_client()
 
-    logger.info('[1] Ensuring state table exists...')
-    client.query(DDL).result()
+    logger.info('[1] Ensuring state tables exist...')
+    client.query(DDL_PING).result()
+    client.query(DDL_MASTER).result()
 
-    logger.info('[2] Querying real_l3 tickets with hygiene gaps (1-3h, not yet pinged)...')
-    rows = list(client.query(QUERY).result())
-    logger.info('      %d ticket(s) due for a ping', len(rows))
+    logger.info('[2] Fetching hygiene candidates from Redash #%s ...', HYGIENE_QUERY_ID)
+    redash = RedashClient(api_key=REDASH_API_KEY, base_url=REDASH_BASE_URL)
+    rows = redash.fetch_query_results(query_id=HYGIENE_QUERY_ID, max_retries=3) or []
+    logger.info('      %d candidate(s) from Redash', len(rows))
     if not rows:
         logger.info('REAL_L3 HYGIENE: nothing to ping')
         return
 
-    pinged = []
-    for r in rows:
-        row = {
-            'ticket_id': r.ticket_id, 'num': r.num, 'ticket_url': r.ticket_url,
-            'escalator_email': r.escalator_email, 'escalator_name': r.escalator_name,
-            'team_done': r.team_done, 'slack_done': r.slack_done, 'reply_done': r.reply_done,
-        }
-        uid = _slack_uid(row['escalator_email'], SLACK_BOT_TOKEN)
-        msg = build_message(row, uid)
-        try:
-            notifier.send_message(msg, mrkdwn=True, unfurl_links=False, unfurl_media=False)
-            pinged.append({
-                'ticket_id': row['ticket_id'], 'num': row['num'],
-                'escalator_email': row['escalator_email'],
-                'missing': ', '.join(_missing_list(row)),
-                'pinged_at': datetime.now(timezone.utc).isoformat(),
-            })
-            logger.info('      pinged #%s (%s)', row['num'], row['escalator_email'])
-        except Exception as e:
-            logger.error('      failed to post for #%s: %s', row['num'], e)
+    # [3] dedup against tickets already pinged
+    already = {r.ticket_id for r in client.query(
+        f"SELECT ticket_id FROM `{PING_TABLE}`").result()}
+    new_rows = [r for r in rows if r.get('ticket_id') not in already]
+    logger.info('      %d new ticket(s) after dedup (%d already pinged)',
+                len(new_rows), len(rows) - len(new_rows))
+    if not new_rows:
+        logger.info('REAL_L3 HYGIENE: nothing new')
+        return
 
+    # [4] load existing master threads: {(ist_date, channel): thread_ts}
+    masters = {(r.ist_date, r.channel): r.thread_ts for r in client.query(
+        f"SELECT ist_date, channel, thread_ts FROM `{MASTER_TABLE}`").result()}
+
+    pinged, new_masters = [], []
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    for r in new_rows:
+        ist_date = r.get('esc_date_ist')
+        channel  = ENV_CHANNEL_OVERRIDE or r.get('channel_id') or FALLBACK_CHANNEL
+        tag      = r.get('channel_tag') or DEFAULT_TAG
+        chan_name = r.get('channel_name') or channel   # log clarity only
+        key      = (ist_date, channel)
+
+        # ensure a master message exists for this IST date + channel
+        thread_ts = masters.get(key)
+        if not thread_ts:
+            try:
+                thread_ts = slack_post(channel, build_master_text(ist_date, tag))
+                masters[key] = thread_ts
+                new_masters.append({'ist_date': ist_date, 'channel': channel,
+                                    'thread_ts': thread_ts, 'created_at': now_iso})
+                logger.info('      posted master for %s in %s [%s] (ts=%s)', ist_date, chan_name, channel, thread_ts)
+            except Exception as e:
+                logger.error('      failed to post master for %s/%s: %s — skipping its tickets',
+                             ist_date, channel, e)
+                continue
+
+        # post the hygiene ping as a threaded reply (@-mentions the escalator)
+        uid = _slack_uid(r.get('escalator_email'), SLACK_BOT_TOKEN)
+        try:
+            slack_post(channel, build_reply_text(r, uid), thread_ts=thread_ts)
+            pinged.append({'ticket_id': r.get('ticket_id'), 'num': r.get('num'),
+                           'escalator_email': r.get('escalator_email'),
+                           'missing': ', '.join(_missing_list(r)), 'pinged_at': now_iso})
+            logger.info('      pinged #%s (%s) under %s', r.get('num'), r.get('escalator_email'), ist_date)
+        except Exception as e:
+            logger.error('      failed to post for #%s: %s', r.get('num'), e)
+
+    # [5] persist state
+    if new_masters:
+        errs = client.insert_rows_json(client.get_table(MASTER_TABLE), new_masters)
+        if errs:
+            logger.error('      master-table insert errors: %s', errs)
     if pinged:
-        logger.info('[3] Recording %d pinged ticket(s) in state table...', len(pinged))
-        table = client.get_table(STATE_TABLE)
-        errors = client.insert_rows_json(table, pinged)
-        if errors:
-            logger.error('      state-table insert errors: %s', errors)
+        errs = client.insert_rows_json(client.get_table(PING_TABLE), pinged)
+        if errs:
+            logger.error('      ping-table insert errors: %s', errs)
 
     logger.info('=' * 60)
-    logger.info('REAL_L3 HYGIENE: COMPLETE (%d pinged)', len(pinged))
+    logger.info('REAL_L3 HYGIENE: COMPLETE (%d pinged, %d master(s) posted)', len(pinged), len(new_masters))
     logger.info('=' * 60)
 
 
@@ -241,7 +234,7 @@ default_args = {
 dag = DAG(
     'real_l3_hygiene_slack',
     default_args=default_args,
-    description='Ping the escalator if a real_l3 ticket is missing team / slack link / reply 1h after escalation',
+    description='Ping the escalator (in a daily thread) if a real_l3 ticket is missing team / slack link / reply after escalation',
     schedule_interval='*/30 * * * *',  # every 30 min, Asia/Kolkata
     catchup=False,
     is_paused_upon_creation=False,
