@@ -17,7 +17,7 @@ ARCHITECTURE (per IST date, like prod_sos):
 
 WHERE THE LOGIC LIVES:
   * QUALIFYING FILTER + SLA/WINDOW/GRACE + ROUTING -> Redash query #HYGIENE_QUERY_ID
-    (channel_id / channel_name are columns there; edit filters/routing there,
+    (channel_id / channel_name / channel_tag are columns there; edit filters/routing there,
      no DAG change needed).
   * dedup + master/thread plumbing + escalator Slack lookup -> this DAG.
 
@@ -43,12 +43,14 @@ from utils.slack.bigquery_client import get_bigquery_client
 logger = logging.getLogger(__name__)
 
 # ==================== CONFIG ====================
-# Channel comes from the Redash query (channel_id / channel_name). Escalators are @-mentioned
-# per-reply (resolved by email), so there is no group mention on the master.
+# Channel + optional master @-mention come from the Redash query (channel_id / channel_name /
+# channel_tag). Individual escalators are @-mentioned per-reply (resolved by email); channel_tag
+# is an optional group ping on the master (blank by default = none).
 #   * ENV override forces ALL pings to one channel (testing).
-#   * FALLBACK_CHANNEL used only if the query row leaves channel_id blank.
+#   * FALLBACK_CHANNEL / DEFAULT_TAG used only if the query row leaves them blank.
 ENV_CHANNEL_OVERRIDE = os.getenv('REAL_L3_HYGIENE_SLACK_CHANNEL')  # testing override; prod leaves unset
 FALLBACK_CHANNEL     = 'C0937QNFJEM'   # community-builders-l2-l1
+DEFAULT_TAG          = ''              # blank = no group @-mention on the master
 HYGIENE_QUERY_ID     = 38914           # Redash: "[Real L3] escalation hygiene feed"
 PING_TABLE           = 'emergent-default.support.real_l3_hygiene_pinged'   # per-ticket dedup
 MASTER_TABLE         = 'emergent-default.support.real_l3_hygiene_master'   # one master per (IST date, channel)
@@ -114,13 +116,14 @@ def _missing_list(row):
     return miss
 
 
-def build_master_text(ist_date):
-    """Day's master header (no group @-mention; escalators are pinged per-reply)."""
+def build_master_text(ist_date, tag):
+    """Day's master header; tag (from query) is blank by default -> no group @-mention."""
     try:
         label = datetime.strptime(ist_date, '%Y-%m-%d').strftime('%-d %b %Y')
     except Exception:
         label = ist_date
-    return ':rotating_light: *real_l3 escalation hygiene* (%s)' % label
+    prefix = (tag + ' ') if tag else ''
+    return '%s:rotating_light: *real_l3 escalation hygiene* (%s)' % (prefix, label)
 
 
 def build_reply_text(row, uid):
@@ -174,6 +177,7 @@ def run_real_l3_hygiene(**context):
     for r in new_rows:
         ist_date = r.get('esc_date_ist')
         channel  = ENV_CHANNEL_OVERRIDE or r.get('channel_id') or FALLBACK_CHANNEL
+        tag      = r.get('channel_tag') or DEFAULT_TAG
         chan_name = r.get('channel_name') or channel   # log clarity only
         key      = (ist_date, channel)
 
@@ -181,7 +185,7 @@ def run_real_l3_hygiene(**context):
         thread_ts = masters.get(key)
         if not thread_ts:
             try:
-                thread_ts = slack_post(channel, build_master_text(ist_date))
+                thread_ts = slack_post(channel, build_master_text(ist_date, tag))
                 masters[key] = thread_ts
                 new_masters.append({'ist_date': ist_date, 'channel': channel,
                                     'thread_ts': thread_ts, 'created_at': now_iso})
