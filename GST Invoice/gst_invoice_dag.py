@@ -151,19 +151,19 @@ def _field(label, value):
     return {'type': 'mrkdwn', 'text': '*%s*\n%s' % (label, ('`%s`' % v) if v else '`—`')}
 
 
-def _doc_buttons(rowmap):
-    """URL buttons for each attached document (only ones with a real link)."""
-    btns = [{'type': 'button', 'text': {'type': 'plain_text', 'text': ':page_facing_up: %s' % label, 'emoji': True},
-             'url': _val(rowmap, col)}
-            for col, label in DOC_FIELDS if _val(rowmap, col).startswith('http')]
-    blocks = []
-    for i in range(0, len(btns), 5):   # max 5 elements per actions block
-        blocks.append({'type': 'actions', 'elements': btns[i:i + 5]})
-    return blocks
+def _doc_section(rowmap):
+    """A section block listing attached documents as plain markdown hyperlinks (no buttons -
+    buttons need app Interactivity enabled; hyperlinks always work). None if no docs."""
+    links = ['<%s|%s>' % (_val(rowmap, col), label)
+             for col, label in DOC_FIELDS if _val(rowmap, col).startswith('http')]
+    if not links:
+        return None
+    return {'type': 'section', 'text': {'type': 'mrkdwn',
+            'text': ':paperclip: *Documents*\n' + '   ·   '.join(links)}}
 
 
 def build_master_blocks(rowmap):
-    """Headline card (Block Kit) for the master message — key fields + all doc buttons."""
+    """Headline card (Block Kit) for the master message — key fields + all doc links."""
     vendor = _val(rowmap, 'Name of Vendor') or '(no name)'
     fields = [_field(label, _val(rowmap, col)) for col, label in MASTER_FIELDS]
     blocks = [
@@ -174,12 +174,12 @@ def build_master_blocks(rowmap):
             'text': ':inbox_tray: submitted *%s*   ·   %s   ·   :thread: full details in thread'
                     % (_val(rowmap, 'Timestamp') or '—', _val(rowmap, 'Email Address') or '—')}]},
         {'type': 'divider'},
-        {'type': 'section', 'text': {'type': 'mrkdwn', 'text': ':paperclip: *Documents*'}},
     ]
-    blocks += _doc_buttons(rowmap)
-    blocks.append({'type': 'actions', 'elements': [
-        {'type': 'button', 'text': {'type': 'plain_text', 'text': ':page_with_curl: Open sheet', 'emoji': True},
-         'url': SHEET_URL, 'style': 'primary'}]})
+    doc = _doc_section(rowmap)
+    if doc:
+        blocks.append(doc)
+    blocks.append({'type': 'section', 'text': {'type': 'mrkdwn',
+                   'text': ':page_with_curl: <%s|Open the response sheet>' % SHEET_URL}})
     text = 'New GST / Vendor Onboarding — %s' % vendor   # notification fallback
     return text, blocks
 
@@ -195,10 +195,9 @@ def build_detail_blocks(rowmap):
         for i in range(0, len(fields), 10):   # max 10 fields per section
             blocks.append({'type': 'section', 'fields': fields[i:i + 10]})
         blocks.append({'type': 'divider'})
-    doc_blocks = _doc_buttons(rowmap)
-    if doc_blocks:
-        blocks.append({'type': 'section', 'text': {'type': 'mrkdwn', 'text': ':paperclip: *Documents*'}})
-        blocks += doc_blocks
+    doc = _doc_section(rowmap)
+    if doc:
+        blocks.append(doc)
     text = 'Full submission — %s' % vendor   # notification fallback
     return text, blocks
 
