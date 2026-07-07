@@ -145,23 +145,41 @@ def _val(rowmap, col):
     return (rowmap.get(col) or '').strip()
 
 
+def _field(label, value):
+    """Header (bold) over its value shown in an inline-code 'box' for clear separation."""
+    v = (value or '').strip()
+    return {'type': 'mrkdwn', 'text': '*%s*\n%s' % (label, ('`%s`' % v) if v else '`—`')}
+
+
+def _doc_buttons(rowmap):
+    """URL buttons for each attached document (only ones with a real link)."""
+    btns = [{'type': 'button', 'text': {'type': 'plain_text', 'text': ':page_facing_up: %s' % label, 'emoji': True},
+             'url': _val(rowmap, col)}
+            for col, label in DOC_FIELDS if _val(rowmap, col).startswith('http')]
+    blocks = []
+    for i in range(0, len(btns), 5):   # max 5 elements per actions block
+        blocks.append({'type': 'actions', 'elements': btns[i:i + 5]})
+    return blocks
+
+
 def build_master_blocks(rowmap):
-    """Headline card (Block Kit) for the master message."""
+    """Headline card (Block Kit) for the master message — key fields + all doc buttons."""
     vendor = _val(rowmap, 'Name of Vendor') or '(no name)'
-    fields = []
-    for col, label in MASTER_FIELDS:
-        fields.append({'type': 'mrkdwn', 'text': '*%s*\n%s' % (label, _val(rowmap, col) or '—')})
+    fields = [_field(label, _val(rowmap, col)) for col, label in MASTER_FIELDS]
     blocks = [
         {'type': 'header', 'text': {'type': 'plain_text',
                                     'text': ':page_facing_up: New GST / Vendor Onboarding', 'emoji': True}},
         {'type': 'section', 'fields': fields},
         {'type': 'context', 'elements': [{'type': 'mrkdwn',
-            'text': ':inbox_tray: submitted *%s*  ·  %s  ·  :thread: full details in thread'
+            'text': ':inbox_tray: submitted *%s*   ·   %s   ·   :thread: full details in thread'
                     % (_val(rowmap, 'Timestamp') or '—', _val(rowmap, 'Email Address') or '—')}]},
-        {'type': 'actions', 'elements': [
-            {'type': 'button', 'text': {'type': 'plain_text', 'text': ':page_with_curl: Open sheet', 'emoji': True},
-             'url': SHEET_URL}]},
+        {'type': 'divider'},
+        {'type': 'section', 'text': {'type': 'mrkdwn', 'text': ':paperclip: *Documents*'}},
     ]
+    blocks += _doc_buttons(rowmap)
+    blocks.append({'type': 'actions', 'elements': [
+        {'type': 'button', 'text': {'type': 'plain_text', 'text': ':page_with_curl: Open sheet', 'emoji': True},
+         'url': SHEET_URL, 'style': 'primary'}]})
     text = 'New GST / Vendor Onboarding — %s' % vendor   # notification fallback
     return text, blocks
 
@@ -173,20 +191,14 @@ def build_detail_blocks(rowmap):
               'text': ':clipboard: Full submission — %s' % vendor[:140], 'emoji': True}}]
     for title, cols in DETAIL_GROUPS:
         blocks.append({'type': 'section', 'text': {'type': 'mrkdwn', 'text': '*%s*' % title}})
-        fields = [{'type': 'mrkdwn', 'text': '*%s*\n%s' % (label, _val(rowmap, col) or '—')}
-                  for col, label in cols]
-        # Slack allows max 10 fields per section
-        for i in range(0, len(fields), 10):
+        fields = [_field(label, _val(rowmap, col)) for col, label in cols]
+        for i in range(0, len(fields), 10):   # max 10 fields per section
             blocks.append({'type': 'section', 'fields': fields[i:i + 10]})
         blocks.append({'type': 'divider'})
-    # documents as link buttons
-    doc_btns = [{'type': 'button', 'text': {'type': 'plain_text', 'text': label, 'emoji': True},
-                 'url': _val(rowmap, col)}
-                for col, label in DOC_FIELDS if _val(rowmap, col).startswith('http')]
-    if doc_btns:
+    doc_blocks = _doc_buttons(rowmap)
+    if doc_blocks:
         blocks.append({'type': 'section', 'text': {'type': 'mrkdwn', 'text': ':paperclip: *Documents*'}})
-        for i in range(0, len(doc_btns), 5):   # max 5 elements per actions block
-            blocks.append({'type': 'actions', 'elements': doc_btns[i:i + 5]})
+        blocks += doc_blocks
     text = 'Full submission — %s' % vendor   # notification fallback
     return text, blocks
 
