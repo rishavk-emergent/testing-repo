@@ -41,23 +41,45 @@ SHEET_GID  = 1327167093                                        # target tab (fro
 STATE_TABLE = 'emergent-default.support.gst_invoice_pinged'
 SHEET_URL   = 'https://docs.google.com/spreadsheets/d/%s/edit#gid=%s' % (SHEET_ID, SHEET_GID)
 
-# Which columns to surface in the alert (exact header text -> label). Anything else is ignored.
-FIELDS = [
+# ---- MASTER message: only the headline fields (col header -> label) ----
+MASTER_FIELDS = [
     ('Name of Vendor', 'Vendor'),
-    ('Nature of Vendor', 'Nature'),
-    ('Email (Your registered email on Emergent)', 'Emergent email'),
-    ('Email Address', 'Form email'),
-    ('Telephone/Mobile No.', 'Phone'),
-    ('Whether Registered as Micro/Small/Medium Enterprise (MSME)', 'MSME'),
-    ('PAN No.', 'PAN'),
-    ('GST Number.', 'GST'),
-    ('HSN/SAC Code', 'HSN/SAC'),
-    ('Bank Name', 'Bank'),
-    ('Account No.', 'A/C No.'),
-    ('IFSC Code', 'IFSC'),
+    ('Nature of Vendor', 'Nature of Vendor'),
+    ('GST Number.', 'GST No.'),
     ('Nature of Invoice generation', 'Invoice cadence'),
 ]
-# Document/attachment columns -> rendered as links
+# ---- THREAD reply: full detail, grouped into sections (audit-complete). Blank -> shown as "—". ----
+DETAIL_GROUPS = [
+    ('Vendor & Contact', [
+        ('Name of Vendor', 'Vendor'),
+        ('Nature of Vendor', 'Nature of Vendor'),
+        ('Registered Office Address', 'Registered Office'),
+        ('Telephone/Mobile No.', 'Phone'),
+        ('Email (Your registered email on Emergent)', 'Emergent email'),
+        ('Email Address', 'Form email'),
+    ]),
+    ('Registration & Tax', [
+        ('Whether Registered as Micro/Small/Medium Enterprise (MSME)', 'MSME registered'),
+        ('Micro/Small/Medium Enterprise (MSME) Registration no.', 'MSME Reg. no.'),
+        ('PAN No.', 'PAN No.'),
+        ('GST Number.', 'GST No.'),
+        ('HSN/SAC Code', 'HSN/SAC'),
+    ]),
+    ('Banking', [
+        ('Bank Name', 'Bank Name'),
+        ('Bank Branch', 'Branch'),
+        ('Account No.', 'Account No.'),
+        ('IFSC Code', 'IFSC'),
+    ]),
+    ('Invoicing & Signatory', [
+        ('Nature of Invoice generation', 'Invoice cadence'),
+        ('Contact Person Name', 'Contact Person'),
+        ('Name of the authorized signatory', 'Authorized Signatory'),
+        ('Place', 'Place'),
+        ('Status', 'Status'),
+    ]),
+]
+# Document/attachment columns -> rendered as link buttons in the thread
 DOC_FIELDS = [
     ('Provide the copy of Registration Certificate', 'MSME cert'),
     ('Attach Pan card copy', 'PAN copy'),
@@ -119,35 +141,67 @@ def _row_key(rowmap):
     return hashlib.sha1(raw.encode('utf-8')).hexdigest()
 
 
-def build_message(rowmap):
-    lines = [':page_facing_up: *New GST / Vendor onboarding submission*']
-    ts = rowmap.get('Timestamp', '')
-    if ts:
-        lines.append('_submitted %s_' % ts)
-    detail = []
-    for col, label in FIELDS:
-        v = (rowmap.get(col) or '').strip()
-        if v:
-            detail.append('*%s:* %s' % (label, v))
-    lines.append('\n'.join(detail))
-    docs = []
-    for col, label in DOC_FIELDS:
-        v = (rowmap.get(col) or '').strip()
-        if v:
-            docs.append('<%s|%s>' % (v, label))
-    if docs:
-        lines.append(':paperclip: ' + '  ·  '.join(docs))
-    lines.append('<%s|Open sheet>' % SHEET_URL)
-    return '\n'.join(lines)
+def _val(rowmap, col):
+    return (rowmap.get(col) or '').strip()
 
 
-def slack_post(channel, text):
+def build_master_blocks(rowmap):
+    """Headline card (Block Kit) for the master message."""
+    vendor = _val(rowmap, 'Name of Vendor') or '(no name)'
+    fields = []
+    for col, label in MASTER_FIELDS:
+        fields.append({'type': 'mrkdwn', 'text': '*%s*\n%s' % (label, _val(rowmap, col) or '—')})
+    blocks = [
+        {'type': 'header', 'text': {'type': 'plain_text',
+                                    'text': ':page_facing_up: New GST / Vendor Onboarding', 'emoji': True}},
+        {'type': 'section', 'fields': fields},
+        {'type': 'context', 'elements': [{'type': 'mrkdwn',
+            'text': ':inbox_tray: submitted *%s*  ·  %s  ·  :thread: full details in thread'
+                    % (_val(rowmap, 'Timestamp') or '—', _val(rowmap, 'Email Address') or '—')}]},
+        {'type': 'actions', 'elements': [
+            {'type': 'button', 'text': {'type': 'plain_text', 'text': ':page_with_curl: Open sheet', 'emoji': True},
+             'url': SHEET_URL}]},
+    ]
+    text = 'New GST / Vendor Onboarding — %s' % vendor   # notification fallback
+    return text, blocks
+
+
+def build_detail_blocks(rowmap):
+    """Full, audit-complete breakdown (Block Kit) for the threaded reply."""
+    vendor = _val(rowmap, 'Name of Vendor') or '(no name)'
+    blocks = [{'type': 'header', 'text': {'type': 'plain_text',
+              'text': ':clipboard: Full submission — %s' % vendor[:140], 'emoji': True}}]
+    for title, cols in DETAIL_GROUPS:
+        blocks.append({'type': 'section', 'text': {'type': 'mrkdwn', 'text': '*%s*' % title}})
+        fields = [{'type': 'mrkdwn', 'text': '*%s*\n%s' % (label, _val(rowmap, col) or '—')}
+                  for col, label in cols]
+        # Slack allows max 10 fields per section
+        for i in range(0, len(fields), 10):
+            blocks.append({'type': 'section', 'fields': fields[i:i + 10]})
+        blocks.append({'type': 'divider'})
+    # documents as link buttons
+    doc_btns = [{'type': 'button', 'text': {'type': 'plain_text', 'text': label, 'emoji': True},
+                 'url': _val(rowmap, col)}
+                for col, label in DOC_FIELDS if _val(rowmap, col).startswith('http')]
+    if doc_btns:
+        blocks.append({'type': 'section', 'text': {'type': 'mrkdwn', 'text': ':paperclip: *Documents*'}})
+        for i in range(0, len(doc_btns), 5):   # max 5 elements per actions block
+            blocks.append({'type': 'actions', 'elements': doc_btns[i:i + 5]})
+    text = 'Full submission — %s' % vendor   # notification fallback
+    return text, blocks
+
+
+def slack_post(channel, text, blocks=None, thread_ts=None):
+    payload = {'channel': channel, 'text': text, 'unfurl_links': False, 'unfurl_media': False}
+    if blocks:
+        payload['blocks'] = blocks
+    if thread_ts:
+        payload['thread_ts'] = thread_ts
     resp = requests.post(
         'https://slack.com/api/chat.postMessage',
         headers={'Authorization': 'Bearer %s' % SLACK_BOT_TOKEN,
                  'Content-Type': 'application/json; charset=utf-8'},
-        json={'channel': channel, 'text': text, 'unfurl_links': False, 'unfurl_media': False},
-        timeout=30)
+        json=payload, timeout=30)
     data = resp.json()
     if not data.get('ok'):
         raise Exception('chat.postMessage failed: %s' % data.get('error'))
@@ -194,7 +248,10 @@ def run_gst_invoice(**context):
     pinged, now_iso = [], datetime.now(timezone.utc).isoformat()
     for s, k in new:
         try:
-            slack_post(SLACK_CHANNEL_ID, build_message(s))
+            m_text, m_blocks = build_master_blocks(s)
+            ts = slack_post(SLACK_CHANNEL_ID, m_text, blocks=m_blocks)          # master (headline)
+            d_text, d_blocks = build_detail_blocks(s)
+            slack_post(SLACK_CHANNEL_ID, d_text, blocks=d_blocks, thread_ts=ts)  # full detail in thread
             pinged.append({'row_key': k, 'ts_raw': s.get('Timestamp', ''),
                            'vendor': s.get('Name of Vendor', ''), 'pinged_at': now_iso})
             logger.info('      alerted vendor=%s ts=%s', s.get('Name of Vendor'), s.get('Timestamp'))
