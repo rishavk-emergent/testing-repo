@@ -40,11 +40,16 @@ from utils.slack.bigquery_client import get_bigquery_client
 logger = logging.getLogger(__name__)
 
 # ==================== CONFIG ====================
-SLACK_CHANNEL_ID      = os.getenv('GST_INVOICE_SLACK_CHANNEL', 'C0B4J9RBWDC')  # TODO live channel; env overrides
+# Destination channel + trigger days come from Redash #CONFIG_QUERY_ID (edit there, no code push).
+# LIVE channel = tf-cs-finance-collab (C0B9Y89RSL9) — sensitive; DAG ships PAUSED and testing uses the
+# GST_INVOICE_SLACK_CHANNEL env override (test channel) until validated.
+ENV_CHANNEL_OVERRIDE  = os.getenv('GST_INVOICE_SLACK_CHANNEL')   # set to a test channel for dry runs; unset in prod
+FALLBACK_CHANNEL      = 'C0B9Y89RSL9'   # tf-cs-finance-collab (used only if config row is blank)
 SHEET_ID              = '1It-QLilNPKev_gYQe9RDFUkE4muSYWxdcqsFZwS58go'   # "GST Invoice" responses
 SHEET_GID             = 1327167093
+SHEET_URL             = 'https://docs.google.com/spreadsheets/d/%s/edit#gid=%s' % (SHEET_ID, SHEET_GID)
 PAYMENTS_QUERY_ID     = 40082    # Redash: "[GST] Vendor monthly payments feed" (params: email, as_of_date)
-TRIGGER_DAYS_QUERY_ID = 40445    # Redash: "[GST] Monthly trigger days" (edit the day list there)
+CONFIG_QUERY_ID       = 40445    # Redash: "[GST] Monthly config" -> day, channel_id, channel_name
 STATE_TABLE           = 'emergent-default.support.gst_monthly_pinged'
 
 # vendor qualifies when (case-insensitive):
@@ -153,6 +158,8 @@ def build_master_blocks(vendor, gst, email, period, payments):
         {'type': 'context', 'elements': [{'type': 'mrkdwn',
          'text': ':moneybag: *%d* payment(s)  ·  total *%s*  ·  :thread: proofs in thread'
                  % (len(payments), tot)}]},
+        {'type': 'section', 'text': {'type': 'mrkdwn',
+         'text': ':page_with_curl: <%s|Open source sheet (Excel)>' % SHEET_URL}},
     ]
     return blocks
 
@@ -178,17 +185,21 @@ def run_gst_monthly(**context):
     logger.info('GST MONTHLY PAYMENTS')
     logger.info('=' * 60)
 
-    # [0] trigger-day gate (config-driven)
+    # [0] read config (trigger days + destination channel) and gate on the day
     now = pendulum.now('Asia/Kolkata')
     dom, last_dom = now.day, now.end_of('month').day
+    cfg = redash_run(CONFIG_QUERY_ID, {}) or []
     days = set()
-    for r in (redash_run(TRIGGER_DAYS_QUERY_ID, {}) or []):
+    for r in cfg:
         try:
             days.add(int(r['day']))
         except Exception:
             pass
+    cfg_channel = next((r.get('channel_id') for r in cfg if r.get('channel_id')), None)
+    channel = ENV_CHANNEL_OVERRIDE or cfg_channel or FALLBACK_CHANNEL
     fire = (dom in days) or (99 in days and dom == last_dom)
-    logger.info('[0] today IST day=%d (last=%d), trigger days=%s -> fire=%s', dom, last_dom, sorted(days), fire)
+    logger.info('[0] today IST day=%d (last=%d), trigger days=%s, channel=%s -> fire=%s',
+                dom, last_dom, sorted(days), channel, fire)
     if not fire:
         logger.info('GST MONTHLY: not a trigger day, exiting')
         return
@@ -222,9 +233,9 @@ def run_gst_monthly(**context):
             continue
         try:
             payments = redash_run(PAYMENTS_QUERY_ID, {'email': email, 'as_of_date': as_of}) or []
-            ts = slack_post(SLACK_CHANNEL_ID, 'GST Monthly Payments — %s' % v.get(COL_VENDOR, email),
+            ts = slack_post(channel, 'GST Monthly Payments — %s' % v.get(COL_VENDOR, email),
                             blocks=build_master_blocks(v.get(COL_VENDOR, ''), v.get(COL_GST, ''), email, period, payments))
-            slack_post(SLACK_CHANNEL_ID, 'Payment proofs — %s' % period,
+            slack_post(channel, 'Payment proofs — %s' % period,
                        blocks=build_thread_blocks(period, payments), thread_ts=ts)
             posted.append({'email': email.lower(), 'period': period, 'vendor': v.get(COL_VENDOR, ''),
                            'n_payments': len(payments), 'pinged_at': now_iso})
@@ -257,7 +268,7 @@ dag = DAG(
     description='Monthly GST payments + proofs per accepted+recurring vendor (config-driven trigger day)',
     schedule_interval='0 9 * * *',  # daily 09:00 IST; gated on Redash trigger-day config
     catchup=False,
-    is_paused_upon_creation=False,
+    is_paused_upon_creation=True,   # PAUSED on merge — posts to sensitive tf-cs-finance-collab; unpause only after validation
     tags=['slack', 'gst', 'vendor', 'payments', 'cs_team'],
 )
 
