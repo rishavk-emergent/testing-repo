@@ -169,9 +169,15 @@ def run_cs_sod_counts(**context):
 
     # [3] render message (indent 1 -> Slack quote line)
     today = pendulum.now('Asia/Kolkata').format('D MMM YYYY')
+    # Two blocks by indent (rows already sorted by line_order):
+    #   quote block  = indent>=1 rows  (rendered under All, below the last one)
+    #   flush block  = indent==0 bucket rows (L3 real, ...), appended at the very bottom
+    is_flush = lambda r: int(r.get('indent', 0) or 0) == 0 and r.get('type') == 'bucket'
+    ordered = [r for r in rows if not is_flush(r)] + [r for r in rows if is_flush(r)]
+
     lines = ['*SOD Count:*  _(%s)_' % today]
     first_indent = True
-    for r in rows:
+    for r in ordered:
         v = values.get(r['line_order'], 0)
         indented = int(r.get('indent', 0) or 0) >= 1
         # extra leading space on the FIRST indented line so it aligns with the rest
