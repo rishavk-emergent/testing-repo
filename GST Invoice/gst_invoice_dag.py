@@ -19,8 +19,8 @@ Composer runtime SA. Sidesteps the org policy that blocks service-account key do
 CONFIG (editable in Redash, no code push):
   * payments feed  -> #40082  (params: email, as_of_date)  email->user_id->prev-month money-in
   * trigger days + channel -> #40445  (day, channel_id, channel_name)
-Channels: onboarding -> GST_INVOICE_SLACK_CHANNEL env (test) else INVOICE default; monthly ->
-config #40445 channel (tf-cs-finance-collab), env overrides for testing.
+Channel: BOTH DAGs post to config #40445 channel_id (tf-cs-finance-collab, C0B9Y89RSL9);
+GST_INVOICE_SLACK_CHANNEL env overrides both for testing. Both ship PAUSED (sensitive channel).
 """
 
 from datetime import datetime, timedelta, timezone
@@ -60,7 +60,7 @@ def _sheet_loc(cfg_rows):
     return sid, gid, _sheet_url(sid, gid)
 
 # ---- onboarding-alert config ----
-INVOICE_CHANNEL      = os.getenv('GST_INVOICE_SLACK_CHANNEL', 'C0B4J9RBWDC')   # TODO live channel; env overrides
+# Channel comes from config #40445 (same as monthly -> tf-cs-finance-collab); env overrides for testing.
 INVOICE_STATE_TABLE  = 'emergent-default.support.gst_invoice_pinged'
 INVOICE_DDL = f"""
 CREATE TABLE IF NOT EXISTS `{INVOICE_STATE_TABLE}` (
@@ -255,7 +255,9 @@ def run_gst_invoice(**context):
     client = get_bigquery_client()
     client.query(INVOICE_DDL).result()
 
-    sid, gid, sheet_url = _sheet_loc(redash_run(CONFIG_QUERY_ID, {}))
+    cfg = redash_run(CONFIG_QUERY_ID, {})
+    sid, gid, sheet_url = _sheet_loc(cfg)
+    channel = ENV_CHANNEL_OVERRIDE or next((r.get('channel_id') for r in (cfg or []) if r.get('channel_id')), None) or FALLBACK_CHANNEL
     rows = sheet_rows(sid, gid)
     submissions = [r for r in rows if (r.get('Timestamp') or '').strip()]
     logger.info('      %d submission row(s) in sheet', len(submissions))
@@ -273,9 +275,9 @@ def run_gst_invoice(**context):
     for s, k in new:
         try:
             m_text, m_blocks = build_master_blocks(s, sheet_url)
-            ts = slack_post(INVOICE_CHANNEL, m_text, blocks=m_blocks)
+            ts = slack_post(channel, m_text, blocks=m_blocks)
             d_text, d_blocks = build_detail_blocks(s)
-            slack_post(INVOICE_CHANNEL, d_text, blocks=d_blocks, thread_ts=ts)
+            slack_post(channel, d_text, blocks=d_blocks, thread_ts=ts)
             pinged.append({'row_key': k, 'ts_raw': s.get('Timestamp', ''),
                            'vendor': s.get('Name of Vendor', ''), 'pinged_at': now_iso})
             logger.info('      alerted vendor=%s', s.get('Name of Vendor'))
@@ -418,7 +420,7 @@ dag_invoice = DAG(
     description='Alert Slack for every new GST/vendor onboarding form submission',
     schedule_interval='0 * * * *',   # hourly, Asia/Kolkata
     catchup=False,
-    is_paused_upon_creation=False,
+    is_paused_upon_creation=True,    # posts to sensitive tf-cs-finance-collab; unpause after validation
     tags=['slack', 'gst', 'vendor', 'forms', 'cs_team'],
 )
 PythonOperator(task_id='run_gst_invoice', python_callable=run_gst_invoice, dag=dag_invoice)
