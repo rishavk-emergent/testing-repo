@@ -143,19 +143,20 @@ def run_cs_sod_counts(**context):
 
     # [1] live counts per bucket from Trinity
     mcp = TrinityMCP(TRINITY_MCP_URL, api_key)
-    values, bucket_total = {}, 0
+    values, by_label = {}, {}
     for r in rows:
         if r.get('type') == 'bucket' and r.get('bucket_id'):
             c = mcp.ticket_counts(r['bucket_id'])
             v = sum(int(c.get(s, 0) or 0) for s in COUNT_STATUSES)
             values[r['line_order']] = v
-            bucket_total += v
+            by_label[(r.get('label') or '').strip()] = v
             logger.info('      %s = %d (%s)', r.get('label'), v, c)
 
-    # [2] resolve 'sum' rows (e.g. All)
+    # [2] resolve 'sum' rows: add up only the labels listed in sum_members (overlap buckets excluded)
     for r in rows:
         if r.get('type') == 'sum':
-            values[r['line_order']] = bucket_total
+            members = [m.strip() for m in (r.get('sum_members') or '').split(',') if m.strip()]
+            values[r['line_order']] = sum(by_label.get(m, 0) for m in members)
 
     # [3] render message (indent 1 -> Slack quote line)
     today = pendulum.now('Asia/Kolkata').format('D MMM YYYY')
