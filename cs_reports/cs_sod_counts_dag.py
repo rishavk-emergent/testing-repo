@@ -47,7 +47,7 @@ ENV_CHANNEL_OVERRIDE = os.getenv('CS_SOD_SLACK_CHANNEL')   # set to a test chann
 FALLBACK_CHANNEL     = 'C0B075CBPS7'                        # cs-associates
 CONFIG_QUERY_ID      = 40628                                # Redash: "[CS] SOD Count config"
 TRINITY_MCP_URL      = 'https://trinity-base.internal.emergent.host/api/mcp/'   # base URL lives in code
-COUNT_STATUSES       = ('open', 'pending')                  # value per bucket = sum of these
+COUNT_STATUSES       = ('open',)                            # value per bucket = sum of these (open tickets only)
 
 
 # ==================== REDASH (config) ====================
