@@ -42,9 +42,22 @@ from utils.slack.bigquery_client import get_bigquery_client
 logger = logging.getLogger(__name__)
 
 # ==================== SHARED CONFIG ====================
-SHEET_ID  = '1It-QLilNPKev_gYQe9RDFUkE4muSYWxdcqsFZwS58go'   # "GST Invoice" responses
-SHEET_GID = 1327167093                                        # target tab (from the sheet URL)
-SHEET_URL = 'https://docs.google.com/spreadsheets/d/%s/edit#gid=%s' % (SHEET_ID, SHEET_GID)
+# Fallbacks only — the live sheet location is read from Redash config #CONFIG_QUERY_ID (sheet_id/gid),
+# so moving the sheet is a query edit, no code change.
+SHEET_ID  = '1It-QLilNPKev_gYQe9RDFUkE4muSYWxdcqsFZwS58go'   # "GST Invoice" responses (fallback)
+SHEET_GID = 1327167093                                        # target tab (fallback)
+
+
+def _sheet_url(sid, gid):
+    return 'https://docs.google.com/spreadsheets/d/%s/edit#gid=%s' % (sid, gid)
+
+
+def _sheet_loc(cfg_rows):
+    """(sheet_id, sheet_gid, sheet_url) from config rows, falling back to the constants above."""
+    sid = next((r.get('sheet_id') for r in (cfg_rows or []) if r.get('sheet_id')), None) or SHEET_ID
+    gid = next((r.get('sheet_gid') for r in (cfg_rows or []) if r.get('sheet_gid') is not None), None)
+    gid = int(gid) if gid is not None else SHEET_GID
+    return sid, gid, _sheet_url(sid, gid)
 
 # ---- onboarding-alert config ----
 INVOICE_CHANNEL      = os.getenv('GST_INVOICE_SLACK_CHANNEL', 'C0B4J9RBWDC')   # TODO live channel; env overrides
@@ -120,18 +133,18 @@ COL_GST     = 'GST Number.'
 
 # ==================== SHARED HELPERS ====================
 
-def sheet_rows():
+def sheet_rows(sheet_id=SHEET_ID, sheet_gid=SHEET_GID):
     """Return the target tab as a list of header-mapped dicts (headers stripped), via Sheets ADC."""
     creds, _ = google.auth.default(scopes=['https://www.googleapis.com/auth/spreadsheets.readonly'])
     creds.refresh(google.auth.transport.requests.Request())
     hdrs = {'Authorization': 'Bearer %s' % creds.token}
-    meta = requests.get('https://sheets.googleapis.com/v4/spreadsheets/%s?fields=sheets.properties' % SHEET_ID,
+    meta = requests.get('https://sheets.googleapis.com/v4/spreadsheets/%s?fields=sheets.properties' % sheet_id,
                         headers=hdrs, timeout=30).json()
     title = next((s['properties']['title'] for s in meta.get('sheets', [])
-                  if s['properties'].get('sheetId') == SHEET_GID),
+                  if s['properties'].get('sheetId') == sheet_gid),
                  meta['sheets'][0]['properties']['title'] if meta.get('sheets') else None)
     rng = requests.utils.quote("'%s'" % title, safe='')
-    vals = requests.get('https://sheets.googleapis.com/v4/spreadsheets/%s/values/%s' % (SHEET_ID, rng),
+    vals = requests.get('https://sheets.googleapis.com/v4/spreadsheets/%s/values/%s' % (sheet_id, rng),
                         headers=hdrs, timeout=30).json().get('values', [])
     if not vals:
         return []
@@ -198,7 +211,7 @@ def _doc_button_blocks(rowmap):
     return [{'type': 'actions', 'elements': btns[i:i + 5]} for i in range(0, len(btns), 5)]
 
 
-def build_master_blocks(rowmap):
+def build_master_blocks(rowmap, sheet_url):
     vendor = _val(rowmap, 'Name of Vendor') or '(no name)'
     fields = [_field(label, _val(rowmap, col)) for col, label in MASTER_FIELDS]
     blocks = [
@@ -216,7 +229,7 @@ def build_master_blocks(rowmap):
         blocks += doc_blocks
     blocks.append({'type': 'actions', 'elements': [
         {'type': 'button', 'text': {'type': 'plain_text', 'text': ':page_with_curl: Open sheet', 'emoji': True},
-         'url': SHEET_URL, 'style': 'primary'}]})
+         'url': sheet_url, 'style': 'primary'}]})
     return 'New GST / Vendor Onboarding — %s' % vendor, blocks
 
 
@@ -242,7 +255,8 @@ def run_gst_invoice(**context):
     client = get_bigquery_client()
     client.query(INVOICE_DDL).result()
 
-    rows = sheet_rows()
+    sid, gid, sheet_url = _sheet_loc(redash_run(CONFIG_QUERY_ID, {}))
+    rows = sheet_rows(sid, gid)
     submissions = [r for r in rows if (r.get('Timestamp') or '').strip()]
     logger.info('      %d submission row(s) in sheet', len(submissions))
     if not submissions:
@@ -258,7 +272,7 @@ def run_gst_invoice(**context):
     pinged, now_iso = [], datetime.now(timezone.utc).isoformat()
     for s, k in new:
         try:
-            m_text, m_blocks = build_master_blocks(s)
+            m_text, m_blocks = build_master_blocks(s, sheet_url)
             ts = slack_post(INVOICE_CHANNEL, m_text, blocks=m_blocks)
             d_text, d_blocks = build_detail_blocks(s)
             slack_post(INVOICE_CHANNEL, d_text, blocks=d_blocks, thread_ts=ts)
@@ -286,7 +300,7 @@ def _fmt_amt(a, c):
     return '%s %s' % (format(a, ','), c)
 
 
-def build_payments_master_blocks(vendor, gst, email, period, payments):
+def build_payments_master_blocks(vendor, gst, email, period, payments, sheet_url):
     totals = {}
     for p in payments:
         totals[p['currency']] = totals.get(p['currency'], 0) + (p['amount'] or 0)
@@ -304,7 +318,7 @@ def build_payments_master_blocks(vendor, gst, email, period, payments):
          'text': ':moneybag: *%d* payment(s)  ·  total *%s*  ·  :thread: proofs in thread'
                  % (len(payments), tot)}]},
         {'type': 'section', 'text': {'type': 'mrkdwn',
-         'text': ':page_with_curl: <%s|Open source sheet (Excel)>' % SHEET_URL}},
+         'text': ':page_with_curl: <%s|Open source sheet (Excel)>' % sheet_url}},
     ]
 
 
@@ -344,11 +358,12 @@ def run_gst_monthly(**context):
 
     as_of = now.format('YYYY-MM-DD')
     period = now.subtract(months=1).format('MMM YYYY')
+    sid, gid, sheet_url = _sheet_loc(cfg)   # reuse the config rows already fetched above
 
     client = get_bigquery_client()
     client.query(MONTHLY_DDL).result()
 
-    vendors = [r for r in sheet_rows()
+    vendors = [r for r in sheet_rows(sid, gid)
                if (r.get(COL_STATUS, '') or '').strip().lower() == ACCEPTED_STATUS
                and RECURRING_MATCH in (r.get(COL_CADENCE, '') or '').lower()
                and (r.get(COL_EMAIL, '') or '').strip()]
@@ -369,7 +384,7 @@ def run_gst_monthly(**context):
             payments = redash_run(PAYMENTS_QUERY_ID, {'email': email, 'as_of_date': as_of}) or []
             ts = slack_post(channel, 'GST Monthly Payments — %s' % v.get(COL_VENDOR, email),
                             blocks=build_payments_master_blocks(v.get(COL_VENDOR, ''), v.get(COL_GST, ''),
-                                                                email, period, payments))
+                                                                email, period, payments, sheet_url))
             slack_post(channel, 'Payment proofs — %s' % period,
                        blocks=build_payments_thread_blocks(period, payments), thread_ts=ts)
             posted.append({'email': email.lower(), 'period': period, 'vendor': v.get(COL_VENDOR, ''),
