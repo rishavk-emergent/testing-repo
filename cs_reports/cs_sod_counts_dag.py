@@ -159,13 +159,15 @@ def run_cs_sod_counts(**context):
 
     # [3] render message (indent 1 -> Slack quote line)
     today = pendulum.now('Asia/Kolkata').format('D MMM YYYY')
+    labelw = max((len(r.get('label') or '') for r in rows), default=0)   # pad boxes to equal width
     lines = ['*SOD Count:*  _(%s)_' % today]
     for r in rows:
         v = values.get(r['line_order'], 0)
         prefix = '> ' if int(r.get('indent', 0) or 0) >= 1 else ''
         link = (r.get('link') or '').strip()
         value = '<%s|%d>' % (link, v) if link else str(v)
-        lines.append('%s`%s` - %s' % (prefix, r.get('label'), value))
+        label_box = '`%s`' % (r.get('label') or '').ljust(labelw)
+        lines.append('%s%s - %s' % (prefix, label_box, value))
     msg = '\n'.join(lines)
 
     logger.info('[4] Posting to %s', channel)
