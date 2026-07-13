@@ -159,14 +159,17 @@ def run_cs_sod_counts(**context):
 
     # [3] render message (indent 1 -> Slack quote line)
     today = pendulum.now('Asia/Kolkata').format('D MMM YYYY')
-    labelw = max((len(r.get('label') or '') for r in rows), default=0)   # pad boxes to equal width
+    # equal-width boxes for the indented sub-buckets; the top-level (All) keeps its natural width
+    subw = max((len(r.get('label') or '') for r in rows if int(r.get('indent', 0) or 0) >= 1), default=0)
     lines = ['*SOD Count:*  _(%s)_' % today]
     for r in rows:
         v = values.get(r['line_order'], 0)
-        prefix = '> ' if int(r.get('indent', 0) or 0) >= 1 else ''
+        indented = int(r.get('indent', 0) or 0) >= 1
+        prefix = '> ' if indented else ''
         link = (r.get('link') or '').strip()
         value = '<%s|%d>' % (link, v) if link else str(v)
-        label_box = '`%s`' % (r.get('label') or '').ljust(labelw)
+        label = (r.get('label') or '')
+        label_box = '`%s`' % (label.ljust(subw) if indented else label)
         lines.append('%s%s - %s' % (prefix, label_box, value))
     msg = '\n'.join(lines)
 
