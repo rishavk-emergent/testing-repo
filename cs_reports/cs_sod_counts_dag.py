@@ -23,8 +23,9 @@ CONFIG-DRIVEN (Redash #CONFIG_QUERY_ID) — edit there, no code push:
   * type='sum'    -> DAG sums the values of the 'bucket' rows (that's how "All" is computed).
   Add / remove / reorder buckets = edit rows in the query.
 
-Schedule: '0 10 * * *' Asia/Kolkata (daily). Channel: from config (cs-associates); override
-CS_SOD_SLACK_CHANNEL env for testing.
+Schedule: ticks hourly (Asia/Kolkata) but only posts on the config's trigger_hours (default
+6,11,16,21 IST) — edit trigger_hours in Redash, no code change. Channel: from config
+(cs-associates); override CS_SOD_SLACK_CHANNEL env for testing, CS_SOD_FORCE_RUN=1 to bypass the gate.
 """
 
 from datetime import timedelta
@@ -44,6 +45,7 @@ logger = logging.getLogger(__name__)
 
 # ==================== CONFIG ====================
 ENV_CHANNEL_OVERRIDE = os.getenv('CS_SOD_SLACK_CHANNEL')   # set to a test channel for dry runs; unset in prod
+FORCE_RUN            = os.getenv('CS_SOD_FORCE_RUN') == '1'   # bypass the trigger-hour gate (manual/test runs)
 FALLBACK_CHANNEL     = 'C0B075CBPS7'                        # cs-associates
 CONFIG_QUERY_ID      = 40628                                # Redash: "[CS] SOD Count config"
 TRINITY_MCP_URL      = 'https://trinity-base.internal.emergent.host/api/mcp/'   # base URL lives in code
@@ -141,6 +143,13 @@ def run_cs_sod_counts(**context):
     channel = ENV_CHANNEL_OVERRIDE or rows[0].get('channel_id') or FALLBACK_CHANNEL
     api_key = rows[0].get('trinity_api_key')
 
+    # [0] trigger-hour gate (config-driven): DAG ticks hourly, fires only on the configured IST hours
+    hours = {int(h.strip()) for h in (rows[0].get('trigger_hours') or '').split(',') if h.strip()}
+    now_hour = pendulum.now('Asia/Kolkata').hour
+    if not FORCE_RUN and hours and now_hour not in hours:
+        logger.info('SOD: hour %d not in trigger_hours %s -> skip', now_hour, sorted(hours))
+        return
+
     # [1] live counts per bucket from Trinity
     mcp = TrinityMCP(TRINITY_MCP_URL, api_key)
     values, by_label = {}, {}
@@ -195,7 +204,7 @@ dag = DAG(
     'cs_sod_counts_slack',
     default_args=default_args,
     description='Post SOD Count (live Trinity bucket counts) to cs-associates; buckets configured in Redash',
-    schedule_interval='0 10 * * *',   # daily 10:00 IST
+    schedule_interval='0 * * * *',    # hourly IST; the task fires only on config trigger_hours (default 6,11,16,21)
     catchup=False,
     is_paused_upon_creation=True,     # posts to cs-associates; unpause after validation
     tags=['slack', 'trinity', 'sod', 'cs_reports', 'cs_team'],
