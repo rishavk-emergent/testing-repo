@@ -165,7 +165,7 @@ def run_cs_sod_counts(**context):
         prefix = '> ' if int(r.get('indent', 0) or 0) >= 1 else ''
         link = (r.get('link') or '').strip()
         value = '<%s|%d>' % (link, v) if link else str(v)
-        lines.append('%s%s - %s' % (prefix, r.get('label'), value))
+        lines.append('%s`%s` - %s' % (prefix, r.get('label'), value))
     msg = '\n'.join(lines)
 
     logger.info('[4] Posting to %s', channel)
