@@ -160,9 +160,14 @@ def run_cs_sod_counts(**context):
     # [3] render message (indent 1 -> Slack quote line)
     today = pendulum.now('Asia/Kolkata').format('D MMM YYYY')
     lines = ['*SOD Count:*  _(%s)_' % today]
+    first_indent = True
     for r in rows:
         v = values.get(r['line_order'], 0)
-        prefix = '> ' if int(r.get('indent', 0) or 0) >= 1 else ''
+        indented = int(r.get('indent', 0) or 0) >= 1
+        # extra leading space on the FIRST indented line so it aligns with the rest
+        prefix = ('>  ' if first_indent else '> ') if indented else ''
+        if indented:
+            first_indent = False
         link = (r.get('link') or '').strip()
         value = '<%s|%d>' % (link, v) if link else str(v)
         lines.append('%s%s - %s' % (prefix, r.get('label'), value))
