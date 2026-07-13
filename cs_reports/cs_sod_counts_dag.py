@@ -105,14 +105,33 @@ class TrinityMCP:
         requests.post(self.url, headers=self.h, timeout=30,
                       json={'jsonrpc': '2.0', 'method': 'notifications/initialized', 'params': {}})
 
-    def ticket_counts(self, bucket_id):
+    def _tool(self, name, args):
         r = requests.post(self.url, headers=self.h, timeout=30, json={
             'jsonrpc': '2.0', 'id': 2, 'method': 'tools/call',
-            'params': {'name': 'ticket_counts', 'arguments': {'bucket_id': bucket_id}}})
+            'params': {'name': name, 'arguments': args}})
         data = _mcp_parse(r.text)
         if data.get('error'):
-            raise Exception('Trinity ticket_counts error: %s' % data['error'])
-        return json.loads(data['result']['content'][0]['text'])   # {open, pending, ...}
+            raise Exception('Trinity %s error: %s' % (name, data['error']))
+        return json.loads(data['result']['content'][0]['text'])
+
+    def ticket_counts(self, bucket_id):
+        return self._tool('ticket_counts', {'bucket_id': bucket_id})   # {open, pending, ...}
+
+    def bucket_ticket_ids(self, bucket_id, page=1000):
+        """Set of ticket ids in the bucket (open per bucket rule), following pagination."""
+        ids, cursor = set(), None
+        for _ in range(50):   # safety cap
+            args = {'bucket_id': bucket_id, 'limit': page}
+            if cursor:
+                args['cursor'] = cursor
+            d = self._tool('list_tickets', args)
+            for it in d.get('items', []):
+                if it.get('id'):
+                    ids.add(it['id'])
+            cursor = d.get('next_cursor')
+            if not cursor:
+                break
+        return ids
 
 
 # ==================== SLACK ====================
@@ -150,22 +169,29 @@ def run_cs_sod_counts(**context):
         logger.info('SOD: hour %d not in trigger_hours %s -> skip', now_hour, sorted(hours))
         return
 
-    # [1] live counts per bucket from Trinity
+    # [1] live counts per bucket from Trinity (open only)
     mcp = TrinityMCP(TRINITY_MCP_URL, api_key)
-    values, by_label = {}, {}
+    values, label_to_bid = {}, {}
     for r in rows:
         if r.get('type') == 'bucket' and r.get('bucket_id'):
             c = mcp.ticket_counts(r['bucket_id'])
             v = sum(int(c.get(s, 0) or 0) for s in COUNT_STATUSES)
             values[r['line_order']] = v
-            by_label[(r.get('label') or '').strip()] = v
+            label_to_bid[(r.get('label') or '').strip()] = r['bucket_id']
             logger.info('      %s = %d (%s)', r.get('label'), v, c)
 
-    # [2] resolve 'sum' rows: add up only the labels listed in sum_members (overlap buckets excluded)
+    # [2] resolve 'sum' rows as a DISTINCT UNION of the member buckets' tickets (buckets overlap,
+    #     so we dedupe ticket ids instead of adding counts). Members = sum_members labels.
     for r in rows:
         if r.get('type') == 'sum':
             members = [m.strip() for m in (r.get('sum_members') or '').split(',') if m.strip()]
-            values[r['line_order']] = sum(by_label.get(m, 0) for m in members)
+            union = set()
+            for m in members:
+                bid = label_to_bid.get(m)
+                if bid:
+                    union |= mcp.bucket_ticket_ids(bid)
+            values[r['line_order']] = len(union)
+            logger.info('      %s = %d (distinct union of %s)', r.get('label'), len(union), members)
 
     # [3] render message (indent 1 -> Slack quote line)
     today = pendulum.now('Asia/Kolkata').format('D MMM YYYY')
