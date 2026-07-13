@@ -1,7 +1,7 @@
 """
 GST Invoice - Slack DAGs (two DAGs in one file)
 
-1) gst_invoice_slack  (every 5 min, IST)
+1) gst_invoice_slack  (hourly, IST)
    Watches the "GST Invoice" Google Form response sheet and posts a Slack alert for every NEW
    vendor submission (Timestamp filled, not seen before): a master card + full audit detail in
    the thread. Dedup: support.gst_invoice_pinged.
@@ -401,7 +401,7 @@ dag_invoice = DAG(
     'gst_invoice_slack',
     default_args=default_args,
     description='Alert Slack for every new GST/vendor onboarding form submission',
-    schedule_interval='*/5 * * * *',
+    schedule_interval='0 * * * *',   # hourly, Asia/Kolkata
     catchup=False,
     is_paused_upon_creation=False,
     tags=['slack', 'gst', 'vendor', 'forms', 'cs_team'],
