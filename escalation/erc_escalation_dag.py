@@ -344,6 +344,19 @@ def _avg_resolution(closed):
     h = (sum(secs) / len(secs)) / 3600.0
     return '%.1f h' % h if h < 48 else '%.1f d' % (h / 24.0)
 
+def _ow_ltv(ow):
+    """Fallback LTV from Overwatch RCA text when Trinity has no LTV (Trinity doesn't carry LTV;
+    the Oracle RCA reliably states it, e.g. 'LTV USD 1,277.54' or '~USD $1,277.54')."""
+    pats = [r'LTV[^\d$]{0,14}\$?\s*(?:USD\s*)?\$?\s*([\d,]+\.?\d*)',
+            r'USD\s*\$?\s*([\d,]+\.\d{2})', r'\$\s*([\d,]+\.\d{2})\s*USD']
+    for a in ow:
+        blob = json.dumps(a, default=str)
+        for p in pats:
+            m = re.search(p, blob, re.I)
+            if m:
+                return '$%s (from Overwatch RCA)' % m.group(1)
+    return None
+
 def _payment_gateway(customer, region, ow):
     blob = (json.dumps(customer, default=str) + json.dumps(ow, default=str)).lower()
     for pg in ('razorpay', 'stripe', 'paddle'):
@@ -409,7 +422,7 @@ def assemble_context(email, trin, over):
     region = _first(customer, 'region', 'country', 'geo', default='Not available')
     facts = {
         'email': email,
-        'ltv_usd': _first(customer, 'ltv_usd', 'ltv', 'lifetime_value_usd', default='Not available'),
+        'ltv_usd': _first(customer, 'ltv_usd', 'ltv', 'lifetime_value_usd', default=(_ow_ltv(ow_analyses) or 'Not available')),
         'region': region,
         'geography': _first(customer, 'geography', 'city', 'state', 'country', default=region),
         'payment_gateway': _payment_gateway(customer, region, ow_analyses),
