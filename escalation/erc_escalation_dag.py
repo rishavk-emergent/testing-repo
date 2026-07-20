@@ -57,6 +57,22 @@ from utils.slack.slack_config import (
 
 logger = logging.getLogger(__name__)
 
+try:
+    from utils.secrets import get_secret          # Composer Secret Manager helper (first_job_quality uses it)
+except Exception:                                  # pragma: no cover - local/test fallback
+    def get_secret(_k):
+        return None
+
+def _env_override(name):
+    """Composer-provided value (Secret Manager first, then Airflow Variable); None if neither set."""
+    try:
+        v = get_secret(name)
+        if v:
+            return v
+    except Exception:
+        pass
+    return Variable.get(name, default_var=None)
+
 # ==================== CONFIG ====================
 CONFIG_QUERY_ID   = 41566                                  # Redash "[ERC] config" (single-row globals)
 ENV_CHANNEL_OVER  = os.getenv('ERC_SLACK_CHANNEL')         # test-channel override for dry runs
@@ -667,6 +683,12 @@ def run_erc(**context):
     bq = _bq()
     bq_ensure_table(bq)
 
+    # Prefer Composer's internal LiteLLM proxy creds (Secret Manager / Airflow Variable) when present,
+    # so a merged PR uses the internal proxy automatically. Locally these are unset -> fall back to the
+    # config-query values (OpenAI-direct for testing). No code/config change needed at go-live.
+    cfg['llm_proxy_url'] = _env_override('LLM_PROXY_URL') or cfg.get('llm_proxy_url')
+    cfg['llm_proxy_api_key'] = _env_override('LLM_PROXY_API_KEY') or cfg.get('llm_proxy_api_key')
+
     # ---- Phase A: new-mail briefings ----
     if FORCE_TS:
         d = _slack('conversations.history',
@@ -674,8 +696,15 @@ def run_erc(**context):
                     'inclusive': 'true', 'limit': 1}, http='get')
         parents = d.get('messages', [])
     else:
-        watermark = Variable.get(WATERMARK_VAR, default_var='0')
-        parents = fetch_new_erc_parents(channel, erc_bot, watermark)[:MAX_PER_RUN]
+        watermark = Variable.get(WATERMARK_VAR, default_var=None)
+        if not watermark:
+            # First run after deploy: start the clock at NOW so we only brief mails that arrive
+            # from here on — never the pre-existing backlog of ERC posts.
+            Variable.set(WATERMARK_VAR, repr(pendulum.now('UTC').float_timestamp))
+            logger.info('ERC: first run — watermark set to now; ignoring backlog, tracking only new mails')
+            parents = []
+        else:
+            parents = fetch_new_erc_parents(channel, erc_bot, watermark)[:MAX_PER_RUN]
 
     max_ts = None
     for m in parents:
