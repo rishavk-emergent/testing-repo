@@ -33,12 +33,12 @@ CONFIG ROW COLUMNS (Redash "[ERC] config"):
   llm_proxy_url, llm_proxy_api_key, llm_model, track_days
   (all on a single row; read from rows[0])
 
-TO CONFIRM AT FIRST TEST (isolated to config, not code):
-  - overwatch_mcp_url + overwatch_api_key: internal base is https://overwatch.internal.emergent.host
-    and the app has an OVERWATCH_API_KEY; confirm the MCP mount path + that this key authorizes it.
-  - Trinity list_tickets/get_customer exact field names for reopen_count / resolution timestamps
-    (defensive fallbacks below emit "Not available" if a field is absent).
-  - SLACK_BOT_TOKEN_ALERTS bot must be a MEMBER of the ERC channel to read/post in-thread.
+STATUS: end-to-end validated on live data (Trinity + Overwatch MCP + gpt-4o-mini). Remaining:
+  - SLACK_BOT_TOKEN_ALERTS bot (the "Daily Report" bot) must be a MEMBER of the ERC channel to
+    read replies + post in-thread.
+  - Config #41566 currently points llm_proxy_* at OpenAI direct (TESTING) — swap to the internal
+    LiteLLM proxy for prod, and rotate the test OpenAI key.
+  - Phase B tracker needs the Composer BQ service account (creates support.erc_tracked_customers).
 """
 
 from datetime import timedelta
@@ -58,7 +58,7 @@ from utils.slack.slack_config import (
 logger = logging.getLogger(__name__)
 
 # ==================== CONFIG ====================
-CONFIG_QUERY_ID   = None                                   # TODO: id of the "[ERC] config" Redash query
+CONFIG_QUERY_ID   = 41566                                  # Redash "[ERC] config" (single-row globals)
 ENV_CHANNEL_OVER  = os.getenv('ERC_SLACK_CHANNEL')         # test-channel override for dry runs
 FORCE_TS          = os.getenv('ERC_FORCE_TS')              # Phase A only: process ONLY this parent ts
 SKIP_PHASE_B      = os.getenv('ERC_SKIP_PHASE_B') == '1'   # test toggle
