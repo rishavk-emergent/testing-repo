@@ -270,6 +270,7 @@ Produce the briefing now, in exactly this structure:
 - *Email:* {email}
 - *Payment Gateway:* {pg}
 - *Open Tickets:* {open_ct}
+- *Ticket numbers:* {ticket_links}
 
 *3. Reason for Escalation*
 - *Total tickets so far:* {total_ct}
@@ -293,6 +294,7 @@ Produce the briefing now, in exactly this structure:
         ltv=facts.get('ltv_usd', 'Not available'), region=facts.get('region', 'Not available'),
         geo=facts.get('geography', 'Not available'), email=facts.get('email', 'Not available'),
         pg=facts.get('payment_gateway', 'Not available'), open_ct=facts.get('open_ticket_count', 'Not available'),
+        ticket_links=facts.get('open_ticket_links', '—'),
         total_ct=facts.get('total_ticket_count', 'Not available'), reopens=facts.get('reopen_count', 'Not available'),
         art=facts.get('avg_resolution_time', 'Not available'), level=facts.get('current_escalation_level', 'Not available'))
 
@@ -357,6 +359,27 @@ def _ow_ltv(ow):
                 return '$%s (from Overwatch RCA)' % m.group(1)
     return None
 
+def _region_from_ip(customer, ccf, tickets):
+    """Region via the customer's IP address. TODO(confirm-source): the IP field is not exposed on
+    Trinity get_customer/get_ticket or the OW AB-dashboard — it lives in <SYSTEM TBD>. Once the IP
+    source is confirmed, resolve it to a region here (geo-IP). Until then, scan known keys + fall back."""
+    ip = _first(customer, 'ip', 'ip_address', 'last_ip', 'signup_ip') or _first(ccf, 'ip', 'ip_address', 'last_ip')
+    if not ip:
+        for t in tickets:
+            ip = _first(t, 'ip', 'ip_address') or _first((t.get('customer') or {}), 'ip', 'ip_address')
+            if ip:
+                break
+    if not ip:
+        return _first(customer, 'region', 'country', 'geo', default='Not available')
+    # geo-IP resolution goes here once the field/source is confirmed
+    return 'Not available'
+
+def _reopen_count(email, tickets):
+    """Reopen count from the reopens snapshot. TODO(confirm-source): not present on Trinity ticket
+    objects; user indicates a 'reopens snapshot' source. Scan known keys, else Not available."""
+    total = sum(int(_first(t, 'reopen_count', 'reopens', 'num_reopens', default=0) or 0) for t in tickets)
+    return total if total else 'Not available'
+
 def _payment_gateway(customer, region, ow):
     blob = (json.dumps(customer, default=str) + json.dumps(ow, default=str)).lower()
     for pg in ('razorpay', 'stripe', 'paddle'):
@@ -380,10 +403,13 @@ def fetch_all_tickets(trin, email):
     return tickets
 
 def slim_ticket(t):
-    return {'id': _ticket_id(t), 'subject': _first(t, 'subject', 'title'),
+    return {'id': _ticket_id(t), 'num': _first(t, 'num'), 'subject': _first(t, 'subject', 'title'),
             'status': _first(t, 'status'), 'level': _first(t, 'level', 'escalation_level'),
             'created_at': _first(t, 'created_at', 'createdAt'), 'tags': _first(t, 'tags'),
             'last_message': _first(t, 'last_message', 'preview')}
+
+def _ticket_link(t):
+    return '<%s|#%s>' % (TRINITY_TICKET_URL % _ticket_id(t), _first(t, 'num', 'id'))
 
 def assemble_context(email, trin, over):
     customer = {}
@@ -419,17 +445,29 @@ def assemble_context(email, trin, over):
     except Exception as e:
         logger.warning('overwatch list_ticket_analyses failed: %s', e)
 
-    region = _first(customer, 'region', 'country', 'geo', default='Not available')
+    # LTV + subscription gateway live ONLY on the full get_ticket snapshot's custom_fields
+    # (list_tickets/get_customer don't carry them). Fetch the primary ticket for these.
+    ccf = {}
+    primary = (open_tickets or tickets or [None])[0]
+    if primary and _ticket_id(primary):
+        try:
+            snap = trin.tool('get_ticket', {'ticket_id': _ticket_id(primary)})
+            ccf = (snap.get('customer') or {}).get('custom_fields') or {}
+        except Exception as e:
+            logger.warning('get_ticket %s failed: %s', _ticket_id(primary), e)
+
+    region = _region_from_ip(customer, ccf, tickets)   # TODO: confirm IP field source (see note)
+    ltv = ccf.get('user_revenue')
     facts = {
         'email': email,
-        'ltv_usd': _first(customer, 'ltv_usd', 'ltv', 'lifetime_value_usd', default=(_ow_ltv(ow_analyses) or 'Not available')),
+        'ltv_usd': ('$%s' % ltv) if ltv not in (None, '') else _first(customer, 'ltv_usd', 'ltv', default=(_ow_ltv(ow_analyses) or 'Not available')),
         'region': region,
-        'geography': _first(customer, 'geography', 'city', 'state', 'country', default=region),
-        'payment_gateway': _payment_gateway(customer, region, ow_analyses),
+        'geography': region,
+        'payment_gateway': ccf.get('subscription_gateway') or _payment_gateway(customer, region, ow_analyses),
         'open_ticket_count': len(open_tickets),
+        'open_ticket_links': ', '.join(_ticket_link(t) for t in open_tickets if _ticket_id(t)) or '—',
         'total_ticket_count': len(tickets),
-        'reopen_count': _first(customer, 'reopen_count',
-                               default=(sum(int(_first(t, 'reopen_count', 'reopens', default=0) or 0) for t in tickets) or 'Not available')),
+        'reopen_count': _reopen_count(email, tickets),   # TODO: confirm reopens-snapshot source (see note)
         'avg_resolution_time': _avg_resolution(closed_tickets),
         'current_escalation_level': _first((open_tickets or tickets or [{}])[0], 'level', 'escalation_level', default='Not available'),
     }
