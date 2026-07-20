@@ -359,26 +359,38 @@ def _ow_ltv(ow):
                 return '$%s (from Overwatch RCA)' % m.group(1)
     return None
 
-def _region_from_ip(customer, ccf, tickets):
-    """Region via the customer's IP address. TODO(confirm-source): the IP field is not exposed on
-    Trinity get_customer/get_ticket or the OW AB-dashboard — it lives in <SYSTEM TBD>. Once the IP
-    source is confirmed, resolve it to a region here (geo-IP). Until then, scan known keys + fall back."""
-    ip = _first(customer, 'ip', 'ip_address', 'last_ip', 'signup_ip') or _first(ccf, 'ip', 'ip_address', 'last_ip')
-    if not ip:
-        for t in tickets:
-            ip = _first(t, 'ip', 'ip_address') or _first((t.get('customer') or {}), 'ip', 'ip_address')
-            if ip:
-                break
-    if not ip:
-        return _first(customer, 'region', 'country', 'geo', default='Not available')
-    # geo-IP resolution goes here once the field/source is confirmed
-    return 'Not available'
+def _signup_geo(bq, email):
+    """Region/geography from the customer's IP, already resolved in analytics.signups_raw_dataset
+    (country/region/city derived from ip_address). Returns {} if no signup row / on error."""
+    from google.cloud import bigquery
+    try:
+        q = ("SELECT country, region, city FROM `emergent-default.analytics.signups_raw_dataset` "
+             "WHERE email=@e ORDER BY created_at DESC LIMIT 1")
+        rows = list(bq.query(q, job_config=bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ScalarQueryParameter('e', 'STRING', email)])).result())
+        return {'country': rows[0].get('country'), 'region': rows[0].get('region'),
+                'city': rows[0].get('city')} if rows else {}
+    except Exception as e:
+        logger.warning('signup geo lookup failed for %s: %s', email, e)
+        return {}
 
-def _reopen_count(email, tickets):
-    """Reopen count from the reopens snapshot. TODO(confirm-source): not present on Trinity ticket
-    objects; user indicates a 'reopens snapshot' source. Scan known keys, else Not available."""
-    total = sum(int(_first(t, 'reopen_count', 'reopens', 'num_reopens', default=0) or 0) for t in tickets)
-    return total if total else 'Not available'
+def _reopen_count(bq, ticket_ids):
+    """Reopen count = CLOSED->not-CLOSED status_changed events on the customer's tickets, from the
+    Trinity v_ticket_events reopens snapshot (same definition as Polaris reopen feed #36960)."""
+    from google.cloud import bigquery
+    ids = [i for i in ticket_ids if i]
+    if not ids:
+        return 'Not available'
+    try:
+        q = ("SELECT COUNT(*) AS c FROM `emergent-default.trinity_database.v_ticket_events` "
+             "WHERE ticket_id IN UNNEST(@ids) AND action='status_changed' "
+             "AND JSON_VALUE(old_value)='CLOSED' AND JSON_VALUE(new_value)<>'CLOSED'")
+        rows = list(bq.query(q, job_config=bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ArrayQueryParameter('ids', 'STRING', ids)])).result())
+        return rows[0].get('c') if rows else 'Not available'
+    except Exception as e:
+        logger.warning('reopen count failed: %s', e)
+        return 'Not available'
 
 def _payment_gateway(customer, region, ow):
     blob = (json.dumps(customer, default=str) + json.dumps(ow, default=str)).lower()
@@ -411,7 +423,7 @@ def slim_ticket(t):
 def _ticket_link(t):
     return '<%s|#%s>' % (TRINITY_TICKET_URL % _ticket_id(t), _first(t, 'num', 'id'))
 
-def assemble_context(email, trin, over):
+def assemble_context(email, trin, over, bq):
     customer = {}
     try:
         rows = _rows(trin.tool('get_customer', {'email': email}))
@@ -456,18 +468,20 @@ def assemble_context(email, trin, over):
         except Exception as e:
             logger.warning('get_ticket %s failed: %s', _ticket_id(primary), e)
 
-    region = _region_from_ip(customer, ccf, tickets)   # TODO: confirm IP field source (see note)
+    geo = _signup_geo(bq, email)
+    region = geo.get('country') or _first(customer, 'region', 'country', default='Not available')
+    geography = ', '.join([x for x in (geo.get('city'), geo.get('region')) if x]) or region
     ltv = ccf.get('user_revenue')
     facts = {
         'email': email,
         'ltv_usd': ('$%s' % ltv) if ltv not in (None, '') else _first(customer, 'ltv_usd', 'ltv', default=(_ow_ltv(ow_analyses) or 'Not available')),
         'region': region,
-        'geography': region,
+        'geography': geography,
         'payment_gateway': ccf.get('subscription_gateway') or _payment_gateway(customer, region, ow_analyses),
         'open_ticket_count': len(open_tickets),
         'open_ticket_links': ', '.join(_ticket_link(t) for t in open_tickets if _ticket_id(t)) or '—',
         'total_ticket_count': len(tickets),
-        'reopen_count': _reopen_count(email, tickets),   # TODO: confirm reopens-snapshot source (see note)
+        'reopen_count': _reopen_count(bq, [_ticket_id(t) for t in tickets]),
         'avg_resolution_time': _avg_resolution(closed_tickets),
         'current_escalation_level': _first((open_tickets or tickets or [{}])[0], 'level', 'escalation_level', default='Not available'),
     }
@@ -549,7 +563,7 @@ def process_new_mail(m, channel, trin, over, cfg, bq):
         return
     logger.info('ERC %s: customer=%s', ts, email)
 
-    facts, open_t, sim_t, ow, tl, all_tickets = assemble_context(email, trin, over)
+    facts, open_t, sim_t, ow, tl, all_tickets = assemble_context(email, trin, over, bq)
     briefing = llm_chat(proxy_url, proxy_key, model, BRIEF_SYSTEM,
                         build_brief_prompt(facts, open_t, sim_t, ow, tl), max_tokens=1800)
     post_reply(channel, ts, '%s\n\n_%s_' % (briefing, BRIEF_MARKER))
