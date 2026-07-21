@@ -85,6 +85,7 @@ WATERMARK_VAR     = 'ERC_LAST_PROCESSED_TS'                # Airflow Variable: l
 BRIEF_SIGNATURE   = '*1. Executive Summary*'               # briefing's own header; detected for idempotency (no visible marker text)
 NOTFOUND_MSG      = ':warning: *ERC:* customer email not found in the forwarded mail — skipped.'
 NOTFOUND_SIG      = 'customer email not found'             # idempotency signature for the not-found post
+POINTER_SIG       = 'already has an active ERC thread'     # idempotency signature for the repeat-escalation pointer
 DEFAULT_MODEL     = 'gpt-4o-mini'
 DEFAULT_TRACK_DAYS = 30
 MAX_PER_RUN       = 5                                      # safety cap on new mails handled per tick
@@ -211,11 +212,18 @@ def already_briefed(channel, thread_ts):
     try:
         d = _slack('conversations.replies',
                    {'channel': channel, 'ts': thread_ts, 'limit': 50}, http='get')
-        return any((BRIEF_SIGNATURE in (m.get('text') or '') or NOTFOUND_SIG in (m.get('text') or ''))
-                   for m in d.get('messages', []))
+        return any((BRIEF_SIGNATURE in (m.get('text') or '') or NOTFOUND_SIG in (m.get('text') or '')
+                    or POINTER_SIG in (m.get('text') or '')) for m in d.get('messages', []))
     except Exception as e:
         logger.warning('conversations.replies failed for %s (%s) - assuming not briefed', thread_ts, e)
         return False
+
+
+def _permalink(channel, ts):
+    try:
+        return _slack('chat.getPermalink', {'channel': channel, 'message_ts': ts}, http='get')['permalink']
+    except Exception:
+        return 'https://emergentlabsinc.slack.com/archives/%s/p%s' % (channel, str(ts).replace('.', ''))
 
 
 def post_reply(channel, thread_ts, text):
@@ -613,6 +621,23 @@ def bq_active_customers(client):
     q = "SELECT email, channel_id, thread_ts, known_tickets FROM `%s` WHERE active AND expires_at > CURRENT_TIMESTAMP()" % BQ_FQN
     return [dict(r) for r in client.query(q).result()]
 
+def bq_active_customer(client, email):
+    """The customer's currently-active tracked row (within the 30-day window), if any."""
+    from google.cloud import bigquery
+    q = ("SELECT channel_id, thread_ts FROM `%s` WHERE email=@e AND active AND expires_at>CURRENT_TIMESTAMP() "
+         "ORDER BY registered_at DESC LIMIT 1" % BQ_FQN)
+    rows = list(client.query(q, job_config=bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ScalarQueryParameter('e', 'STRING', email)])).result())
+    return dict(rows[0]) if rows else None
+
+def bq_extend_expiry(client, email, days):
+    from google.cloud import bigquery
+    q = ("UPDATE `%s` SET expires_at=TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL @d DAY), "
+         "last_checked_at=CURRENT_TIMESTAMP() WHERE email=@e AND active" % BQ_FQN)
+    client.query(q, job_config=bigquery.QueryJobConfig(query_parameters=[
+        bigquery.ScalarQueryParameter('d', 'INT64', int(days)),
+        bigquery.ScalarQueryParameter('e', 'STRING', email)])).result()
+
 def bq_update_known(client, email, known, deactivate=False):
     from google.cloud import bigquery
     q = """UPDATE `{fqn}` SET known_tickets=@known, last_checked_at=CURRENT_TIMESTAMP(), active=@active
@@ -643,6 +668,26 @@ def process_new_mail(m, channel, trin, over, cfg, bq):
         post_reply(channel, ts, NOTFOUND_MSG)
         return
     logger.info('ERC %s: customer=%s', ts, email)
+
+    # Repeat escalation within the 30-day window: don't re-brief. Point to the existing thread,
+    # keep tracking on the ORIGINAL thread, and just extend the window.
+    try:
+        existing = bq_active_customer(bq, email)
+    except Exception as e:
+        existing = None
+        logger.warning('ERC %s: active-customer lookup failed: %s', ts, e)
+    if existing and existing.get('thread_ts'):
+        tag = (cfg.get('oncall_tag') or '').strip()
+        link = _permalink(existing.get('channel_id') or channel, existing['thread_ts'])
+        note = (':repeat: *%s* re-escalated within the tracking window — %s. Please continue there: <%s|open thread>'
+                % (email, POINTER_SIG, link))
+        post_reply(channel, ts, (tag + '\n' + note) if tag else note)
+        try:
+            bq_extend_expiry(bq, email, cfg.get('track_days') or DEFAULT_TRACK_DAYS)
+        except Exception as e:
+            logger.warning('ERC %s: extend expiry failed: %s', ts, e)
+        logger.info('ERC %s: repeat escalation for %s -> pointed to existing thread', ts, email)
+        return
 
     facts, open_t, sim_t, ow, tl, all_tickets = assemble_context(email, trin, over, bq)
     try:
