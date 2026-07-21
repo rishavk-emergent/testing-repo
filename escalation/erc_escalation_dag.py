@@ -555,8 +555,8 @@ def assemble_context(email, trin, over, bq):
 # ==================== BIGQUERY TRACKER STATE ====================
 
 def _bq():
-    from google.cloud import bigquery
-    return bigquery.Client(project=BQ_PROJECT)
+    from utils.slack.bigquery_client import get_bigquery_client   # house helper (Composer ADC)
+    return get_bigquery_client()
 
 def bq_ensure_table(client):
     ddl = """CREATE TABLE IF NOT EXISTS `{fqn}` (
