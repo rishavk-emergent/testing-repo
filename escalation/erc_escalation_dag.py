@@ -281,30 +281,32 @@ Produce the briefing now, in exactly this structure:
 > 2-4 sentence TL;DR: who this is, what the whole thing is about, and what they are asking for right now. Lead with the current ask and the escalation posture (legal notice, chargeback, refund demand...).
 
 *2. Basic Details*
-- *LTV:* {ltv}
-- *Region / Geography:* {region} / {geo}
-- *Email:* {email}
-- *Payment Gateway:* {pg}
-- *Open Tickets:* {open_ct}
-- *Ticket numbers:* {ticket_links}
+> • *LTV:* {ltv}
+> • *Region / Geography:* {region} / {geo}
+> • *Email:* {email}
+> • *Payment Gateway:* {pg}
+> • *Open Tickets:* {open_ct}
+> • *Ticket numbers:* {ticket_links}
 
 *3. Reason for Escalation*
-- *Total tickets so far:* {total_ct}
-- *Reopens:* {reopens}
-- *Resolution time (active/open-only):* P50 {p50} · P75 {p75}
-- *Escalation level:* {level}
-- *Why it escalated:* one line - the trigger that pushed this to ERC (from the RCA/timeline).
+> • *Total tickets so far:* {total_ct}
+> • *Reopens:* {reopens}
+> • *Resolution time (active/open-only):* P50 {p50} · P75 {p75}
+> • *Escalation level:* {level}
+> • *Why it escalated:* one line - the trigger that pushed this to ERC (from the RCA/timeline).
 
 *4. Background*  (synthesize to the crux across ALL tickets - not per-ticket)
 
 > *a. What the user is raising / asking for*
-> - the core issue(s) and the specific ask (refund amount, credits, GST invoice, completion, etc.)
+> • the core issue(s) and the specific ask (refund amount, credits, GST invoice, completion, etc.)
 
 > *b. What we did to resolve it*
-> - verified actions from our side (fixes shipped, credits issued, POC assigned, investigations run), grounded in the Overwatch RCA and the ticket timeline.
+> • verified actions from our side (fixes shipped, credits issued, POC assigned, investigations run), grounded in the Overwatch RCA and the ticket timeline.
 
 > *c. Our limitations conveyed to the user*
-> - the constraints we are up against - derived STRICTLY from what the Overwatch RCA states AND what humans actually communicated in the ticket timeline. State only limitations grounded in those two sources.""".format(
+> • the constraints we are up against - derived STRICTLY from what the Overwatch RCA states AND what humans actually communicated in the ticket timeline. State only limitations grounded in those two sources.
+
+Every line in sections 2, 3, and 4 MUST begin with "> " (blockquote); use "•" for bullets, never "-".""".format(
         facts=j(facts), open_tickets=j(open_tickets), similar_tickets=j(similar_tickets),
         ow=j(ow_analyses), timelines=j(timelines),
         ltv=facts.get('ltv_usd', 'Not available'), region=facts.get('region', 'Not available'),
