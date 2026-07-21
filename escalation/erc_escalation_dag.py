@@ -83,6 +83,8 @@ FORCE_TS          = os.getenv('ERC_FORCE_TS')              # Phase A only: proce
 SKIP_PHASE_B      = os.getenv('ERC_SKIP_PHASE_B') == '1'   # test toggle
 WATERMARK_VAR     = 'ERC_LAST_PROCESSED_TS'                # Airflow Variable: last handled parent ts
 BRIEF_SIGNATURE   = '*1. Executive Summary*'               # briefing's own header; detected for idempotency (no visible marker text)
+NOTFOUND_MSG      = ':warning: *ERC:* customer email not found in the forwarded mail — skipped.'
+NOTFOUND_SIG      = 'customer email not found'             # idempotency signature for the not-found post
 DEFAULT_MODEL     = 'gpt-4o-mini'
 DEFAULT_TRACK_DAYS = 30
 MAX_PER_RUN       = 5                                      # safety cap on new mails handled per tick
@@ -209,7 +211,8 @@ def already_briefed(channel, thread_ts):
     try:
         d = _slack('conversations.replies',
                    {'channel': channel, 'ts': thread_ts, 'limit': 50}, http='get')
-        return any(BRIEF_SIGNATURE in (m.get('text') or '') for m in d.get('messages', []))
+        return any((BRIEF_SIGNATURE in (m.get('text') or '') or NOTFOUND_SIG in (m.get('text') or ''))
+                   for m in d.get('messages', []))
     except Exception as e:
         logger.warning('conversations.replies failed for %s (%s) - assuming not briefed', thread_ts, e)
         return False
@@ -224,15 +227,29 @@ def post_reply(channel, thread_ts, text):
 # ==================== EMAIL EXTRACTION ====================
 
 EMAIL_RE = re.compile(r'[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}')
+# "From:" lines in the mail — the forwarded original sender (the customer) is the first EXTERNAL one;
+# the top "From:" is the internal person who forwarded the mail to erc@.
+FROM_RE = re.compile(r'From:\s*[^<\n]*?<?\s*([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})', re.I)
+
+def _is_internal(e):
+    return any(e.endswith('@' + d) or e.endswith('.' + d) for d in INTERNAL_DOMAINS)
 
 def extract_customer_email(text, proxy_url, proxy_key, model):
+    text = text or ''
+    # ERC = someone forwards a CUSTOMER's mail to erc@. The customer is whose mail was forwarded,
+    # i.e. the first EXTERNAL address on a "From:" line (top "From:" is the internal forwarder).
+    for e in FROM_RE.findall(text):
+        e = e.lower().strip('.,;:>|')
+        if not _is_internal(e):
+            return e
+    # Fallback: any external address in the body (LLM tie-break if several)
     cands, seen = [], set()
-    for e in EMAIL_RE.findall(text or ''):
+    for e in EMAIL_RE.findall(text):
         e = e.lower().strip('.,;:>|')
         if e in seen:
             continue
         seen.add(e)
-        if any(e.endswith('@' + d) or e.endswith('.' + d) for d in INTERNAL_DOMAINS):
+        if _is_internal(e):
             continue
         cands.append(e)
     if not cands:
@@ -622,7 +639,8 @@ def process_new_mail(m, channel, trin, over, cfg, bq):
 
     email = extract_customer_email(m.get('text', ''), proxy_url, proxy_key, model)
     if not email:
-        logger.warning('ERC %s: no customer email found - skip', ts)
+        logger.warning('ERC %s: user email not found - posting notice, no briefing/tracking', ts)
+        post_reply(channel, ts, NOTFOUND_MSG)
         return
     logger.info('ERC %s: customer=%s', ts, email)
 
