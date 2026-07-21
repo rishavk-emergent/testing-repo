@@ -30,8 +30,11 @@ WHERE THE LOGIC LIVES
 
 CONFIG ROW COLUMNS (Redash "[ERC] config"):
   channel_id, erc_bot_id, trinity_mcp_url, trinity_api_key, overwatch_mcp_url, overwatch_api_key,
-  llm_proxy_url, llm_proxy_api_key, llm_model, track_days
+  llm_proxy_url, llm_proxy_api_key, llm_model, track_days, oncall_tag
   (all on a single row; read from rows[0])
+  oncall_tag: emitted verbatim as the first line of every briefing + tracker post to page on-call.
+    Put a Slack mention token (e.g. "<!subteam^S0B8KFV3Y2G>" for @cs_associates) to actually notify;
+    editable here with no code change. Empty = no tag line.
 
 STATUS: end-to-end validated on live data (Trinity + Overwatch MCP + gpt-4o-mini). Remaining:
   - SLACK_BOT_TOKEN_ALERTS bot (the "Daily Report" bot) must be a MEMBER of the ERC channel to
@@ -630,7 +633,9 @@ def process_new_mail(m, channel, trin, over, cfg, bq):
     except Exception as e:
         logger.exception('ERC %s: briefing JSON parse failed, rendering facts-only: %s', ts, e)
         parts = {}
-    post_reply(channel, ts, render_briefing(facts, parts))
+    tag = (cfg.get('oncall_tag') or '').strip()      # e.g. "<!subteam^S...>" — on-call group ping; editable in Redash
+    body = render_briefing(facts, parts)
+    post_reply(channel, ts, (tag + '\n' + body) if tag else body)
 
     # register / refresh 30-day tracker with the current tickets as baseline
     baseline = {tid: _norm_status(_first(t, 'status')) for t in all_tickets if (tid := _ticket_id(t))}
@@ -659,6 +664,7 @@ def ticket_blurb(proxy_url, proxy_key, model, kind, ticket, ow_analyses):
 def run_tracker(channel_default, trin, over, cfg, bq):
     proxy_url, proxy_key = cfg['llm_proxy_url'], cfg['llm_proxy_api_key']
     model = cfg.get('llm_model') or DEFAULT_MODEL
+    tag = (cfg.get('oncall_tag') or '').strip()      # same on-call ping as the briefing; editable in Redash
     bq_expire_stale(bq)
     customers = bq_active_customers(bq)
     logger.info('Tracker: %d active customers', len(customers))
@@ -702,6 +708,8 @@ def run_tracker(channel_default, trin, over, cfg, bq):
             emoji = '🆕' if kind.startswith('New') else '🔄'
             blurb = ticket_blurb(proxy_url, proxy_key, model, kind, t, ow)
             msg = '%s *%s:* %s — %s' % (emoji, kind, _ticket_link(t), blurb)
+            if tag:
+                msg = tag + '\n' + msg
             try:
                 post_reply(channel, thread_ts, msg)
                 logger.info('Tracker %s: posted %s %s', email, kind, tid)
