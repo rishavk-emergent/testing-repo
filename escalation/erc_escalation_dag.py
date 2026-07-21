@@ -291,7 +291,7 @@ Produce the briefing now, in exactly this structure:
 *3. Reason for Escalation*
 - *Total tickets so far:* {total_ct}
 - *Reopens:* {reopens}
-- *Avg resolution time:* {art}
+- *Resolution time (active/open-only):* P50 {p50} · P75 {p75}
 - *Escalation level:* {level}
 - *Why it escalated:* one line - the trigger that pushed this to ERC (from the RCA/timeline).
 
@@ -312,7 +312,8 @@ Produce the briefing now, in exactly this structure:
         pg=facts.get('payment_gateway', 'Not available'), open_ct=facts.get('open_ticket_count', 'Not available'),
         ticket_links=facts.get('open_ticket_links', '—'),
         total_ct=facts.get('total_ticket_count', 'Not available'), reopens=facts.get('reopen_count', 'Not available'),
-        art=facts.get('avg_resolution_time', 'Not available'), level=facts.get('current_escalation_level', 'Not available'))
+        p50=facts.get('resolution_p50', 'Not available'), p75=facts.get('resolution_p75', 'Not available'),
+        level=facts.get('current_escalation_level', 'Not available'))
 
 
 # ==================== CONTEXT ASSEMBLY (Trinity + Overwatch) ====================
@@ -347,20 +348,57 @@ def _is_open(t):
 def _ticket_id(t):
     return _first(t, 'id', '_id', 'ticket_id')
 
-def _avg_resolution(closed):
-    secs = []
-    for t in closed:
-        c0 = _first(t, 'created_at', 'createdAt', 'created')
-        c1 = _first(t, 'closed_at', 'resolved_at', 'closedAt', 'updated_at', 'updatedAt')
-        try:
-            if c0 and c1:
-                secs.append((pendulum.parse(str(c1)) - pendulum.parse(str(c0))).total_seconds())
-        except Exception:
-            pass
-    if not secs:
-        return 'Not available'
-    h = (sum(secs) / len(secs)) / 3600.0
+def _fmt_dur(secs):
+    h = secs / 3600.0
     return '%.1f h' % h if h < 48 else '%.1f d' % (h / 24.0)
+
+def _pct(vals, p):
+    d = sorted(vals)
+    if not d:
+        return None
+    k = (len(d) - 1) * p / 100.0
+    f = int(k); c = min(f + 1, len(d) - 1)
+    return d[f] + (d[c] - d[f]) * (k - f)
+
+def _resolution_pcts(bq, ticket_ids):
+    """P50/P75 of ACTIVE-OPEN resolution time across the customer's CLOSED tickets. 'Active' = time
+    in OPEN status only; PENDING and CLOSED intervals are both treated as downtime and excluded
+    (so closed->reopen gaps and awaiting-customer pauses don't inflate it). Built from the Trinity
+    v_ticket_events status timeline (created_at = first OPEN, walk status_changed, sum OPEN spans)."""
+    from google.cloud import bigquery
+    ids = [i for i in ticket_ids if i]
+    if not ids:
+        return {'p50': 'Not available', 'p75': 'Not available'}
+    q = """
+    WITH ev AS (
+      SELECT ticket_id, created_at AS ts, UPPER(JSON_VALUE(new_value)) AS st
+      FROM `emergent-default.trinity_database.v_ticket_events`
+      WHERE ticket_id IN UNNEST(@ids) AND action='status_changed'
+      UNION ALL
+      SELECT _id, created_at, 'OPEN' FROM `emergent-default.trinity_database.v_tickets`
+      WHERE _id IN UNNEST(@ids)
+      QUALIFY ROW_NUMBER() OVER (PARTITION BY _id ORDER BY source_timestamp DESC)=1
+    ),
+    seq AS (
+      SELECT ticket_id, ts, st, LEAD(ts) OVER (PARTITION BY ticket_id ORDER BY ts) AS nxt FROM ev
+    ),
+    per_ticket AS (
+      SELECT ticket_id,
+        SUM(IF(st='OPEN' AND nxt IS NOT NULL, TIMESTAMP_DIFF(nxt, ts, SECOND), 0)) AS open_secs,
+        ARRAY_AGG(st ORDER BY ts DESC LIMIT 1)[OFFSET(0)] AS final_st
+      FROM seq GROUP BY ticket_id
+    )
+    SELECT open_secs FROM per_ticket WHERE final_st='CLOSED'"""
+    try:
+        rows = list(bq.query(q, job_config=bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ArrayQueryParameter('ids', 'STRING', ids)])).result())
+        vals = [r.get('open_secs') for r in rows if r.get('open_secs') is not None]
+        if not vals:
+            return {'p50': 'Not available', 'p75': 'Not available'}
+        return {'p50': _fmt_dur(_pct(vals, 50)), 'p75': _fmt_dur(_pct(vals, 75))}
+    except Exception as e:
+        logger.warning('resolution percentiles failed: %s', e)
+        return {'p50': 'Not available', 'p75': 'Not available'}
 
 def _ow_ltv(ow):
     """Fallback LTV from Overwatch RCA text when Trinity has no LTV (Trinity doesn't carry LTV;
@@ -485,6 +523,7 @@ def assemble_context(email, trin, over, bq):
             logger.warning('get_ticket %s failed: %s', _ticket_id(primary), e)
 
     geo = _signup_geo(bq, email)
+    res = _resolution_pcts(bq, [_ticket_id(t) for t in tickets])
     region = geo.get('country') or _first(customer, 'region', 'country', default='Not available')
     geography = ', '.join([x for x in (geo.get('city'), geo.get('region')) if x]) or region
     ltv = ccf.get('user_revenue')
@@ -498,7 +537,8 @@ def assemble_context(email, trin, over, bq):
         'open_ticket_links': ', '.join(_ticket_link(t) for t in open_tickets if _ticket_id(t)) or '—',
         'total_ticket_count': len(tickets),
         'reopen_count': _reopen_count(bq, [_ticket_id(t) for t in tickets]),
-        'avg_resolution_time': _avg_resolution(closed_tickets),
+        'resolution_p50': res['p50'],
+        'resolution_p75': res['p75'],
         'current_escalation_level': _first((open_tickets or tickets or [{}])[0], 'level', 'escalation_level', default='Not available'),
     }
     return (facts, [slim_ticket(t) for t in open_tickets], [slim_ticket(t) for t in closed_tickets[:8]],
@@ -652,9 +692,8 @@ def run_tracker(channel_default, trin, over, cfg, bq):
         for kind, t in events:
             tid = _ticket_id(t)
             emoji = '🆕' if kind.startswith('New') else '🔄'
-            link = TRINITY_TICKET_URL % tid
             blurb = ticket_blurb(proxy_url, proxy_key, model, kind, t, ow)
-            msg = '%s *%s:* <%s|#%s> — %s' % (emoji, kind, link, str(tid)[-6:], blurb)
+            msg = '%s *%s:* %s — %s' % (emoji, kind, _ticket_link(t), blurb)
             try:
                 post_reply(channel, thread_ts, msg)
                 logger.info('Tracker %s: posted %s %s', email, kind, tid)
