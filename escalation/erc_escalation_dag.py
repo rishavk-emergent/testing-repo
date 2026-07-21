@@ -17,7 +17,7 @@ PHASE B - 30-day ticket tracker
 
 WHY POLL, NOT WEBHOOK: Composer/Airflow cannot host an inbound listener; no analytics-dags DAG
 does. So this ticks every 5 min. Idempotency:
-  - Phase A: before briefing, we read the thread and skip if our auto-brief marker is already there
+  - Phase A: before briefing, we read the thread and skip if our briefing header is already there
     (survives watermark resets). A watermark Variable bounds how far back we scan.
   - Phase B: state lives in BigQuery (support.erc_tracked_customers); we only post ticket ids not
     already in the stored baseline, then fold them into the baseline.
@@ -79,7 +79,7 @@ ENV_CHANNEL_OVER  = os.getenv('ERC_SLACK_CHANNEL')         # test-channel overri
 FORCE_TS          = os.getenv('ERC_FORCE_TS')              # Phase A only: process ONLY this parent ts
 SKIP_PHASE_B      = os.getenv('ERC_SKIP_PHASE_B') == '1'   # test toggle
 WATERMARK_VAR     = 'ERC_LAST_PROCESSED_TS'                # Airflow Variable: last handled parent ts
-BRIEF_MARKER      = 'ERC-AUTO-BRIEF'                       # hidden marker in our briefing -> idempotency
+BRIEF_SIGNATURE   = '*1. Executive Summary*'               # briefing's own header; detected for idempotency (no visible marker text)
 DEFAULT_MODEL     = 'gpt-4o-mini'
 DEFAULT_TRACK_DAYS = 30
 MAX_PER_RUN       = 5                                      # safety cap on new mails handled per tick
@@ -202,11 +202,11 @@ def fetch_new_erc_parents(channel, erc_bot_id, oldest_ts):
 
 
 def already_briefed(channel, thread_ts):
-    """True if our auto-brief marker is already present in the thread (idempotency w/o reactions)."""
+    """True if our briefing (its Executive Summary header) is already in the thread (idempotency w/o reactions)."""
     try:
         d = _slack('conversations.replies',
                    {'channel': channel, 'ts': thread_ts, 'limit': 50}, http='get')
-        return any(BRIEF_MARKER in (m.get('text') or '') for m in d.get('messages', []))
+        return any(BRIEF_SIGNATURE in (m.get('text') or '') for m in d.get('messages', []))
     except Exception as e:
         logger.warning('conversations.replies failed for %s (%s) - assuming not briefed', thread_ts, e)
         return False
@@ -622,7 +622,7 @@ def process_new_mail(m, channel, trin, over, cfg, bq):
     facts, open_t, sim_t, ow, tl, all_tickets = assemble_context(email, trin, over, bq)
     briefing = llm_chat(proxy_url, proxy_key, model, BRIEF_SYSTEM,
                         build_brief_prompt(facts, open_t, sim_t, ow, tl), max_tokens=1800)
-    post_reply(channel, ts, '%s\n\n_%s_' % (briefing, BRIEF_MARKER))
+    post_reply(channel, ts, briefing)
 
     # register / refresh 30-day tracker with the current tickets as baseline
     baseline = {tid: _norm_status(_first(t, 'status')) for t in all_tickets if (tid := _ticket_id(t))}
