@@ -86,6 +86,7 @@ BRIEF_SIGNATURE   = '*1. Executive Summary*'               # briefing's own head
 NOTFOUND_MSG      = ':warning: *ERC:* customer email not found in the forwarded mail — skipped.'
 NOTFOUND_SIG      = 'customer email not found'             # idempotency signature for the not-found post
 POINTER_SIG       = 'already has an active ERC thread'     # idempotency signature for the repeat-escalation pointer
+NOACCOUNT_SIG     = 'no matching account or tickets found'  # idempotency signature for the no-account notice
 DEFAULT_MODEL     = 'gpt-4o-mini'
 DEFAULT_TRACK_DAYS = 30
 MAX_PER_RUN       = 5                                      # safety cap on new mails handled per tick
@@ -212,8 +213,8 @@ def already_briefed(channel, thread_ts):
     try:
         d = _slack('conversations.replies',
                    {'channel': channel, 'ts': thread_ts, 'limit': 50}, http='get')
-        return any((BRIEF_SIGNATURE in (m.get('text') or '') or NOTFOUND_SIG in (m.get('text') or '')
-                    or POINTER_SIG in (m.get('text') or '')) for m in d.get('messages', []))
+        sigs = (BRIEF_SIGNATURE, NOTFOUND_SIG, POINTER_SIG, NOACCOUNT_SIG)
+        return any(any(s in (m.get('text') or '') for s in sigs) for m in d.get('messages', []))
     except Exception as e:
         logger.warning('conversations.replies failed for %s (%s) - assuming not briefed', thread_ts, e)
         return False
@@ -690,6 +691,13 @@ def process_new_mail(m, channel, trin, over, cfg, bq):
         return
 
     facts, open_t, sim_t, ow, tl, all_tickets = assemble_context(email, trin, over, bq)
+    if not all_tickets and not ow:
+        # Email identified, but no Trinity tickets and no Overwatch analyses -> no real account/history.
+        # Post an alert instead of a briefing full of "Not available", and do not register for tracking.
+        logger.warning('ERC %s: %s identified but no account/tickets found - notice, no briefing/tracking', ts, email)
+        post_reply(channel, ts, ':warning: *ERC:* `%s` identified but %s — skipped.' % (email, NOACCOUNT_SIG))
+        return
+
     try:
         parts = _parse_brief_json(llm_chat(proxy_url, proxy_key, model, BRIEF_SYSTEM,
                                            build_brief_prompt(facts, open_t, sim_t, ow, tl), max_tokens=1200))
