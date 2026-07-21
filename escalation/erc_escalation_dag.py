@@ -250,72 +250,74 @@ def extract_customer_email(text, proxy_url, proxy_key, model):
 
 # ==================== PROMPTS ====================
 
-BRIEF_SYSTEM = """You are the ERC (Escalation Resolution Committee) analyst bot for Emergent, a platform where users build software with AI agents. An escalation email has landed on erc@emergent.sh and been posted to Slack. Produce ONE tight briefing to post as a reply in that thread so leadership grasps the case in 30 seconds.
+BRIEF_SYSTEM = """You are the ERC (Escalation Resolution Committee) analyst bot for Emergent, a platform where users build software with AI agents. An escalation email has landed on erc@emergent.sh. Extract the NARRATIVE for a leadership briefing (the numeric fields are rendered separately by code — you only write prose).
 
 GROUNDING RULES - non-negotiable:
-- Use ONLY the facts in the INPUT (customer facts, ticket timelines, Overwatch RCA/analyses).
-- NEVER invent or recompute a number. Every figure is given in `facts` - copy it verbatim. If a value is missing/empty, write "Not available". Do not estimate.
+- Use ONLY the INPUT (ticket timelines, Overwatch RCA/analyses). Never invent facts.
 - Distinguish what the CUSTOMER claims from what Emergent VERIFIED (Overwatch RCA = our verified view).
-- Synthesize to the CRUX. Do NOT go ticket-by-ticket. Merge everything across all of the user's tickets into one coherent account - collapse duplicates, keep only what matters. Brevity over completeness.
+- Synthesize to the CRUX across ALL of the user's tickets - do NOT go ticket-by-ticket; collapse duplicates, keep only what matters. Brevity over completeness.
 - No marketing tone, no reassurance filler. Internal briefing.
 
-OUTPUT FORMAT - Slack mrkdwn only (single *bold*, > quotes, bullets). Exactly the four sections in the template."""
+OUTPUT: return ONLY a JSON object (no markdown, no code fences, no prose around it) with these string keys, each a SINGLE line with no newlines:
+- "exec_summary": 2-4 sentences - who this is, what the whole thing is about, and the current ask + escalation posture (legal notice, chargeback, refund demand...).
+- "why_escalated": one line - the trigger that pushed this to ERC.
+- "bg_asking": 1-3 sentences - the core issue(s) and the specific ask (refund amount, credits, GST invoice, completion...).
+- "bg_did": 1-3 sentences - verified actions from our side (fixes shipped, credits issued, POC assigned, investigations run), grounded in the RCA/timeline.
+- "bg_limits": 1-3 sentences - constraints we are up against, STRICTLY from what the Overwatch RCA states AND what humans actually communicated in the ticket timeline."""
 
 
 def build_brief_prompt(facts, open_tickets, similar_tickets, ow_analyses, timelines):
     j = lambda o: json.dumps(o, ensure_ascii=False, default=str)
-    return """INPUT
-=====
-facts (authoritative - copy numbers verbatim):
-{facts}
+    return ("INPUT\n=====\n"
+            "open_tickets:        %s\nsimilar_tickets:     %s\noverwatch_analyses:  %s\nticket_timelines:    %s\n\n"
+            "=====\nReturn ONLY the JSON object described above (keys: exec_summary, why_escalated, "
+            "bg_asking, bg_did, bg_limits)." % (
+                j(open_tickets), j(similar_tickets), j(ow_analyses), j(timelines)))
 
-open_tickets:        {open_tickets}
-similar_tickets:     {similar_tickets}
-overwatch_analyses:  {ow}
-ticket_timelines:    {timelines}
 
-=====
-Produce the briefing now, in exactly this structure:
+def _parse_brief_json(text):
+    """Extract the JSON object from the model output (tolerates code fences / surrounding text)."""
+    m = re.search(r'\{.*\}', text or '', re.S)
+    if not m:
+        raise ValueError('no JSON object in model output')
+    d = json.loads(m.group(0))
+    return {k: ' '.join(str(d.get(k, '') or '').split()) for k in
+            ('exec_summary', 'why_escalated', 'bg_asking', 'bg_did', 'bg_limits')}
 
-*1. Executive Summary*
-> 2-4 sentence TL;DR: who this is, what the whole thing is about, and what they are asking for right now. Lead with the current ask and the escalation posture (legal notice, chargeback, refund demand...).
 
-*2. Basic Details*
-> • *LTV:* {ltv}
-> • *Region / Geography:* {region} / {geo}
-> • *Email:* {email}
-> • *Payment Gateway:* {pg}
-> • *Open Tickets:* {open_ct}
-> • *Ticket numbers:* {ticket_links}
-
-*3. Reason for Escalation*
-> • *Total tickets so far:* {total_ct}
-> • *Reopens:* {reopens}
-> • *Resolution time (active/open-only):* P50 {p50} · P75 {p75}
-> • *Escalation level:* {level}
-> • *Why it escalated:* one line - the trigger that pushed this to ERC (from the RCA/timeline).
-
-*4. Background*  (synthesize to the crux across ALL tickets - not per-ticket)
-
-> *a. What the user is raising / asking for*
-> • the core issue(s) and the specific ask (refund amount, credits, GST invoice, completion, etc.)
-
-> *b. What we did to resolve it*
-> • verified actions from our side (fixes shipped, credits issued, POC assigned, investigations run), grounded in the Overwatch RCA and the ticket timeline.
-
-> *c. Our limitations conveyed to the user*
-> • the constraints we are up against - derived STRICTLY from what the Overwatch RCA states AND what humans actually communicated in the ticket timeline. State only limitations grounded in those two sources.
-
-Every line in sections 2, 3, and 4 MUST begin with "> " (blockquote); use "•" for bullets, never "-".""".format(
-        facts=j(facts), open_tickets=j(open_tickets), similar_tickets=j(similar_tickets),
-        ow=j(ow_analyses), timelines=j(timelines),
-        ltv=facts.get('ltv_usd', 'Not available'), region=facts.get('region', 'Not available'),
-        geo=facts.get('geography', 'Not available'), email=facts.get('email', 'Not available'),
-        pg=facts.get('payment_gateway', 'Not available'), open_ct=facts.get('open_ticket_count', 'Not available'),
-        ticket_links=facts.get('open_ticket_links', '—'),
-        total_ct=facts.get('total_ticket_count', 'Not available'), reopens=facts.get('reopen_count', 'Not available'),
-        p50=facts.get('resolution_p50', 'Not available'), p75=facts.get('resolution_p75', 'Not available'),
-        level=facts.get('current_escalation_level', 'Not available'))
+def render_briefing(f, p):
+    """Assemble the Slack mrkdwn briefing deterministically: code owns all formatting/numbers,
+    the model only supplied the prose in `p`. Guarantees blockquotes/bullets are exactly right."""
+    na = 'Not available'
+    return "\n".join([
+        "*1. Executive Summary*",
+        "> " + (p.get('exec_summary') or na),
+        "",
+        "*2. Basic Details*",
+        "> • *LTV:* %s" % f.get('ltv_usd', na),
+        "> • *Region / Geography:* %s / %s" % (f.get('region', na), f.get('geography', na)),
+        "> • *Email:* %s" % f.get('email', na),
+        "> • *Payment Gateway:* %s" % f.get('payment_gateway', na),
+        "> • *Open Tickets:* %s" % f.get('open_ticket_count', na),
+        "> • *Ticket numbers:* %s" % f.get('open_ticket_links', '—'),
+        "",
+        "*3. Reason for Escalation*",
+        "> • *Total tickets so far:* %s" % f.get('total_ticket_count', na),
+        "> • *Reopens:* %s" % f.get('reopen_count', na),
+        "> • *Resolution time (active/open-only):* P50 %s · P75 %s" % (f.get('resolution_p50', na), f.get('resolution_p75', na)),
+        "> • *Escalation level:* %s" % f.get('current_escalation_level', na),
+        "> • *Why it escalated:* %s" % (p.get('why_escalated') or na),
+        "",
+        "*4. Background*",
+        "> *a. What the user is raising / asking for*",
+        "> " + (p.get('bg_asking') or na),
+        "",
+        "> *b. What we did to resolve it*",
+        "> " + (p.get('bg_did') or na),
+        "",
+        "> *c. Our limitations conveyed to the user*",
+        "> " + (p.get('bg_limits') or na),
+    ])
 
 
 # ==================== CONTEXT ASSEMBLY (Trinity + Overwatch) ====================
@@ -622,9 +624,13 @@ def process_new_mail(m, channel, trin, over, cfg, bq):
     logger.info('ERC %s: customer=%s', ts, email)
 
     facts, open_t, sim_t, ow, tl, all_tickets = assemble_context(email, trin, over, bq)
-    briefing = llm_chat(proxy_url, proxy_key, model, BRIEF_SYSTEM,
-                        build_brief_prompt(facts, open_t, sim_t, ow, tl), max_tokens=1800)
-    post_reply(channel, ts, briefing)
+    try:
+        parts = _parse_brief_json(llm_chat(proxy_url, proxy_key, model, BRIEF_SYSTEM,
+                                           build_brief_prompt(facts, open_t, sim_t, ow, tl), max_tokens=1200))
+    except Exception as e:
+        logger.exception('ERC %s: briefing JSON parse failed, rendering facts-only: %s', ts, e)
+        parts = {}
+    post_reply(channel, ts, render_briefing(facts, parts))
 
     # register / refresh 30-day tracker with the current tickets as baseline
     baseline = {tid: _norm_status(_first(t, 'status')) for t in all_tickets if (tid := _ticket_id(t))}
