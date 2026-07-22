@@ -43,6 +43,7 @@ logger = logging.getLogger(__name__)
 CONFIG_QUERY_ID = 41566                 # same [ERC] config row (trinity/overwatch/llm/tag + rca_channels)
 WATERMARK_VAR   = 'RCA_CMD_WATERMARKS'  # Airflow Variable: JSON {channel_id: last_ts}
 MAX_PER_CHANNEL = 5                     # safety cap on commands handled per channel per run
+THREAD_LOOKBACK_HOURS = 48              # scan replies of threads whose parent is within this window
 RCA_RE          = re.compile(r'\brca\b', re.I)
 
 
@@ -123,28 +124,59 @@ def run_rca(**context):
     except Exception:
         wm = {}
 
+    now_f = pendulum.now('UTC').float_timestamp
+    newer = lambda a, b: max(a, b, key=lambda t: float(t))
+
     for ch in channels:
         last = wm.get(ch)
         if not last:
             # first time we see this channel -> start the clock now, ignore backlog
-            wm[ch] = repr(pendulum.now('UTC').float_timestamp)
+            wm[ch] = repr(now_f)
             continue
+        newest = last
+        handled = [0]
+
+        def _maybe(msg):
+            if handled[0] < MAX_PER_CHANNEL and _is_command(msg, bot_id):
+                try:
+                    handle_command(ch, msg, bot_id, trin, over, bq, cfg)  # replies in msg's thread
+                    handled[0] += 1
+                except Exception as e:
+                    logger.exception('RCA: handle failed in %s: %s', ch, e)
+
+        # (1) new TOP-LEVEL messages since watermark
         try:
-            d = erc._slack('conversations.history', {'channel': ch, 'oldest': last, 'limit': 50, 'inclusive': 'false'}, http='get')
+            d = erc._slack('conversations.history', {'channel': ch, 'oldest': last, 'limit': 100, 'inclusive': 'false'}, http='get')
         except Exception as e:
             logger.warning('RCA: history(%s) failed: %s', ch, e)
             continue
-        msgs = sorted(d.get('messages', []), key=lambda x: float(x['ts']))
-        newest = last
-        handled = 0
-        for m in msgs:
-            newest = max(newest, m['ts'], key=lambda t: float(t))
-            if handled < MAX_PER_CHANNEL and _is_command(m, bot_id):
-                try:
-                    handle_command(ch, m, bot_id, trin, over, bq, cfg)
-                    handled += 1
-                except Exception as e:
-                    logger.exception('RCA: handle failed in %s: %s', ch, e)
+        for m in sorted(d.get('messages', []), key=lambda x: float(x['ts'])):
+            newest = newer(newest, m['ts'])
+            _maybe(m)
+
+        # (2) new REPLIES in threads active within the lookback window (conversations.history does
+        #     not return thread replies, so scan replies of threads that got activity since watermark)
+        look = repr(now_f - THREAD_LOOKBACK_HOURS * 3600)
+        try:
+            hd = erc._slack('conversations.history', {'channel': ch, 'oldest': look, 'limit': 200}, http='get')
+        except Exception as e:
+            hd = {'messages': []}
+            logger.warning('RCA: lookback history(%s) failed: %s', ch, e)
+        for p in hd.get('messages', []):
+            if int(p.get('reply_count', 0) or 0) <= 0 or float(p.get('latest_reply', '0') or 0) <= float(last):
+                continue
+            pts = p.get('thread_ts') or p['ts']
+            try:
+                rd = erc._slack('conversations.replies', {'channel': ch, 'ts': pts, 'oldest': last, 'limit': 100}, http='get')
+            except Exception as e:
+                logger.warning('RCA: replies(%s,%s) failed: %s', ch, pts, e)
+                continue
+            for rep in sorted(rd.get('messages', []), key=lambda x: float(x['ts'])):
+                if rep.get('ts') == pts or float(rep['ts']) <= float(last):
+                    continue
+                newest = newer(newest, rep['ts'])
+                _maybe(rep)
+
         wm[ch] = newest
 
     Variable.set(WATERMARK_VAR, json.dumps(wm))
