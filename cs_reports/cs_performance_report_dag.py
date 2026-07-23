@@ -385,14 +385,20 @@ def _plain_fallback():
     return ("Your weekly performance report is in the HTML body of this email, with your reopen "
             "dump attached as an .xlsx. Questions, suggestions, or anything else - just reply.")
 
-def send_email(to, subject, html, xlsx_bytes, filename, cfg):
+def cc_for_tier(tier, cfg):
+    """CC list by tier, from the config query. L1 -> cc_l1; L2 Full Stack/Expo -> cc_l2."""
+    key = 'cc_l1' if tier == 'L1' else 'cc_l2'
+    return [e.strip() for e in (cfg.get(key) or '').split(',') if e.strip()]
+
+def send_email(to, subject, html, xlsx_bytes, filename, cfg, cc=None):
     """Send one agent's report as HTML + .xlsx attachment via Gmail SMTP (app password).
     DRY_RUN writes HTML+xlsx to disk instead of sending."""
+    cc = cc or []
     if DRY_RUN:
         os.makedirs(DRY_RUN_DIR, exist_ok=True)
         base=os.path.join(DRY_RUN_DIR, to.split('@')[0])
         open(base+'.html','w').write(html); open(base+'_'+filename,'wb').write(xlsx_bytes)
-        logger.info('[DRY_RUN] wrote %s.html + %s (%d bytes xlsx)', base, filename, len(xlsx_bytes))
+        logger.info('[DRY_RUN] wrote %s.html + %s (%d bytes xlsx); cc=%s', base, filename, len(xlsx_bytes), cc)
         return
     import smtplib
     from email.mime.multipart import MIMEMultipart
@@ -404,6 +410,8 @@ def send_email(to, subject, html, xlsx_bytes, filename, cfg):
     msg = MIMEMultipart('mixed')
     msg['Subject'] = subject; msg['From'] = 'CS Weekly Report <%s>' % sender
     msg['To'] = to; msg['Reply-To'] = reply_to
+    if cc:
+        msg['Cc'] = ', '.join(cc)
     alt = MIMEMultipart('alternative')
     alt.attach(MIMEText(_plain_fallback(), 'plain'))
     alt.attach(MIMEText(html, 'html'))
@@ -413,8 +421,8 @@ def send_email(to, subject, html, xlsx_bytes, filename, cfg):
     msg.attach(att)
     with smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=60) as s:
         s.starttls(); s.login(sender, _gmail_app_password())
-        s.sendmail(sender, [to], msg.as_string())
-    logger.info('sent report to %s (xlsx %d bytes)', to, len(xlsx_bytes))
+        s.sendmail(sender, [to] + cc, msg.as_string())   # envelope incl. CC recipients
+    logger.info('sent report to %s (cc=%s, xlsx %d bytes)', to, cc, len(xlsx_bytes))
 
 # ==================== MAIN TASK ====================
 def run_perf_report(**context):
@@ -437,7 +445,8 @@ def run_perf_report(**context):
             fname=f"reopen_dump_{p['name'].split()[0].lower().replace('/','-') or 'agent'}.xlsx"
             to = test_to or p['email']
             subj = ('[TEST %s] ' % p['name'] + subject_prefix) if test_to else subject_prefix
-            send_email(to, subj, html, xlsx, fname, cfg)
+            cc = [] if test_to else cc_for_tier(p['tier'], cfg)   # no CC during pilot/test sends
+            send_email(to, subj, html, xlsx, fname, cfg, cc=cc)
             sent+=1
         except Exception as e:                                # one bad agent must not sink the run
             logger.exception('perf report FAILED for %s: %s', p.get('email'), e)
