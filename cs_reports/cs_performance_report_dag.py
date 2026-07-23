@@ -369,15 +369,52 @@ def _ai_fallback(p):
     }
 
 # ==================== DELIVERY ====================
+SMTP_SERVER = 'smtp.gmail.com'
+SMTP_PORT   = 587
+GMAIL_SECRET_NAME = 'cs-perf-gmail-app-password'   # 16-char Gmail App Password for from_email
+
+def _gmail_app_password():
+    """App password: env override for local tests, else Secret Manager (Composer)."""
+    pw = os.getenv('CS_PERF_GMAIL_APP_PASSWORD')
+    if pw:
+        return pw
+    from utils.secrets import get_secret
+    return get_secret(GMAIL_SECRET_NAME)
+
+def _plain_fallback():
+    return ("Your weekly performance report is in the HTML body of this email, with your reopen "
+            "dump attached as an .xlsx. Questions, suggestions, or anything else - just reply.")
+
 def send_email(to, subject, html, xlsx_bytes, filename, cfg):
-    """Gmail send - STUBBED. Wire a Gmail service account / SMTP later. DRY_RUN writes to disk."""
+    """Send one agent's report as HTML + .xlsx attachment via Gmail SMTP (app password).
+    DRY_RUN writes HTML+xlsx to disk instead of sending."""
     if DRY_RUN:
         os.makedirs(DRY_RUN_DIR, exist_ok=True)
         base=os.path.join(DRY_RUN_DIR, to.split('@')[0])
         open(base+'.html','w').write(html); open(base+'_'+filename,'wb').write(xlsx_bytes)
-        logger.info('[DRY_RUN] wrote %s.html + %s (%d bytes xlsx) to %s', base, filename, len(xlsx_bytes), DRY_RUN_DIR)
+        logger.info('[DRY_RUN] wrote %s.html + %s (%d bytes xlsx)', base, filename, len(xlsx_bytes))
         return
-    raise NotImplementedError('Gmail sender not yet configured (from=%s). Wire SA/SMTP then send.' % cfg.get('from_email'))
+    import smtplib
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+    from email.mime.application import MIMEApplication
+    sender = cfg.get('from_email'); reply_to = cfg.get('reply_to') or sender
+    if not sender:
+        raise RuntimeError('from_email missing in config query')
+    msg = MIMEMultipart('mixed')
+    msg['Subject'] = subject; msg['From'] = 'CS Weekly Report <%s>' % sender
+    msg['To'] = to; msg['Reply-To'] = reply_to
+    alt = MIMEMultipart('alternative')
+    alt.attach(MIMEText(_plain_fallback(), 'plain'))
+    alt.attach(MIMEText(html, 'html'))
+    msg.attach(alt)
+    att = MIMEApplication(xlsx_bytes, _subtype='vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+    att.add_header('Content-Disposition', 'attachment', filename=filename)
+    msg.attach(att)
+    with smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=60) as s:
+        s.starttls(); s.login(sender, _gmail_app_password())
+        s.sendmail(sender, [to], msg.as_string())
+    logger.info('sent report to %s (xlsx %d bytes)', to, len(xlsx_bytes))
 
 # ==================== MAIN TASK ====================
 def run_perf_report(**context):
@@ -387,6 +424,10 @@ def run_perf_report(**context):
     logger.info('assembled %d agent reports (%d core, %d reopen rows); baseline avoidable=%s%%',
                 len(payloads), len(core), len(reopen), base.get('avoidable_pct_of_all_reopens'))
     subject_prefix = cfg.get('subject_prefix') or 'Your Weekly Performance Report'
+    test_to = os.getenv('CS_PERF_TEST_RECIPIENT')             # pilot: route ALL emails here
+    limit   = int(os.getenv('CS_PERF_LIMIT', '0') or 0)       # pilot: only first N agents (0 = all)
+    if limit: payloads = payloads[:limit]
+    if test_to: logger.warning('PILOT: routing all %d emails to %s', len(payloads), test_to)
     sent=0; failed=[]
     for p in payloads:
         try:
@@ -394,7 +435,9 @@ def run_perf_report(**context):
             html = build_html(p, ai)
             xlsx = build_xlsx(p)
             fname=f"reopen_dump_{p['name'].split()[0].lower().replace('/','-') or 'agent'}.xlsx"
-            send_email(p['email'], subject_prefix, html, xlsx, fname, cfg)
+            to = test_to or p['email']
+            subj = ('[TEST %s] ' % p['name'] + subject_prefix) if test_to else subject_prefix
+            send_email(to, subj, html, xlsx, fname, cfg)
             sent+=1
         except Exception as e:                                # one bad agent must not sink the run
             logger.exception('perf report FAILED for %s: %s', p.get('email'), e)
