@@ -9,13 +9,14 @@ per-agent reopen dump (.xlsx); and (4) AI notes written by an LLM from the numbe
 WHERE THE LOGIC LIVES - all numbers come from Redash; the DAG only slices, renders, and sends.
   * CORE_QUERY_ID   41791  - Team/Shift/Agent x week wide payload (closed-week, assignee-credited)
   * REOPEN_QUERY_ID 41792  - per reopen-event rows (last-closer attributed) -> buckets + xlsx + issue feed
-  * CONFIG_QUERY_ID 41839  - from/reply-to address, alert channel, n_weeks, llm_* (OpenAI-compatible)
-Config-in-Redash: edit the config row to change address / model / weeks with no code push.
+  * CONFIG_QUERY_ID 41839  - from/reply-to, cc_l1/cc_l2, n_weeks, llm_*, gmail_app_password, ai_rubric
+Config-in-Redash: edit the config row to change address / CC / model / app password with no code push.
 
-DELIVERY: Gmail send is intentionally STUBBED (send_email raises unless creds wired). Run with
-CS_PERF_DRY_RUN=1 to assemble from real data and write each agent's HTML + xlsx to disk (no send).
+DELIVERY: Gmail SMTP (smtp.gmail.com:587, app password from config). Each agent gets their own
+report; CC by tier (L1 -> cc_l1, L2 Full Stack/Expo -> cc_l2). CS_PERF_DRY_RUN=1 writes HTML+xlsx
+to disk instead of sending; CS_PERF_TEST_RECIPIENT routes all to one address (CC suppressed).
 
-Schedule: Monday 19:00 Asia/Kolkata, after the prior Mon-Sun week has closed. Paused on creation.
+Schedule: Monday 07:00 Asia/Kolkata, after the prior Mon-Sun week has closed. Paused on creation.
 """
 
 from datetime import timedelta, date
@@ -371,15 +372,12 @@ def _ai_fallback(p):
 # ==================== DELIVERY ====================
 SMTP_SERVER = 'smtp.gmail.com'
 SMTP_PORT   = 587
-GMAIL_SECRET_NAME = 'cs-perf-gmail-app-password'   # 16-char Gmail App Password for from_email
 
-def _gmail_app_password():
-    """App password: env override for local tests, else Secret Manager (Composer)."""
-    pw = os.getenv('CS_PERF_GMAIL_APP_PASSWORD')
-    if pw:
-        return pw
-    from utils.secrets import get_secret
-    return get_secret(GMAIL_SECRET_NAME)
+def _gmail_app_password(cfg):
+    """16-char Gmail App Password for from_email. From the config query (gmail_app_password),
+    editable in Redash like the LLM key; env override for local tests. Spaces are stripped."""
+    pw = os.getenv('CS_PERF_GMAIL_APP_PASSWORD') or (cfg.get('gmail_app_password') or '')
+    return pw.replace(' ', '')
 
 def _plain_fallback():
     return ("Your weekly performance report is in the HTML body of this email, with your reopen "
@@ -420,7 +418,7 @@ def send_email(to, subject, html, xlsx_bytes, filename, cfg, cc=None):
     att.add_header('Content-Disposition', 'attachment', filename=filename)
     msg.attach(att)
     with smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=60) as s:
-        s.starttls(); s.login(sender, _gmail_app_password())
+        s.starttls(); s.login(sender, _gmail_app_password(cfg))
         s.sendmail(sender, [to] + cc, msg.as_string())   # envelope incl. CC recipients
     logger.info('sent report to %s (cc=%s, xlsx %d bytes)', to, cc, len(xlsx_bytes))
 
@@ -467,7 +465,7 @@ dag = DAG(
     'cs_performance_report_weekly',
     default_args=default_args,
     description='Per-agent weekly performance email (v2 matrix); numbers in Redash 41791/41792, config 41839',
-    schedule_interval='0 19 * * 1',   # Monday 19:00 IST
+    schedule_interval='0 7 * * 1',    # Monday 07:00 IST
     catchup=False, is_paused_upon_creation=True,
     tags=['email', 'trinity', 'performance', 'cs_reports', 'cs_team'],
 )
