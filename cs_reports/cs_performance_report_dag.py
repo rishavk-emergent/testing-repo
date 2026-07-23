@@ -236,7 +236,7 @@ def build_html(p, ai):
     return f"""<!doctype html><html><body style="margin:0;padding:24px 0;background:#eef1f5;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;">
 <table role="presentation" align="center" width="640" cellpadding="0" cellspacing="0" style="width:640px;max-width:640px;margin:0 auto;background:#ffffff;border-radius:14px;overflow:hidden;">
   <tr><td style="background:#1e293b;padding:24px 26px;">
-    <div style="font-size:19px;font-weight:650;color:#ffffff;">Your Weekly Performance Report</div>
+    <div style="font-size:19px;font-weight:650;color:#ffffff;">Your Weekly Report</div>
     <div style="font-size:13px;color:#c7d2e0;margin-top:6px;line-height:1.5;">This is our understanding of your work this week, meant to help, not to grade. If any number looks off or you'd like something changed, just <b style="color:#fff;">reply to this email</b>.</div>
     <div style="margin-top:14px;font-size:12.5px;color:#e2e8f0;">
       <span style="background:rgba(255,255,255,.16);border-radius:6px;padding:2px 9px;margin-right:6px;">{p['tier']}</span>
@@ -431,7 +431,7 @@ def run_perf_report(**context):
     base = baseline_summary(baselines)
     logger.info('assembled %d agent reports (%d core, %d reopen rows); baseline avoidable=%s%%',
                 len(payloads), len(core), len(reopen), base.get('avoidable_pct_of_all_reopens'))
-    subject_prefix = cfg.get('subject_prefix') or 'Your Weekly Performance Report'
+    subject_prefix = cfg.get('subject_prefix') or 'Your Weekly Report'
     test_to = os.getenv('CS_PERF_TEST_RECIPIENT')             # pilot: route ALL emails here
     limit   = int(os.getenv('CS_PERF_LIMIT', '0') or 0)       # pilot: only first N agents (0 = all)
     if limit: payloads = payloads[:limit]
