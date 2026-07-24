@@ -287,33 +287,36 @@ def _pil_font(sz, bold=False):
     try: return ImageFont.load_default(sz)
     except Exception: return ImageFont.load_default()
 
-def _grid_pdf(title, subtitle, headers, rows, widths, aligns, bold_rows=None, sep_rows=None):
-    """Render a simple table to a single-page PDF via Pillow (Composer-safe; no extra deps).
-    rows: list of cell-lists. bold_rows/sep_rows: sets of row indices."""
+def _grid_pdf(title, subtitle, headers, rows, widths, aligns, bold_rows=None, sep_rows=None, vlines=True):
+    """Render a table to a single-page PDF via Pillow (Composer-safe; no extra deps). Smaller font,
+    with vertical + horizontal grid lines so columns/days read clearly."""
     from PIL import Image, ImageDraw
-    s=2; INK=(15,23,42); MUT=(100,116,139); TXT=(51,65,85); GRID=(226,230,236); HEADBG=(244,246,249)
-    fn=_pil_font(11*s); fnb=_pil_font(11*s,True); ft=_pil_font(15*s,True); fsub=_pil_font(10*s)
+    s=2; INK=(15,23,42); MUT=(100,116,139); TXT=(51,65,85); GRID=(210,215,224); HEADBG=(244,246,249)
+    fn=_pil_font(8*s); fnb=_pil_font(8*s,True); ft=_pil_font(12*s,True); fsub=_pil_font(8*s)
     bold_rows=bold_rows or set(); sep_rows=sep_rows or set()
-    colx=[6];
+    colx=[8]
     for w in widths: colx.append(colx[-1]+w*s)
-    W=colx[-1]+6; rh=int(24*s)
-    ytop=int(12*s + (18*s if subtitle else 6*s) + 8*s)
-    H=ytop + rh*(len(rows)+1) + 16*s
+    W=colx[-1]+8; rh=int(17*s)
+    ytop=int(8*s + (13*s if subtitle else 4*s) + 8*s)
+    H=ytop + rh*(len(rows)+1) + 10*s
     img=Image.new('RGB',(W,H),'white'); d=ImageDraw.Draw(img)
-    d.text((6,6*s), title, font=ft, fill=INK)
-    if subtitle: d.text((6,6*s+17*s), subtitle, font=fsub, fill=MUT)
+    d.text((8,5*s), title, font=ft, fill=INK)
+    if subtitle: d.text((8,5*s+13*s), subtitle, font=fsub, fill=MUT)
     def row(y, cells, fonts, fills, bg=None):
         if bg: d.rectangle([colx[0],y,colx[-1],y+rh], fill=bg)
         for i,c in enumerate(cells):
             f=fonts[i]; tw=d.textlength(str(c), font=f); fw=colx[i+1]-colx[i]; al=aligns[i]
-            tx = colx[i]+6*s if al=='l' else (colx[i]+fw-6*s-tw if al=='r' else colx[i]+(fw-tw)/2)
-            d.text((tx, y+6*s), str(c), font=f, fill=fills[i])
+            tx = colx[i]+5*s if al=='l' else (colx[i]+fw-5*s-tw if al=='r' else colx[i]+(fw-tw)/2)
+            d.text((tx, y+4*s), str(c), font=f, fill=fills[i])
         d.line([colx[0],y+rh,colx[-1],y+rh], fill=GRID)
     row(ytop, headers, [fnb]*len(headers), [MUT]*len(headers), bg=HEADBG); y=ytop+rh
     for ri,r in enumerate(rows):
         b = ri in bold_rows
         row(y, r, [fnb if b else fn]*len(r), [INK if b else TXT]*len(r), bg=(HEADBG if ri in sep_rows else None)); y+=rh
-    buf=io.BytesIO(); img.save(buf, format='PDF', resolution=120.0); return buf.getvalue()
+    d.line([colx[0],ytop,colx[-1],ytop], fill=GRID)               # top border
+    if vlines:
+        for x in colx: d.line([x,ytop,x,y], fill=GRID)            # vertical separators (incl. edges)
+    buf=io.BytesIO(); img.save(buf, format='PDF', resolution=150.0); return buf.getvalue()
 
 def build_reopen_pdf(p):
     """Reopen dump as a PDF (Pillow image; content readable, links shown as ticket #s - not clickable)."""
@@ -329,7 +332,7 @@ def build_reopen_pdf(p):
         for it in items:
             rows.append([f"#{it['ticket_number']}", it.get('reopen_ts',''), (it.get('trinity_tags') or '')[:42]])
     sub=f"{p['name']} - {p['tier']} {p['shift']} - latest week - {len(events)} reopen events - open by ticket # in Trinity"
-    return _grid_pdf('Reopen dump', sub, ['Ticket #','Reopened (IST)','Tags'], rows, [90,150,240], ['l','l','l'], bold_rows=bold, sep_rows=sep)
+    return _grid_pdf('Reopen dump', sub, ['Ticket #','Reopened (IST)','Tags'], rows, [90,150,240], ['l','l','l'], bold_rows=bold, sep_rows=sep, vlines=False)
 
 # ==================== HOURLY GRID (xlsx) + SHIFT ACTIVITY ====================
 def _shift_bounds(shift):
