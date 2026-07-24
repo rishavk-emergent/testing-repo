@@ -20,7 +20,7 @@ Schedule: Monday 07:00 Asia/Kolkata, after the prior Mon-Sun week has closed. Pa
 """
 
 from datetime import timedelta, date
-import logging, os, io, json, urllib.request
+import logging, os, io, json, re, urllib.request
 
 import pendulum
 from airflow import DAG
@@ -35,6 +35,8 @@ CORE_QUERY_ID     = 41791
 REOPEN_QUERY_ID   = 41792
 CONFIG_QUERY_ID   = 41839
 BASELINES_QUERY_ID= 41854
+HOURLY_QUERY_ID   = 38693   # per-agent human closes by (day, hour) IST, last 10 days
+HOUR_BURST_BAR    = {'L1': 10, 'L2 Full Stack': 8, 'L2 Expo': 8}   # closes/hr outlier bar (~tier p99)
 DRY_RUN         = os.getenv('CS_PERF_DRY_RUN') == '1'
 DRY_RUN_DIR     = os.getenv('CS_PERF_DRY_RUN_DIR', '/tmp/cs_perf_out')
 
@@ -55,7 +57,8 @@ def fetch_all():
     core=r.fetch_query_results(query_id=CORE_QUERY_ID, max_retries=3)
     reopen=r.fetch_query_results(query_id=REOPEN_QUERY_ID, max_retries=3)
     baselines=r.fetch_query_results(query_id=BASELINES_QUERY_ID, max_retries=3)
-    return cfg, core, reopen, baselines
+    hourly=r.fetch_query_results(query_id=HOURLY_QUERY_ID, max_retries=3)
+    return cfg, core, reopen, baselines, hourly
 
 def baseline_summary(baselines):
     """Turn the [CS Perf] baselines rows into a compact, live summary for the LLM."""
@@ -104,7 +107,10 @@ def _arrow(cur, prev, direction):
     return f'<span style="font-size:9px;color:{col};margin-left:4px;">{"&#9650;" if up else "&#9660;"}</span>'
 
 def _fmt_int(v):  return '&ndash;' if v is None else f'{int(round(v)):,}'
-def _fmt_m(v):    return '&ndash;' if v is None else f'{v:g}m'
+def _fmt_m(v):
+    if v is None: return '&ndash;'
+    t=int(round(v)); h,m=divmod(t,60)
+    return (f'{h} hr {m} min' if h and m else (f'{h} hr' if h else f'{m} min'))
 def _fmt_pct(v):  return '&ndash;' if v is None else f'{v:g}%'
 def _fmt_plain(v):return '&ndash;' if v is None else f'{v:g}'
 
@@ -120,19 +126,19 @@ def _row(nw, label, primary, direction, pfmt=_fmt_plain, bracket=None, bfmt=_fmt
     """primary/bracket/cmp are oldest->newest lists (len nw). Displayed latest-left; arrow on latest only."""
     P=list(reversed(primary)); C=list(reversed(cmp if cmp is not None else primary))
     B=list(reversed(bracket)) if bracket is not None else None
-    tds=[f'<td style="padding:7px 8px;border-bottom:1px solid {ROW};color:#334155;font-weight:500;">{label}</td>']
+    tds=[f'<td style="padding:6px 8px;border-bottom:1px solid {ROW};color:#334155;font-weight:500;letter-spacing:.1px;">{label}</td>']
     for i in range(nw):
         newest=i==0; bg=f'background:{HL};' if newest else ''
         prev=C[i+1] if i+1<nw else None
         br=f' <span style="font-size:10px;color:{FAINT};">({bfmt(B[i])})</span>' if (B is not None and B[i] is not None) else ''
-        st=f'{bg}padding:7px 8px;border-bottom:1px solid {ROW};text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums;'
-        st+=(f'font-weight:700;color:{INK};font-size:13.5px;' if newest else 'color:#475569;')
+        st=f'{bg}padding:6px 8px;border-bottom:1px solid {ROW};text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums;'
+        st+=(f'font-weight:700;color:{INK};font-size:12.5px;' if newest else 'color:#475569;')
         ind=_arrow(C[i],prev,direction) if newest else ''
         tds.append(f'<td style="{st}">{pfmt(P[i])}{br}{ind}</td>')
     return f'<tr>{"".join(tds)}</tr>'
 
 def _sep(nw): return f'<tr><td colspan="{nw+1}" style="padding:3px 0;"></td></tr>'
-def _tbl(nw, weeks, rows): return f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;font-size:13px;">{_hdr(weeks)}{"".join(rows)}</table>'
+def _tbl(nw, weeks, rows): return f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;font-size:12px;">{_hdr(weeks)}{"".join(rows)}</table>'
 def _sec(num,label,cap): return (f'<div style="font-size:11px;font-weight:700;letter-spacing:1.2px;text-transform:uppercase;color:{MUT};">{num} &middot; {label}</div><div style="font-size:12px;color:{FAINT};margin:2px 0 12px;">{cap}</div>')
 
 def _series(by_idx, order, col):
@@ -144,10 +150,16 @@ def _series(by_idx, order, col):
     return out
 
 # ==================== ASSEMBLE (per agent) ====================
-def assemble(core, reopen):
+def assemble(core, reopen, hourly=None):
     order, labels = _weeks_meta(core)
     weeks_disp=[labels[i] for i in reversed(order)]  # latest-left
     nw=len(order)
+    # latest week's 7 calendar dates (Mon..Sun) for the hourly grid
+    lws=max(pendulum.parse(str(r['week_start'])).date() for r in core)
+    week_dates=[(lws+timedelta(days=i)).isoformat() for i in range(7)]
+    hourly_by={}
+    for h in (hourly or []):
+        hourly_by.setdefault(h['agent_email'], []).append(h)
     # index rows
     agents={}; shifts={}; teams={}
     for r in core:
@@ -177,6 +189,7 @@ def assemble(core, reopen):
                  'csat_n_hu':S(aidx,'csat_n_hu'),'csat_pos_hu':S(aidx,'csat_pos_hu'),'reopen_n_hu':S(aidx,'reopen_n_hu'),'reopen_rate_hu':S(aidx,'reopen_rate_hu')},
             buckets=_bucket_matrix(reo_by_agent.get(email, []), order),
             reopen_events=reo_by_agent.get(email, []),
+            week_dates=week_dates, hourly=hourly_by.get(email, []),
         ))
     return payloads, order
 
@@ -205,8 +218,8 @@ def build_html(p, ai):
         _row(nw,'Escalated&rarr;human FRT',T['hufrt_p50'],'lower',_fmt_m),
         _row(nw,'Created&rarr;human FRT',T['frt_p50'],'lower',_fmt_m),
         _sep(nw),
-        _row(nw,'OW CSAT (resp)',T['csat_n_ow'],'higher',_fmt_int,bracket=T['csat_pos_ow'],cmp=T['csat_pos_ow']),
-        _row(nw,'Human CSAT (resp)',T['csat_n_hu'],'higher',_fmt_int,bracket=T['csat_pos_hu'],cmp=T['csat_pos_hu']),
+        _row(nw,'OW CSAT % pos. (total resp.)',T['csat_pos_ow'],'higher',_fmt_pct,bracket=T['csat_n_ow'],bfmt=_fmt_int,cmp=T['csat_pos_ow']),
+        _row(nw,'Human CSAT % pos. (total resp.)',T['csat_pos_hu'],'higher',_fmt_pct,bracket=T['csat_n_hu'],bfmt=_fmt_int,cmp=T['csat_pos_hu']),
         _row(nw,'OW reopen',T['reopen_n_ow'],'lower',_fmt_int,bracket=T['reopen_rate_ow'],cmp=T['reopen_rate_ow']),
         _row(nw,'Human reopen',T['reopen_n_hu'],'lower',_fmt_int,bracket=T['reopen_rate_hu'],cmp=T['reopen_rate_hu']),
     ])
@@ -215,7 +228,7 @@ def build_html(p, ai):
             _row(nw,'Human closes',D['human_n'],'neutral',_fmt_int),
             _row(nw,'Escalated&rarr;human FRT',D['hufrt_p50'],'lower',_fmt_m),
             _row(nw,'Created&rarr;human FRT',D['frt_p50'],'lower',_fmt_m),
-            _row(nw,'Human CSAT (resp)',D['csat_n_hu'],'higher',_fmt_int,bracket=D['csat_pos_hu'],cmp=D['csat_pos_hu']),
+            _row(nw,'Human CSAT % pos. (total resp.)',D['csat_pos_hu'],'higher',_fmt_pct,bracket=D['csat_n_hu'],bfmt=_fmt_int,cmp=D['csat_pos_hu']),
             _row(nw,'Human reopen',D['reopen_n_hu'],'lower',_fmt_int,bracket=D['reopen_rate_hu'],cmp=D['reopen_rate_hu']),
         ])
     buckets=_tbl(nw,W,[
@@ -233,7 +246,9 @@ def build_html(p, ai):
     ab=lambda color,t,body:f'<div style="margin-bottom:14px;"><div style="font-size:12px;font-weight:700;color:{INK};margin-bottom:5px;"><span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:{color};margin-right:7px;"></span>{t}</div>{body}</div>'
     ul=lambda items:'<ul style="margin:0;padding-left:18px;">'+''.join(f'<li style="font-size:12.5px;color:#334155;line-height:1.6;margin-bottom:3px;">{i}</li>' for i in items)+'</ul>'
     para=lambda t:f'<p style="font-size:12.5px;color:#334155;line-height:1.6;margin:0;">{t}</p>'
-    dump_name=f"reopen_dump_{p['name'].split()[0].lower()}.xlsx"
+    first=p['name'].split()[0].lower()
+    dump_name=f"reopen_dump_{first}.xlsx"; hourly_name=f"hourly_closes_{first}.xlsx"
+    snote=_shift_note(p)
     return f"""<!doctype html><html><body style="margin:0;padding:24px 0;background:#eef1f5;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;">
 <table role="presentation" align="center" width="640" cellpadding="0" cellspacing="0" style="width:640px;max-width:640px;margin:0 auto;background:#ffffff;border-radius:14px;overflow:hidden;">
   <tr><td style="background:#1e293b;padding:24px 26px;">
@@ -248,13 +263,14 @@ def build_html(p, ai):
   <tr><td style="padding:20px 26px;border-top:1px solid {LINE};">{_sec('2','Shift Performance',f"Your shift &middot; <b>{p['tier']} &middot; {p['shift']}</b> &middot; roster-aggregate &middot; human-only")}{human_tbl(S)}</td></tr>
   <tr><td style="padding:20px 26px;border-top:1px solid {LINE};">{_sec('3','Your Performance',f"{p['name']} &middot; human-only")}{human_tbl(Y)}
     <div style="margin-top:18px;">{_sec('','Reopen snapshots','per reopen event, credited to you as last-closer (+1 each time) &middot; bucket &times; week')}{buckets}</div>
-    <div style="margin-top:12px;font-size:11.5px;color:{MUT};background:#f8fafc;border:1px dashed #dbe2ea;border-radius:8px;padding:9px 12px;">&#128206; <b>Reopen dump attached</b> (<i>{dump_name}</i>) &middot; every reopen grouped by bucket with ticket number and Trinity link.</div>
+    <div style="margin-top:12px;font-size:11.5px;color:{MUT};background:#f8fafc;border:1px dashed #dbe2ea;border-radius:8px;padding:9px 12px;">&#128206; <b>Attached:</b> <i>{dump_name}</i> (every reopen by bucket + ticket link) &middot; <i>{hourly_name}</i> (your hour &times; day closures for the week).</div>
   </td></tr>
   <tr><td style="padding:20px 26px;border-top:1px solid {LINE};background:#f8fafc;">{_sec('4','AI Notes','Auto-generated from the tables above plus issue-type breakdown &middot; a read on the trend, not a verdict.')}
     {ab('#2a78d6','The trend', para(ai['trend']))}
     {ab('#15803d','What went well', ul(ai['strengths']))}
     {ab('#b91c1c','Where to tighten', ul(ai['weaknesses']))}
     {ab('#eda100','Suggested next steps', ul(ai['actions']))}
+    {ab('#64748b','Shift activity', ul(snote)) if snote else ''}
   </td></tr>
   <tr><td style="padding:18px 26px 26px;border-top:1px solid {LINE};text-align:center;font-size:12.5px;color:{MUT};line-height:1.6;">
     Just reply to this email with any questions, suggestions, or anything else.</td></tr>
@@ -295,6 +311,106 @@ def build_xlsx(p):
         r+=1
     buf=io.BytesIO(); wb.save(buf); return buf.getvalue()
 
+# ==================== HOURLY GRID (xlsx) + SHIFT ACTIVITY ====================
+def _shift_bounds(shift):
+    a,b=shift.split('-'); return int(a.split(':')[0]), int(b.split(':')[0])
+
+def _shift_hours(shift):
+    """'21:00-06:00' -> [21,22,23,0,1,2,3,4,5] (end exclusive); handles cross-midnight."""
+    try:
+        s,e=_shift_bounds(shift)
+    except Exception:
+        return list(range(24))
+    if e==s: return list(range(24))
+    return list(range(s,e)) if e>s else list(range(s,24))+list(range(0,e))
+
+def _hourly_grid(p):
+    days=set(p.get('week_dates') or [])
+    g={}
+    for h in p.get('hourly') or []:
+        d=str(h['day_ist'])
+        if d in days: g[(d,int(h['hour_ist']))]=int(h['ticket_count'] or 0)
+    return g
+
+def build_hourly_xlsx(p):
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    g=_hourly_grid(p); dates=p.get('week_dates') or []
+    labels=[pendulum.parse(d).format('DD/MM ddd') for d in dates]
+    wb=Workbook(); ws=wb.active; ws.title='Hourly closes'
+    thin=Side(style='thin',color='E2E6EC'); bd=Border(left=thin,right=thin,top=thin,bottom=thin)
+    ws.cell(1,1,"Hourly human closes - %s - %s %s - week %s to %s" % (p['name'],p['tier'],p['shift'], labels[0] if labels else '', labels[-1] if labels else '')).font=Font(bold=True,size=12)
+    ws.merge_cells(start_row=1,start_column=1,end_row=1,end_column=len(dates)+2)
+    ws.cell(3,1,'Hour (IST)').font=Font(bold=True,size=9,color='64748B'); ws.column_dimensions['A'].width=13
+    for j,lb in enumerate(labels):
+        c=ws.cell(3,2+j,lb); c.font=Font(bold=True,size=9,color='64748B'); c.alignment=Alignment(horizontal='center'); ws.column_dimensions[chr(66+j)].width=11
+    tcol=2+len(dates); ws.cell(3,tcol,'Total').font=Font(bold=True,size=9,color='0F172A'); ws.column_dimensions[chr(64+tcol)].width=8
+    shift=set(_shift_hours(p['shift'])); coltot=[0]*len(dates); grand=0
+    for h in range(24):
+        r=4+h
+        ws.cell(r,1,'%02d:00 - %02d:59'%(h,h)).font=Font(size=10, bold=(h in shift), color=('0F172A' if h in shift else '94A3B8'))
+        rowtot=0
+        for j,d in enumerate(dates):
+            v=g.get((d,h),0); rowtot+=v; coltot[j]+=v
+            cell=ws.cell(r,2+j, v if v else None); cell.alignment=Alignment(horizontal='center'); cell.border=bd
+        ws.cell(r,tcol, rowtot if rowtot else None).font=Font(bold=True); grand+=rowtot
+    tr=28; ws.cell(tr,1,'Total').font=Font(bold=True)
+    for j in range(len(dates)): ws.cell(tr,2+j,coltot[j]).font=Font(bold=True)
+    ws.cell(tr,tcol,grand).font=Font(bold=True)
+    ws.cell(tr+2,1,'Bold hours = your rostered shift.').font=Font(italic=True,size=9,color='94A3B8')
+    buf=io.BytesIO(); wb.save(buf); return buf.getvalue()
+
+def shift_activity(p):
+    """Per shift-INSTANCE downtime + burst signals (names the day, handles cross-midnight, and
+    excludes unworked/day-off shifts). Rubric adds the caveats."""
+    g=_hourly_grid(p); dates=p.get('week_dates') or []; sh=_shift_hours(p['shift']); shset=set(sh)
+    try: s_hr,e_hr=_shift_bounds(p['shift']); cross=(e_hr<=s_hr)
+    except Exception: cross=False
+    fmt=lambda d: pendulum.parse(d).format('ddd DD/MM')
+    # a shift instance = its hours mapped to the actual calendar date they fall on
+    worst=None; off=[]
+    for i,d in enumerate(dates):
+        seq=[]
+        for h in sh:
+            if (not cross) or (h>=s_hr): seq.append((h,d))              # hours on the start date
+            else:
+                nd=dates[i+1] if i+1<len(dates) else None               # early-morning -> next date
+                if nd: seq.append((h,nd))
+        if sum(g.get((dd,hh),0) for hh,dd in seq)==0:                   # unworked shift (likely day off)
+            off.append(d); continue
+        run=0; start=None
+        for hh,dd in seq:
+            if g.get((dd,hh),0)==0:
+                if run==0: start=hh
+                run+=1
+                if worst is None or run>worst[0]: worst=(run,d,start,hh)
+            else: run=0
+    quiet=None
+    if worst and worst[0]>=2:
+        run,d,st,en=worst
+        quiet={'day':fmt(d),'from':'%02d:00'%st,'to':'%02d:59'%en,'consecutive_hours':run}
+    busiest=None
+    if g:
+        (bd,bh),bn=max(g.items(), key=lambda kv: kv[1]); bar=HOUR_BURST_BAR.get(p['tier'],10)
+        busiest={'day':fmt(bd),'hour':'%02d:00'%bh,'closes':bn,'tier_norm_per_hr':bar,'exceeds_norm':bn>=bar}
+    return {'shift':p['shift'],'shift_length_hrs':len(sh),
+            'closes_in_shift':sum(v for (d,h),v in g.items() if h in shset),'closes_total':sum(g.values()),
+            'likely_off_or_unworked_shifts':[fmt(d) for d in off],
+            'quiet_stretch_in_shift':quiet,'busiest_hour':busiest}
+
+def _shift_note(p):
+    """Deterministic, code-owned shift-activity lines for section 4 (never LLM-generated, so the
+    day + numbers are always exact and the caveats are always present)."""
+    sa=shift_activity(p); out=[]; tot=sa['closes_total']; ins=sa['closes_in_shift']
+    q=sa.get('quiet_stretch_in_shift'); b=sa.get('busiest_hour')
+    if tot and ins < 0.30*tot:
+        out.append(f"Most of your closes landed <b>outside</b> your rostered <b>{sa['shift']}</b> window this week ({ins} of {tot} in-shift) &mdash; worth checking your shift mapping, not a performance issue.")
+    elif q:
+        out.append(f"No closures were logged on <b>{q['day']}</b> between <b>{q['from']} and {q['to']}</b> ({q['consecutive_hours']}h) during your shift &mdash; could be a tough ticket, a break, or simply low volume. Just flagging, not a mark against you (and your day off is excluded).")
+    if b and b.get('exceeds_norm'):
+        out.append(f"Heads-up: <b>{b['closes']} closes in a single hour</b> ({b['day']} {b['hour']}) vs the ~{b['tier_norm_per_hr']}/hr {p['tier']} norm &mdash; worth a quick look (often a legitimate batch of duplicates/spam).")
+    return out
+
 # ==================== SECTION 4 - LLM (OpenAI-compatible REST) ====================
 def _agent_top_tags(p):
     """This agent's latest-week avoidable reopens, by tag, split incorrect vs incomplete."""
@@ -307,6 +423,24 @@ def _agent_top_tags(p):
     out=[{'tag':t,'incorrect':v['incorrect'],'incomplete':v['incomplete'],'total':v['incorrect']+v['incomplete']}
          for t,v in d.items()]
     return sorted(out,key=lambda x:x['total'],reverse=True)[:8]
+
+def _load_rubric(cfg):
+    """Rubric source of truth. If config has a rubric_doc_url, fetch that Google Doc as plain text
+    and use it when it's readable AND non-empty; otherwise fall back to the config ai_rubric column."""
+    url=(cfg.get('rubric_doc_url') or '').strip()
+    if url:
+        m=re.search(r'/document/d/([A-Za-z0-9_-]+)', url)
+        txt_url=('https://docs.google.com/document/d/%s/export?format=txt' % m.group(1)) if m else url
+        try:
+            body=urllib.request.urlopen(urllib.request.Request(txt_url, headers={'User-Agent':'cs-perf-dag'}), timeout=30).read().decode('utf-8','replace')
+            head=body.lstrip()[:400].lower()
+            readable = body.strip() and '<html' not in head and '<!doctype' not in head and 'accounts.google.com' not in body[:3000]
+            if readable:
+                return body.strip()
+            logger.warning('rubric doc empty/unreadable (%s) - using config ai_rubric', txt_url)
+        except Exception as e:
+            logger.warning('rubric doc fetch failed (%s): %s - using config ai_rubric', txt_url, e)
+    return (cfg.get('ai_rubric') or '').strip()
 
 def ai_notes(p, cfg, baseline):
     def metric(series, unit=''):
@@ -339,7 +473,7 @@ def ai_notes(p, cfg, baseline):
       'TAG_BUCKET_LEADERS':baseline.get('tag_bucket_leaders', [])}
     # The analysis framework (the "skill") lives in the config query column ai_rubric - editable in
     # Redash, no code push. Fall back to a minimal instruction if the column is missing.
-    rubric=(cfg.get('ai_rubric') or '').strip() or (
+    rubric=_load_rubric(cfg) or (
       "Write supportive weekly AI notes. Use only the numbers in DATA, quoting them exactly. "
       "Return STRICT JSON: trend (string), strengths (2), weaknesses (2), actions (2).")
     prompt=rubric+"\n\nDATA:\n"+json.dumps(ctx, default=str)
@@ -388,15 +522,16 @@ def cc_for_tier(tier, cfg):
     key = 'cc_l1' if tier == 'L1' else 'cc_l2'
     return [e.strip() for e in (cfg.get(key) or '').split(',') if e.strip()]
 
-def send_email(to, subject, html, xlsx_bytes, filename, cfg, cc=None):
-    """Send one agent's report as HTML + .xlsx attachment via Gmail SMTP (app password).
-    DRY_RUN writes HTML+xlsx to disk instead of sending."""
-    cc = cc or []
+def send_email(to, subject, html, attachments, cfg, cc=None):
+    """Send one agent's report as HTML + .xlsx attachments via Gmail SMTP (app password).
+    attachments = list of (filename, bytes). DRY_RUN writes HTML+attachments to disk instead."""
+    cc = cc or []; attachments = attachments or []
     if DRY_RUN:
         os.makedirs(DRY_RUN_DIR, exist_ok=True)
         base=os.path.join(DRY_RUN_DIR, to.split('@')[0])
-        open(base+'.html','w').write(html); open(base+'_'+filename,'wb').write(xlsx_bytes)
-        logger.info('[DRY_RUN] wrote %s.html + %s (%d bytes xlsx); cc=%s', base, filename, len(xlsx_bytes), cc)
+        open(base+'.html','w').write(html)
+        for fn,b in attachments: open(base+'_'+fn,'wb').write(b)
+        logger.info('[DRY_RUN] wrote %s.html + %d attachment(s); cc=%s', base, len(attachments), cc)
         return
     import smtplib
     from email.mime.multipart import MIMEMultipart
@@ -414,13 +549,14 @@ def send_email(to, subject, html, xlsx_bytes, filename, cfg, cc=None):
     alt.attach(MIMEText(_plain_fallback(), 'plain'))
     alt.attach(MIMEText(html, 'html'))
     msg.attach(alt)
-    att = MIMEApplication(xlsx_bytes, _subtype='vnd.openxmlformats-officedocument.spreadsheetml.sheet')
-    att.add_header('Content-Disposition', 'attachment', filename=filename)
-    msg.attach(att)
+    for fn, b in attachments:
+        a = MIMEApplication(b, _subtype='vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+        a.add_header('Content-Disposition', 'attachment', filename=fn)
+        msg.attach(a)
     with smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=60) as s:
         s.starttls(); s.login(sender, _gmail_app_password(cfg))
         s.sendmail(sender, [to] + cc, msg.as_string())   # envelope incl. CC recipients
-    logger.info('sent report to %s (cc=%s, xlsx %d bytes)', to, cc, len(xlsx_bytes))
+    logger.info('sent report to %s (cc=%s, %d attachments)', to, cc, len(attachments))
 
 # ==================== MAIN TASK ====================
 def run_perf_report(**context):
@@ -439,12 +575,13 @@ def run_perf_report(**context):
         try:
             ai = ai_notes(p, cfg, base)                       # LLM (has its own fallback)
             html = build_html(p, ai)
-            xlsx = build_xlsx(p)
-            fname=f"reopen_dump_{p['name'].split()[0].lower().replace('/','-') or 'agent'}.xlsx"
+            first = p['name'].split()[0].lower().replace('/','-') or 'agent'
+            attachments = [(f"reopen_dump_{first}.xlsx", build_xlsx(p)),
+                           (f"hourly_closes_{first}.xlsx", build_hourly_xlsx(p))]
             to = test_to or p['email']
             subj = ('[TEST %s] ' % p['name'] + subject_prefix) if test_to else subject_prefix
             cc = [] if test_to else cc_for_tier(p['tier'], cfg)   # no CC during pilot/test sends
-            send_email(to, subj, html, xlsx, fname, cfg, cc=cc)
+            send_email(to, subj, html, attachments, cfg, cc=cc)
             sent+=1
         except Exception as e:                                # one bad agent must not sink the run
             logger.exception('perf report FAILED for %s: %s', p.get('email'), e)
