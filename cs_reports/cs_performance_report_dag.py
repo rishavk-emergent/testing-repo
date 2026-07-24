@@ -560,8 +560,8 @@ def send_email(to, subject, html, attachments, cfg, cc=None):
 
 # ==================== MAIN TASK ====================
 def run_perf_report(**context):
-    cfg, core, reopen, baselines = fetch_all()
-    payloads, _ = assemble(core, reopen)
+    cfg, core, reopen, baselines, hourly = fetch_all()
+    payloads, _ = assemble(core, reopen, hourly)
     base = baseline_summary(baselines)
     logger.info('assembled %d agent reports (%d core, %d reopen rows); baseline avoidable=%s%%',
                 len(payloads), len(core), len(reopen), base.get('avoidable_pct_of_all_reopens'))
