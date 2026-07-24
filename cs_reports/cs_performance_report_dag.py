@@ -247,7 +247,7 @@ def build_html(p, ai):
     ul=lambda items:'<ul style="margin:0;padding-left:18px;">'+''.join(f'<li style="font-size:12.5px;color:#334155;line-height:1.6;margin-bottom:3px;">{i}</li>' for i in items)+'</ul>'
     para=lambda t:f'<p style="font-size:12.5px;color:#334155;line-height:1.6;margin:0;">{t}</p>'
     first=p['name'].split()[0].lower()
-    dump_name=f"reopen_dump_{first}.html"; hourly_name=f"hourly_closes_{first}.html"
+    dump_name=f"reopen_dump_{first}.pdf"; hourly_name=f"hourly_closes_{first}.pdf"
     snote=_shift_note(p)
     return f"""<!doctype html><html><body style="margin:0;padding:24px 0;background:#eef1f5;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;">
 <table role="presentation" align="center" width="640" cellpadding="0" cellspacing="0" style="width:640px;max-width:640px;margin:0 auto;background:#ffffff;border-radius:14px;overflow:hidden;">
@@ -277,32 +277,59 @@ def build_html(p, ai):
 </table></body></html>"""
 
 # ==================== XLSX (per-agent reopen dump, latest week) ====================
-def build_reopen_html(p):
-    """Reopen dump as an HTML file attachment (no openpyxl; Trinity links stay clickable)."""
+def _pil_font(sz, bold=False):
+    from PIL import ImageFont
+    paths=(['/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf','/System/Library/Fonts/Supplemental/Arial Bold.ttf','/Library/Fonts/Arial Bold.ttf'] if bold
+           else ['/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf','/System/Library/Fonts/Supplemental/Arial.ttf','/Library/Fonts/Arial.ttf'])
+    for pth in paths:
+        try: return ImageFont.truetype(pth, sz)
+        except Exception: pass
+    try: return ImageFont.load_default(sz)
+    except Exception: return ImageFont.load_default()
+
+def _grid_pdf(title, subtitle, headers, rows, widths, aligns, bold_rows=None, sep_rows=None):
+    """Render a simple table to a single-page PDF via Pillow (Composer-safe; no extra deps).
+    rows: list of cell-lists. bold_rows/sep_rows: sets of row indices."""
+    from PIL import Image, ImageDraw
+    s=2; INK=(15,23,42); MUT=(100,116,139); TXT=(51,65,85); GRID=(226,230,236); HEADBG=(244,246,249)
+    fn=_pil_font(11*s); fnb=_pil_font(11*s,True); ft=_pil_font(15*s,True); fsub=_pil_font(10*s)
+    bold_rows=bold_rows or set(); sep_rows=sep_rows or set()
+    colx=[6];
+    for w in widths: colx.append(colx[-1]+w*s)
+    W=colx[-1]+6; rh=int(24*s)
+    ytop=int(12*s + (18*s if subtitle else 6*s) + 8*s)
+    H=ytop + rh*(len(rows)+1) + 16*s
+    img=Image.new('RGB',(W,H),'white'); d=ImageDraw.Draw(img)
+    d.text((6,6*s), title, font=ft, fill=INK)
+    if subtitle: d.text((6,6*s+17*s), subtitle, font=fsub, fill=MUT)
+    def row(y, cells, fonts, fills, bg=None):
+        if bg: d.rectangle([colx[0],y,colx[-1],y+rh], fill=bg)
+        for i,c in enumerate(cells):
+            f=fonts[i]; tw=d.textlength(str(c), font=f); fw=colx[i+1]-colx[i]; al=aligns[i]
+            tx = colx[i]+6*s if al=='l' else (colx[i]+fw-6*s-tw if al=='r' else colx[i]+(fw-tw)/2)
+            d.text((tx, y+6*s), str(c), font=f, fill=fills[i])
+        d.line([colx[0],y+rh,colx[-1],y+rh], fill=GRID)
+    row(ytop, headers, [fnb]*len(headers), [MUT]*len(headers), bg=HEADBG); y=ytop+rh
+    for ri,r in enumerate(rows):
+        b = ri in bold_rows
+        row(y, r, [fnb if b else fn]*len(r), [INK if b else TXT]*len(r), bg=(HEADBG if ri in sep_rows else None)); y+=rh
+    buf=io.BytesIO(); img.save(buf, format='PDF', resolution=120.0); return buf.getvalue()
+
+def build_reopen_pdf(p):
+    """Reopen dump as a PDF (Pillow image; content readable, links shown as ticket #s - not clickable)."""
     from collections import defaultdict
     events=[e for e in p['reopen_events'] if int(e['week_idx'])==1]
-    events.sort(key=lambda e:(BUCKET_ORDER.index(e['bucket']) if e['bucket'] in BUCKET_ORDER else 9, e.get('reopen_ts','')))
     by=defaultdict(list)
     for e in events: by[e['bucket']].append(e)
-    HDR={'incorrect':'#c23b22','incomplete':'#e07d35','new_issue':'#8a94a6','clarification':'#9aa3af','noise':'#c2c8d0'}
-    sec=''
+    rows=[]; bold=set(); sep=set()
     for b in BUCKET_ORDER:
-        items=by.get(b,[]); tag='AVOIDABLE' if b in AVOID_BUCKETS else 'not your fault'
-        sec+=(f'<tr><td colspan="3" style="background:{HDR[b]};color:#fff;font-weight:700;padding:6px 10px;">{BUCKET_NICE[b]} ({len(items)}) &middot; {tag}</td></tr>'
-              '<tr><td style="background:#f4f6f9;font-size:11px;color:#64748b;font-weight:700;padding:5px 10px;">Ticket #</td>'
-              '<td style="background:#f4f6f9;font-size:11px;color:#64748b;font-weight:700;padding:5px 10px;">Reopened (IST)</td>'
-              '<td style="background:#f4f6f9;font-size:11px;color:#64748b;font-weight:700;padding:5px 10px;">Trinity link</td></tr>')
+        items=by.get(b,[]); tag='avoidable' if b in AVOID_BUCKETS else 'not your fault'
+        sep.add(len(rows)); bold.add(len(rows))
+        rows.append([f'{BUCKET_NICE[b]}  ({len(items)}) - {tag}','',''])
         for it in items:
-            ln=it['trinity_link']
-            sec+=(f'<tr><td style="padding:5px 10px;border-bottom:1px solid #eef1f5;"><a href="{ln}" style="color:#2a78d6;font-weight:600;text-decoration:none;">#{it["ticket_number"]}</a></td>'
-                  f'<td style="padding:5px 10px;border-bottom:1px solid #eef1f5;color:#475569;">{it.get("reopen_ts","")}</td>'
-                  f'<td style="padding:5px 10px;border-bottom:1px solid #eef1f5;"><a href="{ln}" style="color:#2a78d6;font-size:12px;">{ln}</a></td></tr>')
-    html=(f'<!doctype html><html><body style="font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:#eef1f5;padding:20px;">'
-          f'<div style="max-width:840px;margin:0 auto;"><div style="font-size:14px;font-weight:700;color:#0f172a;margin-bottom:10px;">'
-          f"Reopen dump &middot; {p['name']} &middot; {p['tier']} {p['shift']} &middot; latest week &middot; {len(events)} reopen events</div>"
-          f'<table cellpadding="0" cellspacing="0" style="width:100%;border-collapse:collapse;background:#fff;font-size:12.5px;">{sec}</table>'
-          f'<div style="font-size:11px;color:#94a3b8;margin-top:8px;">One row per reopen event (multi-reopens repeat). Click a ticket # or link to open it in Trinity.</div></div></body></html>')
-    return html.encode('utf-8')
+            rows.append([f"#{it['ticket_number']}", it.get('reopen_ts',''), (it.get('trinity_tags') or '')[:42]])
+    sub=f"{p['name']} - {p['tier']} {p['shift']} - latest week - {len(events)} reopen events - open by ticket # in Trinity"
+    return _grid_pdf('Reopen dump', sub, ['Ticket #','Reopened (IST)','Tags'], rows, [90,150,240], ['l','l','l'], bold_rows=bold, sep_rows=sep)
 
 # ==================== HOURLY GRID (xlsx) + SHIFT ACTIVITY ====================
 def _shift_bounds(shift):
@@ -325,33 +352,25 @@ def _hourly_grid(p):
         if d in days: g[(d,int(h['hour_ist']))]=int(h['ticket_count'] or 0)
     return g
 
-def build_hourly_html(p):
-    """Hourly hour x day closure grid as an HTML file attachment (no openpyxl; no shading;
-    rostered shift hours in bold)."""
+def build_hourly_pdf(p):
+    """Hourly hour x day closure grid as a PDF (Pillow; no shading; rostered shift hours bold)."""
     g=_hourly_grid(p); dates=p.get('week_dates') or []; sh=set(_shift_hours(p['shift']))
     labs=[pendulum.parse(d).format('DD/MM ddd') for d in dates]
-    head=''.join(f'<th style="padding:5px 8px;font-size:11px;color:#64748b;text-align:center;border:1px solid #e2e6ec;">{l}</th>' for l in labs)
-    rows=''; coltot=[0]*len(dates); grand=0
+    headers=['Hour (IST)']+labs+['Total']
+    rows=[]; bold=set(); coltot=[0]*len(dates); grand=0
     for h in range(24):
-        inb=h in sh
-        rl=f'<td style="padding:4px 8px;border:1px solid #eef1f5;font-size:11px;{"font-weight:700;color:#0f172a" if inb else "color:#94a3b8"}">{h:02d}:00 - {h:02d}:59</td>'
-        cs=''; rt=0
+        rt=0; cells=[f'{h:02d}:00 - {h:02d}:59']
         for j,d in enumerate(dates):
-            v=g.get((d,h),0); rt+=v; coltot[j]+=v
-            cs+=f'<td style="padding:4px 8px;border:1px solid #eef1f5;text-align:center;color:#334155;">{v or ""}</td>'
-        grand+=rt
-        rows+=f'<tr>{rl}{cs}<td style="padding:4px 8px;border:1px solid #eef1f5;text-align:center;font-weight:700;">{rt or ""}</td></tr>'
-    foot=('<tr><td style="padding:5px 8px;border:1px solid #e2e6ec;font-weight:700;font-size:11px;">Total</td>'
-          +''.join(f'<td style="padding:5px 8px;border:1px solid #e2e6ec;text-align:center;font-weight:700;">{t}</td>' for t in coltot)
-          +f'<td style="padding:5px 8px;border:1px solid #e2e6ec;text-align:center;font-weight:700;">{grand}</td></tr>')
-    html=(f'<!doctype html><html><body style="font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:#eef1f5;padding:20px;">'
-          f'<div style="max-width:840px;margin:0 auto;"><div style="font-size:14px;font-weight:700;color:#0f172a;">'
-          f"Hourly human closes &middot; {p['name']} &middot; {p['tier']} {p['shift']}</div>"
-          f"<div style=\"font-size:12px;color:#64748b;margin:2px 0 10px;\">week {pendulum.parse(dates[0]).format('DD/MM') if dates else ''}-{pendulum.parse(dates[-1]).format('DD/MM') if dates else ''} &middot; bold hours = rostered shift</div>"
-          f'<table cellpadding="0" cellspacing="0" style="border-collapse:collapse;background:#fff;font-size:11.5px;">'
-          f'<tr><th style="padding:5px 8px;font-size:11px;color:#64748b;text-align:left;border:1px solid #e2e6ec;">Hour (IST)</th>{head}'
-          f'<th style="padding:5px 8px;font-size:11px;border:1px solid #e2e6ec;">Total</th></tr>{rows}{foot}</table></div></body></html>')
-    return html.encode('utf-8')
+            v=g.get((d,h),0); rt+=v; coltot[j]+=v; cells.append(str(v) if v else '')
+        cells.append(str(rt) if rt else ''); grand+=rt
+        if h in sh: bold.add(len(rows))
+        rows.append(cells)
+    bold.add(len(rows))
+    rows.append(['Total']+[str(t) for t in coltot]+[str(grand)])
+    widths=[90]+[52]*len(dates)+[46]; aligns=['l']+['c']*len(dates)+['c']
+    sub=(f"{p['name']} - {p['tier']} {p['shift']} - week "
+         f"{pendulum.parse(dates[0]).format('DD/MM') if dates else ''}-{pendulum.parse(dates[-1]).format('DD/MM') if dates else ''} - bold = rostered shift hours")
+    return _grid_pdf('Hourly human closes', sub, headers, rows, widths, aligns, bold_rows=bold)
 
 def shift_activity(p):
     """Per shift-INSTANCE downtime + burst signals (names the day, handles cross-midnight, and
@@ -574,8 +593,8 @@ def run_perf_report(**context):
             ai = ai_notes(p, cfg, base)                       # LLM (has its own fallback)
             html = build_html(p, ai)
             first = p['name'].split()[0].lower().replace('/','-') or 'agent'
-            attachments = [(f"reopen_dump_{first}.html", build_reopen_html(p)),
-                           (f"hourly_closes_{first}.html", build_hourly_html(p))]
+            attachments = [(f"reopen_dump_{first}.pdf", build_reopen_pdf(p)),
+                           (f"hourly_closes_{first}.pdf", build_hourly_pdf(p))]
             to = test_to or p['email']
             subj = ('[TEST %s] ' % p['name'] + subject_prefix) if test_to else subject_prefix
             cc = [] if test_to else cc_for_tier(p['tier'], cfg)   # no CC during pilot/test sends
