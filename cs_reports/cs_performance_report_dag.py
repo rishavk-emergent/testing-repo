@@ -36,13 +36,14 @@ REOPEN_QUERY_ID   = 41792
 CONFIG_QUERY_ID   = 41839
 BASELINES_QUERY_ID= 41854
 HOURLY_QUERY_ID   = 38693   # per-agent human closes by (day, hour) IST, last 10 days
+CLOSETYPE_QUERY_ID= 41972   # per-agent latest-week new / reopen / self-reopen close snapshots (section 3)
 HOUR_BURST_BAR    = {'L1': 10, 'L2 Full Stack': 8, 'L2 Expo': 8}   # closes/hr outlier bar (~tier p99)
 DRY_RUN         = os.getenv('CS_PERF_DRY_RUN') == '1'
 DRY_RUN_DIR     = os.getenv('CS_PERF_DRY_RUN_DIR', '/tmp/cs_perf_out')
 
 # palette / ink
 INK='#0f172a'; MUT='#64748b'; FAINT='#94a3b8'; LINE='#eef1f5'; ROW='#f4f6f9'
-HL='#eef5fd'; HLB='#d7e6fb'; UP='#15803d'; DOWN='#b91c1c'; GREY='#b3b8c0'
+HL='#eef5fd'; HLB='#d7e6fb'; UP='#4a7d68'; DOWN='#b06a63'; GREY='#b3b8c0'   # muted good/bad
 BUCKET_ORDER=['incorrect','incomplete','new_issue','clarification','noise']
 BUCKET_NICE={'incorrect':'Incorrect','incomplete':'Incomplete','new_issue':'New issue','clarification':'Clarification','noise':'Noise'}
 AVOID_BUCKETS={'incorrect','incomplete'}
@@ -58,7 +59,8 @@ def fetch_all():
     reopen=r.fetch_query_results(query_id=REOPEN_QUERY_ID, max_retries=3)
     baselines=r.fetch_query_results(query_id=BASELINES_QUERY_ID, max_retries=3)
     hourly=r.fetch_query_results(query_id=HOURLY_QUERY_ID, max_retries=3)
-    return cfg, core, reopen, baselines, hourly
+    closetypes=r.fetch_query_results(query_id=CLOSETYPE_QUERY_ID, max_retries=3)
+    return cfg, core, reopen, baselines, hourly, closetypes
 
 def baseline_summary(baselines):
     """Turn the [CS Perf] baselines rows into a compact, live summary for the LLM."""
@@ -96,15 +98,12 @@ def _weeks_meta(core):
     return old_to_new, labels
 
 # ==================== RENDER (v2 matrix) ====================
-def _arrow(cur, prev, direction):
-    if prev is None or cur is None: return ''
-    d=cur-prev
-    if abs(d)<1e-9: return f'<span style="font-size:9px;color:{GREY};margin-left:4px;">&#9644;</span>'
-    up=d>0
-    if direction=='neutral': col=GREY
-    else:
-        good=(d<0) if direction=='lower' else (d>0); col=UP if good else DOWN
-    return f'<span style="font-size:9px;color:{col};margin-left:4px;">{"&#9650;" if up else "&#9660;"}</span>'
+def _val_color(cur, prev, direction):
+    """Latest-week value colour: green if the WoW move is good, red if bad, default ink otherwise.
+    No arrows - colour only, and only two colours (green/red) for directional metrics."""
+    if direction=='neutral' or prev is None or cur is None or abs(cur-prev)<1e-9: return INK
+    good=(cur<prev) if direction=='lower' else (cur>prev)
+    return UP if good else DOWN
 
 def _fmt_int(v):  return '&ndash;' if v is None else f'{int(round(v)):,}'
 def _fmt_m(v):
@@ -129,12 +128,14 @@ def _row(nw, label, primary, direction, pfmt=_fmt_plain, bracket=None, bfmt=_fmt
     tds=[f'<td style="padding:6px 8px;border-bottom:1px solid {ROW};color:#334155;font-weight:500;letter-spacing:.1px;">{label}</td>']
     for i in range(nw):
         newest=i==0; bg=f'background:{HL};' if newest else ''
-        prev=C[i+1] if i+1<nw else None
         br=f' <span style="font-size:10px;color:{FAINT};">({bfmt(B[i])})</span>' if (B is not None and B[i] is not None) else ''
         st=f'{bg}padding:6px 8px;border-bottom:1px solid {ROW};text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums;'
-        st+=(f'font-weight:700;color:{INK};font-size:12.5px;' if newest else 'color:#475569;')
-        ind=_arrow(C[i],prev,direction) if newest else ''
-        tds.append(f'<td style="{st}">{pfmt(P[i])}{br}{ind}</td>')
+        if newest:
+            col=_val_color(C[0], C[1] if nw>1 else None, direction)   # green/red on latest value, no arrow
+            st+=f'font-weight:700;color:{col};font-size:12.5px;'
+        else:
+            st+='color:#475569;'
+        tds.append(f'<td style="{st}">{pfmt(P[i])}{br}</td>')
     return f'<tr>{"".join(tds)}</tr>'
 
 def _sep(nw): return f'<tr><td colspan="{nw+1}" style="padding:3px 0;"></td></tr>'
@@ -150,7 +151,7 @@ def _series(by_idx, order, col):
     return out
 
 # ==================== ASSEMBLE (per agent) ====================
-def assemble(core, reopen, hourly=None):
+def assemble(core, reopen, hourly=None, closetypes=None):
     order, labels = _weeks_meta(core)
     weeks_disp=[labels[i] for i in reversed(order)]  # latest-left
     nw=len(order)
@@ -160,6 +161,9 @@ def assemble(core, reopen, hourly=None):
     hourly_by={}
     for h in (hourly or []):
         hourly_by.setdefault(h['agent_email'], []).append(h)
+    ct_by={}
+    for r in (closetypes or []):
+        ct_by.setdefault(r['agent_email'], {})[int(r['week_idx'])]=r
     # index rows
     agents={}; shifts={}; teams={}
     for r in core:
@@ -190,6 +194,8 @@ def assemble(core, reopen, hourly=None):
             buckets=_bucket_matrix(reo_by_agent.get(email, []), order),
             reopen_events=reo_by_agent.get(email, []),
             week_dates=week_dates, hourly=hourly_by.get(email, []),
+            closetypes={c:[ (ct_by.get(email,{}).get(i,{}) or {}).get(c,0) for i in order ]
+                        for c in ('new_closes','reopen_closes_other','self_reopen_closes')},
         ))
     return payloads, order
 
@@ -220,17 +226,23 @@ def build_html(p, ai):
         _sep(nw),
         _row(nw,'OW CSAT % pos. (total resp.)',T['csat_pos_ow'],'higher',_fmt_pct,bracket=T['csat_n_ow'],bfmt=_fmt_int,cmp=T['csat_pos_ow']),
         _row(nw,'Human CSAT % pos. (total resp.)',T['csat_pos_hu'],'higher',_fmt_pct,bracket=T['csat_n_hu'],bfmt=_fmt_int,cmp=T['csat_pos_hu']),
-        _row(nw,'OW reopen',T['reopen_n_ow'],'lower',_fmt_int,bracket=T['reopen_rate_ow'],cmp=T['reopen_rate_ow']),
-        _row(nw,'Human reopen',T['reopen_n_hu'],'lower',_fmt_int,bracket=T['reopen_rate_hu'],cmp=T['reopen_rate_hu']),
+        _row(nw,'OW reopen',T['reopen_rate_ow'],'lower',_fmt_pct,bracket=T['reopen_n_ow'],bfmt=_fmt_int,cmp=T['reopen_rate_ow']),
+        _row(nw,'Human reopen',T['reopen_rate_hu'],'lower',_fmt_pct,bracket=T['reopen_n_hu'],bfmt=_fmt_int,cmp=T['reopen_rate_hu']),
     ])
     def human_tbl(D):
         return _tbl(nw,W,[
-            _row(nw,'Human closes',D['human_n'],'neutral',_fmt_int),
+            _row(nw,'Human closes',D['human_n'],'higher',_fmt_int),
             _row(nw,'Escalated&rarr;human FRT',D['hufrt_p50'],'lower',_fmt_m),
             _row(nw,'Created&rarr;human FRT',D['frt_p50'],'lower',_fmt_m),
             _row(nw,'Human CSAT % pos. (total resp.)',D['csat_pos_hu'],'higher',_fmt_pct,bracket=D['csat_n_hu'],bfmt=_fmt_int,cmp=D['csat_pos_hu']),
-            _row(nw,'Human reopen',D['reopen_n_hu'],'lower',_fmt_int,bracket=D['reopen_rate_hu'],cmp=D['reopen_rate_hu']),
+            _row(nw,'Human reopen',D['reopen_rate_hu'],'lower',_fmt_pct,bracket=D['reopen_n_hu'],bfmt=_fmt_int,cmp=D['reopen_rate_hu']),
         ])
+    ct=p.get('closetypes') or {}
+    interv=_tbl(nw,W,[
+        _row(nw,'New tickets closed', ct.get('new_closes',[0]*nw),'neutral',_fmt_int),
+        _row(nw,'Reopen closes', ct.get('reopen_closes_other',[0]*nw),'neutral',_fmt_int),
+        _row(nw,'Self-reopen closes', ct.get('self_reopen_closes',[0]*nw),'neutral',_fmt_int),
+    ])
     buckets=_tbl(nw,W,[
         _row(nw,'&#128308; Incorrect',B['incorrect'],'lower',_fmt_plain),
         _row(nw,'&#128992; Incomplete',B['incomplete'],'lower',_fmt_plain),
@@ -239,7 +251,6 @@ def build_html(p, ai):
         _row(nw,'New issue',B['new_issue'],'neutral',_fmt_plain),
         _row(nw,'Clarification',B['clarification'],'neutral',_fmt_plain),
         _row(nw,'Noise',B['noise'],'neutral',_fmt_plain),
-        _row(nw,'&nbsp;&nbsp;Not your fault',B['notfault'],'neutral',_fmt_plain),
         _sep(nw),
         _row(nw,'<b>Total reopen events</b>',B['total'],'lower',_fmt_plain),
     ])
@@ -259,11 +270,11 @@ def build_html(p, ai):
       <span style="background:rgba(255,255,255,.16);border-radius:6px;padding:2px 9px;margin-right:8px;">Shift {p['shift']} IST</span>
       <b style="color:#fff;">{p['name']}</b></div>
   </td></tr>
-  <tr><td style="padding:20px 26px;">{_sec('1','Team Performance',f"Your tier &middot; <b>{p['tier']}</b> &middot; closed-week &middot; assignee-credited &middot; arrow vs prior week")}{team}</td></tr>
+  <tr><td style="padding:20px 26px;">{_sec('1','Team Performance',f"Your tier &middot; <b>{p['tier']}</b> &middot; closed-week &middot; assignee-credited &middot; latest coloured vs prior week")}{team}</td></tr>
   <tr><td style="padding:20px 26px;border-top:1px solid {LINE};">{_sec('2','Shift Performance',f"Your shift &middot; <b>{p['tier']} &middot; {p['shift']}</b> &middot; roster-aggregate &middot; human-only")}{human_tbl(S)}</td></tr>
   <tr><td style="padding:20px 26px;border-top:1px solid {LINE};">{_sec('3','Your Performance',f"{p['name']} &middot; human-only")}{human_tbl(Y)}
     <div style="margin-top:18px;">{_sec('','Reopen snapshots','per reopen event, credited to you as last-closer (+1 each time) &middot; bucket &times; week')}{buckets}</div>
-    <div style="margin-top:12px;font-size:11.5px;color:{MUT};background:#f8fafc;border:1px dashed #dbe2ea;border-radius:8px;padding:9px 12px;">&#128206; <b>Attached:</b> <i>{dump_name}</i> (every reopen by bucket + ticket link) &middot; <i>{hourly_name}</i> (your hour &times; day closures for the week).</div>
+    <div style="margin-top:18px;">{_sec('','Interventions by you','your close actions per week (by closer) &middot; new-ticket closes vs re-closing reopened tickets - your own or someone else&rsquo;s')}{interv}</div>
   </td></tr>
   <tr><td style="padding:20px 26px;border-top:1px solid {LINE};background:#f8fafc;">{_sec('4','AI Notes','Auto-generated from the tables above plus issue-type breakdown &middot; a read on the trend, not a verdict.')}
     {ab('#2a78d6','The trend', para(ai['trend']))}
@@ -584,8 +595,8 @@ def send_email(to, subject, html, attachments, cfg, cc=None):
 
 # ==================== MAIN TASK ====================
 def run_perf_report(**context):
-    cfg, core, reopen, baselines, hourly = fetch_all()
-    payloads, _ = assemble(core, reopen, hourly)
+    cfg, core, reopen, baselines, hourly, closetypes = fetch_all()
+    payloads, _ = assemble(core, reopen, hourly, closetypes)
     base = baseline_summary(baselines)
     logger.info('assembled %d agent reports (%d core, %d reopen rows); baseline avoidable=%s%%',
                 len(payloads), len(core), len(reopen), base.get('avoidable_pct_of_all_reopens'))
