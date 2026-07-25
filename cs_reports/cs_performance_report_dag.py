@@ -639,7 +639,16 @@ def run_perf_report(**context):
     logger.info('CS WEEKLY PERFORMANCE REPORT: %s for %d/%d agents (%d failed: %s)',
                 'DRY_RUN wrote' if DRY_RUN else 'sent', sent, len(payloads), len(failed), failed)
     if failed and not DRY_RUN:
-        logger.warning('agents skipped due to errors: %s', failed)
+        logger.error('agents that FAILED delivery: %s', failed)
+    # Fail the task on a SYSTEMIC delivery failure (SMTP down / bad app password / blocked
+    # egress) so Airflow marks it red and retries, instead of a silent green with no reports.
+    # We raise only when NOTHING was delivered: a retry then re-sends to everyone safely (no
+    # one got a duplicate). Partial failures are logged at ERROR above but don't auto-retry,
+    # because an Airflow retry re-runs the whole task and would re-send to agents who already
+    # received their report. If nothing was even attempted, that's also a failure worth surfacing.
+    if not DRY_RUN and payloads and sent == 0:
+        raise RuntimeError('CS perf report: 0/%d reports delivered (all failed: %s) - '
+                           'systemic delivery failure, failing task for retry' % (len(payloads), failed))
 
 # ==================== DAG ====================
 default_args = {
