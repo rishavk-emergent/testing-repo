@@ -9,11 +9,12 @@ per-agent reopen dump (.xlsx); and (4) AI notes written by an LLM from the numbe
 WHERE THE LOGIC LIVES - all numbers come from Redash; the DAG only slices, renders, and sends.
   * CORE_QUERY_ID   41791  - Team/Shift/Agent x week wide payload (closed-week, assignee-credited)
   * REOPEN_QUERY_ID 41792  - per reopen-event rows (last-closer attributed) -> buckets + xlsx + issue feed
-  * CONFIG_QUERY_ID 41839  - from/reply-to, cc_l1/cc_l2, n_weeks, llm_*, gmail_app_password, ai_rubric
-Config-in-Redash: edit the config row to change address / CC / model / app password with no code push.
+  * CONFIG_QUERY_ID 41839  - from/reply-to, n_weeks, llm_*, gmail_app_password, ai_rubric
+  * CC_QUERY_ID     41992  - per-agent CC map (org/tier + team-lead associate); edit config blocks + re-run
+Config-in-Redash: edit the config row / CC map to change address / CC / model / app password with no code push.
 
 DELIVERY: Gmail SMTP (smtp.gmail.com:587, app password from config). Each agent gets their own
-report; CC by tier (L1 -> cc_l1, L2 Full Stack/Expo -> cc_l2). CS_PERF_DRY_RUN=1 writes HTML+xlsx
+report; CC per agent from the 41992 map (org/tier associates + their team lead). CS_PERF_DRY_RUN=1 writes HTML+xlsx
 to disk instead of sending; CS_PERF_TEST_RECIPIENT routes all to one address (CC suppressed).
 
 Schedule: Monday 07:00 Asia/Kolkata, after the prior Mon-Sun week has closed. Paused on creation.
@@ -37,6 +38,7 @@ CONFIG_QUERY_ID   = 41839
 BASELINES_QUERY_ID= 41854
 HOURLY_QUERY_ID   = 38693   # per-agent human closes by (day, hour) IST, last 10 days
 CLOSETYPE_QUERY_ID= 41972   # per-agent latest-week new / reopen / self-reopen close snapshots (section 3)
+CC_QUERY_ID       = 41992   # per-agent CC list (org/tier + team-lead associate); edit + re-run, no code push
 HOUR_BURST_BAR    = {'L1': 10, 'L2 Full Stack': 8, 'L2 Expo': 8}   # closes/hr outlier bar (~tier p99)
 DRY_RUN         = os.getenv('CS_PERF_DRY_RUN') == '1'
 DRY_RUN_DIR     = os.getenv('CS_PERF_DRY_RUN_DIR', '/tmp/cs_perf_out')
@@ -60,7 +62,8 @@ def fetch_all():
     baselines=r.fetch_query_results(query_id=BASELINES_QUERY_ID, max_retries=3)
     hourly=r.fetch_query_results(query_id=HOURLY_QUERY_ID, max_retries=3)
     closetypes=r.fetch_query_results(query_id=CLOSETYPE_QUERY_ID, max_retries=3)
-    return cfg, core, reopen, baselines, hourly, closetypes
+    ccmap=r.fetch_query_results(query_id=CC_QUERY_ID, max_retries=3)
+    return cfg, core, reopen, baselines, hourly, closetypes, ccmap
 
 def baseline_summary(baselines):
     """Turn the [CS Perf] baselines rows into a compact, live summary for the LLM."""
@@ -547,10 +550,21 @@ def _plain_fallback():
     return ("Your weekly performance report is in the HTML body of this email, with your reopen "
             "dump attached as an .xlsx. Questions, suggestions, or anything else - just reply.")
 
-def cc_for_tier(tier, cfg):
-    """CC list by tier, from the config query. L1 -> cc_l1; L2 Full Stack/Expo -> cc_l2."""
-    key = 'cc_l1' if tier == 'L1' else 'cc_l2'
-    return [e.strip() for e in (cfg.get(key) or '').split(',') if e.strip()]
+def build_cc_map(ccrows):
+    """dict agent_email -> [cc emails], from the CC-map query (41992).
+    Each rostered agent maps to their org/tier CC (soham / vinish) + team-lead associate.
+    Edit tier_cc/lead_map in 41992 and re-run to change who is CC'd - no code push."""
+    m = {}
+    for row in (ccrows or []):
+        ae = (row.get('agent_email') or '').strip().lower()
+        if not ae:
+            continue
+        m[ae] = [e.strip() for e in (row.get('cc_emails') or '').split(',') if e.strip()]
+    return m
+
+def cc_for_agent(email, cc_map):
+    """This agent's CC list from the 41992 map; [] if unmapped (never guess a CC)."""
+    return cc_map.get((email or '').strip().lower(), [])
 
 def send_email(to, subject, html, attachments, cfg, cc=None):
     """Send one agent's report as HTML + .xlsx attachments via Gmail SMTP (app password).
@@ -595,8 +609,9 @@ def send_email(to, subject, html, attachments, cfg, cc=None):
 
 # ==================== MAIN TASK ====================
 def run_perf_report(**context):
-    cfg, core, reopen, baselines, hourly, closetypes = fetch_all()
+    cfg, core, reopen, baselines, hourly, closetypes, ccmap = fetch_all()
     payloads, _ = assemble(core, reopen, hourly, closetypes)
+    cc_map = build_cc_map(ccmap)
     base = baseline_summary(baselines)
     logger.info('assembled %d agent reports (%d core, %d reopen rows); baseline avoidable=%s%%',
                 len(payloads), len(core), len(reopen), base.get('avoidable_pct_of_all_reopens'))
@@ -615,7 +630,7 @@ def run_perf_report(**context):
                            (f"hourly_closes_{first}.pdf", build_hourly_pdf(p))]
             to = test_to or p['email']
             subj = ('[TEST %s] ' % p['name'] + subject_prefix) if test_to else subject_prefix
-            cc = [] if test_to else cc_for_tier(p['tier'], cfg)   # no CC during pilot/test sends
+            cc = [] if test_to else cc_for_agent(p['email'], cc_map)   # no CC during pilot/test sends
             send_email(to, subj, html, attachments, cfg, cc=cc)
             sent+=1
         except Exception as e:                                # one bad agent must not sink the run
