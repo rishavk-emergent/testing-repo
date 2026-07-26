@@ -279,14 +279,33 @@ def post_rca(cfg, channel, ticket_id):
     return True
 
 
-# ==================== selection (STUB - replace with the >=$1k selection query/skill) ====================
+# ==================== selection ====================
 def select_ticket_ids(cfg, n, done):
-    """TODO: replace with the dedicated >=$1k-LTV selection query/skill. For now: recent open
-    tickets whose customer LTV >= LTV_MIN and not already RCA'd."""
+    """Read the ordered candidate list from the [RCA MIS] selection query (config
+    rca_selection_query, #42036) and take the first n not already RCA'd. The query encodes the
+    cascade: Tier A = RealL3 open/pending (LTV ignored, reopened-defect then oldest-waiting first) ->
+    Tier B = LTV>=floor -> Tier C = rest by LTV desc. Selection logic lives in that query (no code
+    push). Falls back to a recent-open Trinity scan only if the query is unset/unavailable."""
+    qid = cfg.get('rca_selection_query')
+    if qid:
+        try:
+            rows = redash_run(int(qid), cfg['redash_base_url'], cfg['redash_api_key'])
+            picked = []
+            for r in rows:
+                tid = r.get('ticket_id')
+                if tid and tid not in done:
+                    picked.append(tid)
+                    logger.info('RCA MIS: candidate #%s tier=%s | %s', r.get('num'), r.get('tier'), r.get('reason'))
+                if len(picked) >= n:
+                    break
+            return picked
+        except Exception as e:
+            logger.warning('RCA MIS: selection query %s failed (%s) - falling back to Trinity scan', qid, e)
+    # fallback: recent open tickets with LTV >= LTV_MIN
     try:
         lt = json.loads(mcp(cfg['trinity_mcp_url'], cfg['trinity_api_key'], 'list_tickets', {'status': 'open', 'limit': 40}))
     except Exception as e:
-        logger.warning('RCA MIS: selection list_tickets failed: %s', e)
+        logger.warning('RCA MIS: fallback list_tickets failed: %s', e)
         return []
     picked = []
     for it in lt.get('items', []):
