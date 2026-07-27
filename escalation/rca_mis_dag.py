@@ -27,7 +27,7 @@ Ships paused (posts to a real channel). Reuses SLACK_BOT_TOKEN_ALERTS (the Daily
 """
 
 from datetime import timedelta
-import logging, json, re, base64, time
+import logging, os, json, re, base64, time
 
 import pendulum, requests
 from airflow import DAG
@@ -41,7 +41,6 @@ CONFIG_QUERY_ID = 42029
 DONE_VAR        = 'RCA_MIS_DONE'
 LTV_MIN         = 1000.0
 MAX_ITER        = 24
-import os
 FORCE_RUN       = os.getenv('RCA_MIS_FORCE') == '1'
 FORCE_TICKET    = os.getenv('RCA_MIS_TICKET')          # run one specific ticket id (testing)
 ENV_CHANNEL     = os.getenv('RCA_MIS_CHANNEL')          # test-channel override
@@ -335,9 +334,24 @@ def slot_now(cfg):
 
 
 # ==================== MAIN ====================
+def _resolve(name):
+    """Composer-provided override (env / Secret Manager, then Airflow Variable); None if neither."""
+    v = os.getenv(name)
+    if v:
+        return v
+    try:
+        return Variable.get(name, default_var=None)
+    except Exception:
+        return None
+
 def run_rca_mis(**context):
     cfg = redash_run(CONFIG_QUERY_ID, REDASH_BASE_URL, REDASH_API_KEY)[0]
     cfg['redash_base_url'] = _https(cfg.get('redash_base_url') or REDASH_BASE_URL)
+    # Prefer Composer's internal LiteLLM proxy (Secret Manager / Airflow Variable) when present, so a
+    # merged PR uses the internal proxy automatically; locally these are unset -> fall back to the
+    # config-query OpenAI-direct values. No code/config change needed at go-live.
+    cfg['llm_url'] = _resolve('LLM_PROXY_URL') or cfg['llm_url']
+    cfg['llm_api_key'] = _resolve('LLM_PROXY_API_KEY') or cfg['llm_api_key']
     channel = ENV_CHANNEL or cfg['channel_id']
 
     if FORCE_TICKET:
