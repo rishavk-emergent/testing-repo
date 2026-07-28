@@ -615,7 +615,11 @@ def run_perf_report(**context):
     base = baseline_summary(baselines)
     logger.info('assembled %d agent reports (%d core, %d reopen rows); baseline avoidable=%s%%',
                 len(payloads), len(core), len(reopen), base.get('avoidable_pct_of_all_reopens'))
-    subject_prefix = cfg.get('subject_prefix') or 'Your Weekly Report'
+    # Subject is a per-recipient template from config (41839, subject_template): a {name}
+    # placeholder is filled with the agent's name. Edit wording in the query - no code push
+    # (keep the {name} token). Falls back to subject_prefix / a default if unset or malformed.
+    subject_prefix   = cfg.get('subject_prefix') or 'Your Weekly Report'
+    subject_template = cfg.get('subject_template') or ('{name} — ' + subject_prefix)
     test_to = os.getenv('CS_PERF_TEST_RECIPIENT')             # pilot: route ALL emails here
     limit   = int(os.getenv('CS_PERF_LIMIT', '0') or 0)       # pilot: only first N agents (0 = all)
     if limit: payloads = payloads[:limit]
@@ -629,7 +633,11 @@ def run_perf_report(**context):
             attachments = [(f"reopen_dump_{first}.pdf", build_reopen_pdf(p)),
                            (f"hourly_closes_{first}.pdf", build_hourly_pdf(p))]
             to = test_to or p['email']
-            subj = ('[TEST %s] ' % p['name'] + subject_prefix) if test_to else subject_prefix
+            try:
+                real_subj = subject_template.format(name=p['name'])
+            except Exception:                                 # template missing/misusing {name}
+                real_subj = subject_template
+            subj = ('[TEST] ' + real_subj) if test_to else real_subj
             cc = [] if test_to else cc_for_agent(p['email'], cc_map)   # no CC during pilot/test sends
             send_email(to, subj, html, attachments, cfg, cc=cc)
             sent+=1
