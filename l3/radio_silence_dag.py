@@ -83,11 +83,6 @@ def slack_post(channel, text, thread_ts=None):
 def _lvl(v):
     return v if v else 'L?'
 
-def _summary(row):
-    s = (row.get('subject') or '').strip() or (row.get('last_message_snippet') or '').strip()
-    s = ' '.join(s.split())
-    return (s[:90] + '…') if len(s) > 90 else s
-
 LIST_CAP    = 12          # cap tickets shown per section (avoids giant replies)
 EMOJI_SILENT = ':hourglass_flowing_sand:'
 EMOJI_OPEN   = ':card_index_dividers:'
@@ -96,8 +91,7 @@ def _ticket_line(row, silent=False):
     link = '<%s|#%d>' % (TICKET_URL % row['ticket_id'], int(row['num']))
     tags = (' · _%s_' % row['tags']) if row.get('tags') else ''
     age  = (' · *%dh silent*' % int(row['hours_since_resp'])) if silent else ''
-    summ = _summary(row)
-    return '   • %s `[%s]`%s%s%s' % (link, _lvl(row.get('level')), age, tags, (' — ' + summ) if summ else '')
+    return '   • %s `[%s]`%s%s' % (link, _lvl(row.get('level')), age, tags)
 
 def _lines(rows, silent=False):
     out = [_ticket_line(r, silent=silent) for r in rows[:LIST_CAP]]
