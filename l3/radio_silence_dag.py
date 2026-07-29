@@ -66,7 +66,9 @@ def redash_run(query_id):
 
 # ==================== Slack ====================
 def slack_post(channel, text, thread_ts=None):
-    p = {'channel': channel, 'text': text, 'unfurl_links': False, 'unfurl_media': False}
+    # parse='none' stops Slack auto-linking the code-box email into a mailto link;
+    # explicit <url|#num> ticket links still render.
+    p = {'channel': channel, 'text': text, 'unfurl_links': False, 'unfurl_media': False, 'parse': 'none'}
     if thread_ts:
         p['thread_ts'] = thread_ts
     d = requests.post('https://slack.com/api/chat.postMessage',
