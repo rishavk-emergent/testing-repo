@@ -86,6 +86,10 @@ def _summary(row):
     s = ' '.join(s.split())
     return (s[:90] + '…') if len(s) > 90 else s
 
+LIST_CAP    = 12          # cap tickets shown per section (avoids giant replies)
+EMOJI_SILENT = ':hourglass_flowing_sand:'
+EMOJI_OPEN   = ':card_index_dividers:'
+
 def _ticket_line(row, silent=False):
     link = '<%s|#%d>' % (TICKET_URL % row['ticket_id'], int(row['num']))
     tags = (' · _%s_' % row['tags']) if row.get('tags') else ''
@@ -93,23 +97,36 @@ def _ticket_line(row, silent=False):
     summ = _summary(row)
     return '   • %s `[%s]`%s%s%s' % (link, _lvl(row.get('level')), age, tags, (' — ' + summ) if summ else '')
 
+def _lines(rows, silent=False):
+    out = [_ticket_line(r, silent=silent) for r in rows[:LIST_CAP]]
+    if len(rows) > LIST_CAP:
+        out.append('   • _…and %d more_' % (len(rows) - LIST_CAP))
+    return out
+
 def build_user_reply(email, rows):
-    silent = [r for r in rows if r.get('is_silent')]
+    silent = sorted([r for r in rows if r.get('is_silent')], key=lambda r: -r['hours_since_resp'])
+    others = sorted([r for r in rows if not r.get('is_silent')], key=lambda r: int(r['num']))
     multi  = rows[0].get('user_multi_open')
+    open_n = int(rows[0].get('open_count', len(rows)))
     ltv    = rows[0].get('ltv')
-    header = '*%s*' % email
+
     meta = []
     if ltv not in (None, ''):
-        meta.append('$%s' % ltv)
-    meta.append('%d open' % rows[0].get('open_count', len(rows)))
-    header += '  (' + ' · '.join(meta) + ')'
-    parts = [header]
+        meta.append('$%d LTV' % round(float(ltv)))
+    meta.append('%d open' % open_n)
+    parts = ['*%s*  (%s)' % (email, ' · '.join(meta))]
+
     if silent:
-        parts.append('🔴 *No response %d h+:*' % int(max(r['hours_since_resp'] for r in silent)))
-        parts += [_ticket_line(r, silent=True) for r in sorted(silent, key=lambda r: -r['hours_since_resp'])]
+        parts.append('%s *No response %dh+ (%d):*' % (EMOJI_SILENT, int(silent[0]['hours_since_resp']), len(silent)))
+        parts += _lines(silent, silent=True)
     if multi:
-        parts.append('📂 *Multiple open (%d):*' % rows[0].get('open_count', len(rows)))
-        parts += [_ticket_line(r) for r in sorted(rows, key=lambda r: r['num'])]
+        # for a both-case user, only list the open tickets NOT already shown as silent
+        if silent and others:
+            parts.append('%s *Also open (%d):*' % (EMOJI_OPEN, len(others)))
+            parts += _lines(others)
+        elif not silent:
+            parts.append('%s *Multiple open (%d):*' % (EMOJI_OPEN, open_n))
+            parts += _lines(others)
     return '\n'.join(parts)
 
 def build_master(title, ist_date):
