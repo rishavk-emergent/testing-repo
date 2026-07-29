@@ -114,7 +114,7 @@ def build_user_reply(email, rows):
     if ltv not in (None, ''):
         meta.append('$%d LTV' % round(float(ltv)))
     meta.append('%d open' % open_n)
-    parts = ['*%s*  (%s)' % (email, ' · '.join(meta))]
+    parts = ['`%s`  (%s)' % (email, ' · '.join(meta))]   # email in a code box so each user block stands out
 
     if silent:
         parts.append('%s *No response %dh+ (%d):*' % (EMOJI_SILENT, int(silent[0]['hours_since_resp']), len(silent)))
