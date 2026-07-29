@@ -3,8 +3,8 @@ Radio Silence & Multi-Ticket Alert - Slack DAG (every 30 min, IST)
 
 Flags support tickets that have gone quiet or users who are piling up open tickets, so the team
 can jump on them. Per user, per run it posts (into a single daily thread, not the channel):
-  🔴  Radio silence — OPEN tickets with NO response from our side (agent OR Overwatch) in
-      SILENCE_HOURS (default 24h).  [never-responded tickets older than that count too]
+  🔴  Radio silence — OPEN tickets whose LAST message (from anyone: customer, human agent, or
+      Overwatch) was more than SILENCE_HOURS ago (default 24h) — i.e. the ticket has gone quiet.
   📂  Multiple open — the user's full open-ticket list, shown when they have >= MIN_OPEN (default 3).
 A user is alerted if either applies; both sections show if both apply.
 
@@ -90,7 +90,7 @@ EMOJI_OPEN   = ':card_index_dividers:'
 def _ticket_line(row, silent=False):
     link = '<%s|#%d>' % (TICKET_URL % row['ticket_id'], int(row['num']))
     tags = (' · _%s_' % row['tags']) if row.get('tags') else ''
-    age  = (' · *%dh silent*' % int(row['hours_since_resp'])) if silent else ''
+    age  = (' · *%dh silent*' % int(row['hours_silent'])) if silent else ''
     return '   • %s `[%s]`%s%s' % (link, _lvl(row.get('level')), age, tags)
 
 def _lines(rows, silent=False):
@@ -100,7 +100,7 @@ def _lines(rows, silent=False):
     return out
 
 def build_user_reply(email, rows):
-    silent = sorted([r for r in rows if r.get('is_silent')], key=lambda r: -r['hours_since_resp'])
+    silent = sorted([r for r in rows if r.get('is_silent')], key=lambda r: -r['hours_silent'])
     others = sorted([r for r in rows if not r.get('is_silent')], key=lambda r: int(r['num']))
     multi  = rows[0].get('user_multi_open')
     open_n = int(rows[0].get('open_count', len(rows)))
@@ -113,7 +113,7 @@ def build_user_reply(email, rows):
     parts = ['`%s`  (%s)' % (email, ' · '.join(meta))]   # email in a code box so each user block stands out
 
     if silent:
-        parts.append('%s *No response %dh+ (%d):*' % (EMOJI_SILENT, int(silent[0]['hours_since_resp']), len(silent)))
+        parts.append('%s *No activity %dh+ (%d):*' % (EMOJI_SILENT, int(silent[0]['hours_silent']), len(silent)))
         parts += _lines(silent, silent=True)
     if multi:
         # for a both-case user, only list the open tickets NOT already shown as silent
