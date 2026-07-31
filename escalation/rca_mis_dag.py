@@ -1,29 +1,48 @@
 """
-RCA MIS - Slack DAG (poll every 15 min, IST)
+RCA MIS - Slack DAG   (dag_id: rca_mis_slack)
 
-Posts a deep, KB-grounded product RCA for a >=$1k-LTV support ticket to a Slack channel, so the
-product team can pick up the fix. At each configured time slot it selects a ticket, runs an
-agentic gpt-4.1 investigation loop (Trinity + Overwatch + Redash ds5/ds10 + LIVE emergentbase KB),
-and posts a 4-part briefing + thread:
+WHAT IT DOES
+Every configured IST slot, selects one high-value support ticket, runs an agentic gpt-4.1
+investigation grounded in live DB evidence + the emergentbase knowledge base, and posts a deep,
+product-oriented RCA to Slack:
   MAIN   : 1. Executive Summary  2. Basic Details (code-computed)  3. Background
-  THREAD : What's been done so far (code-derived) / What's still missing / Detailed RCA (L3 depth)
+  THREAD : What's been done so far / What's still missing / Detailed RCA (L3 depth)
 
-HOW IT WORKS
-- Config lives in Redash "[RCA MIS] config" #CONFIG_QUERY_ID (edit there, no code push): channel,
-  MCP urls+keys, redash creds, OpenAI url/key/model, kb_github_token, kb_sources (pipe-sep
-  repo:path list - add a KB by editing this), rca_times, rca_count, and the full rca_prompt.
-- Schedule gate: the DAG ticks every 15 min but only fires on the configured rca_times slots
-  (default 06:00,09:00,12:00,15:00,18:00,21:00), rca_count RCAs per slot.
-- The investigation is an OpenAI function-calling loop; tools = MCP-over-HTTP (Trinity/Overwatch),
-  Redash SQL (ds10 agent-service, ds5 deployer, ds7 BigQuery), live http_get, and GitHub KB
-  read/list. KB grounding is mandatory (catches known limitations first-principles misses).
-- done_so_far and Basic Details are computed in CODE (never the LLM) to avoid fabrication.
+HOW IT WORKS  (thin runtime - all the logic lives in Redash + the KB, editable with no code push)
+- Config: Redash "[RCA MIS] config" #42029 (CONFIG_QUERY_ID) - one row read at runtime: channel,
+  MCP urls+keys, redash creds, LLM url/key/model, kb_github_token, kb_sources, rca_times, rca_count,
+  rca_selection_query, and the full rca_prompt (the RCA "skill" itself lives in this column).
+- Selection: Redash "[RCA MIS] selection" #42036 (pointed to by config col rca_selection_query) - an
+  ordered candidate list the DAG reads top-down, skipping ids already in the RCA_MIS_DONE watermark.
+  Cascade: VIP (LTV >= $25k) -> RealL3 (curated real_l3 tag) -> rest by LTV; hard genuine-user +
+  LTV >= $1k floor. Ranking/thresholds all edit in that query.
+- Schedule gate: the DAG ticks every 15 min but fires only on the rca_times slots (IST), rca_count
+  RCAs per slot.
+- Investigation: an OpenAI function-calling loop. Tools the model may call = MCP-over-HTTP
+  (Trinity/Overwatch), Redash SQL (ds10 agent-service, ds5 deployer, ds7 BigQuery), live http_get,
+  and GitHub KB list/read. KB grounding is MANDATORY (known limitations override first-principles).
+- Anti-hallucination: done_so_far, LTV, region and open-count are computed in CODE, never the LLM;
+  the model returns prose-only JSON and code renders the Slack layout.
+- Overwatch is AUDIT-ONLY (its own RCA is often wrong - treated as a lead to refute, not trust).
+- LLM creds fall back: prefer Composer env LLM_PROXY_URL / LLM_PROXY_API_KEY, else config OpenAI-direct.
 
-TICKET SELECTION is intentionally a STUB here (select_ticket_ids) - the >=$1k selection query/skill
-is wired separately later; for now it picks a recent open ticket with LTV>=rca_ltv_min not already
-done (tracked in Airflow Variable RCA_MIS_DONE).
+SOURCE MAP  -  where to look to understand / change any part
+  Redash #42029   config      creds - rca_prompt - rca_times - channel - kb_sources - rca_selection_query
+  Redash #42036   selection   VIP / RealL3 / rest cascade + genuine-user + LTV floor
+  Trinity   MCP   trinity-base.internal.emergent.host/api/mcp     get_ticket, messages, customer
+  Overwatch MCP   overwatch.internal.emergent.host/api/mcp        existing analyses (audit only)
+  Redash DS       ds7 BigQuery (trinity_database.v_*) - ds10 agent-service (environments/pipeline_runs)
+                  - ds5 deployer (apps/pipeline_runs)
+  KB (live)       github.com/emergentbase/mono/.claude/skills/*  via GitHub contents API; token in
+                  config col kb_github_token (classic PAT, SSO). e.g. debugging-knowledgebase,
+                  cortex-rca, mobile-to-web-fork.md
+  Model           gpt-4.1  (api.openai.com/v1/chat/completions, or LLM_PROXY_URL)
+  State           RCA_MIS_DONE  (Airflow Variable - dedup watermark, so no ticket is RCA'd twice)
+  Signals         real_l3 tag id 6a1f2e835ad901b459b7665f ; reopen signal support.reopen_classifications
+  Slack           channel from config (test C0B4J9RBWDC) ; posts via SLACK_BOT_TOKEN_ALERTS
+  Prod            emergentbase/analytics-dags  dags/rca_mis_dag.py  (PR #1058)
 
-Ships paused (posts to a real channel). Reuses SLACK_BOT_TOKEN_ALERTS (the Daily Report bot).
+Ships paused (is_paused_upon_creation=True; posts to a real channel - unpause after validating).
 """
 
 from datetime import timedelta
