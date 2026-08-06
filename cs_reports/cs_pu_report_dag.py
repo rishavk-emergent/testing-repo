@@ -17,7 +17,9 @@ trend = last 7 days daily p50. Edit the query to retune - no code change.
 SPEC-DRIVEN: SECTIONS / ROWS / TILES / TREND_LINES declared as data below.
 
 Standalone: DejaVu font embedded as base64. Pillow >= 8.0 only.
-Schedule: 0 10 * * * (10:00 IST). Channel via CS_PU_REPORT_SLACK_CHANNEL env (default support-ops C0BEZ3YK4AE).
+Schedule: both DAGs tick hourly ('0 * * * *' IST); the task fires only at config trigger_hour (weekly also
+on weekly_day). Channel + trigger schedule come from Redash config #43481 - edit there, no code push.
+CS_PU_FORCE_RUN=1 bypasses the gate; CS_PU_REPORT_SLACK_CHANNEL overrides the channel (tests).
 Ships paused (posts to a real channel; unpause after validating).
 """
 from datetime import timedelta
@@ -34,8 +36,10 @@ from utils.slack.slack_config import SLACK_BOT_TOKEN_ALERTS as SLACK_TOKEN, REDA
 logger = logging.getLogger(__name__)
 
 # ==================== CONFIG ====================
-SLACK_CHANNEL = os.getenv('CS_PU_REPORT_SLACK_CHANNEL', 'C0BEZ3YK4AE')   # support-ops; override for tests
-QUERY_ID      = 43298
+QUERY_ID        = 43298   # payload: daily+weekly x cohorts x tiers (+ trend + prev)
+CONFIG_QUERY_ID = 43481   # channel + trigger schedule: channel_id / trigger_hour / weekly_day
+ENV_CHANNEL     = os.getenv('CS_PU_REPORT_SLACK_CHANNEL')   # test override; prod uses config
+FORCE_RUN       = os.getenv('CS_PU_FORCE_RUN') == '1'       # bypass the trigger gate (manual/test)
 
 # ==================== EMBEDDED FONT (base64, DejaVu - reused from cs_report/cs_shift) ====================
 import base64
@@ -221,13 +225,23 @@ def slack_upload_v2(token, channel, images, comment):
 # ==================== TASK ====================
 def run_pu_report(mode='daily', **context):
     redash=RedashClient(api_key=REDASH_API_KEY, base_url=REDASH_BASE_URL)
+    cfg=(redash.fetch_query_results(query_id=CONFIG_QUERY_ID, max_retries=3) or [{}])[0]
+    channel=ENV_CHANNEL or cfg.get('channel_id') or 'C0BEZ3YK4AE'
+    now=pendulum.now('Asia/Kolkata')
+    # trigger gate (config-driven): DAG ticks hourly, fires only at trigger_hour (weekly also on weekly_day)
+    if not FORCE_RUN:
+        try: th=int(cfg.get('trigger_hour',10))
+        except Exception: th=10
+        if now.hour!=th:
+            logger.info('CS PU %s: hour %d != trigger_hour %d -> skip', mode, now.hour, th); return
+        if mode=='weekly' and now.format('dddd').lower()!=str(cfg.get('weekly_day','monday')).strip().lower():
+            logger.info('CS PU weekly: %s != weekly_day %s -> skip', now.format('dddd'), cfg.get('weekly_day')); return
     rows=[r for r in (redash.fetch_query_results(query_id=QUERY_ID, max_retries=3) or []) if r.get('mode')==mode]
     if not rows:
         raise Exception('Redash query %s returned no %s rows'%(QUERY_ID,mode))
     by={}
     for r in rows:
         by.setdefault(r.get('cohort'),{})[r.get('tier')]=r
-    now=pendulum.now('Asia/Kolkata')
     if mode=='weekly':
         this_mon=now.start_of('week'); last_mon=this_mon.subtract(days=7)
         period=last_mon.format('DD/MM')+'–'+this_mon.subtract(days=1).format('DD/MM'); tag='WEEKLY'
@@ -235,8 +249,8 @@ def run_pu_report(mode='daily', **context):
         period=now.subtract(days=1).format('DD/MM/YYYY'); tag='DAILY'
     png=render_report(by, period, mode)
     caption=':bar_chart: *Power-User Success Report (%s) — %s*'%(tag,period)
-    slack_upload_v2(SLACK_TOKEN, SLACK_CHANNEL, [('Power-User Success Report', png)], caption)
-    logger.info('CS PU %s report: posted to %s', mode, SLACK_CHANNEL)
+    slack_upload_v2(SLACK_TOKEN, channel, [('Power-User Success Report', png)], caption)
+    logger.info('CS PU %s report: posted to %s', mode, channel)
 
 # ==================== DAG ====================
 _default_args={'owner':'cs_team','depends_on_past':False,
@@ -244,12 +258,12 @@ _default_args={'owner':'cs_team','depends_on_past':False,
     'email_on_failure':False,'email_on_retry':False,'retries':1,'retry_delay':timedelta(minutes=2)}
 daily_dag=DAG('cs_pu_report_daily',default_args=_default_args,
     description='Daily power-user CS success report (LTV cohorts) + 7-day trends, posted to Slack',
-    schedule_interval='0 10 * * *',catchup=False,is_paused_upon_creation=True,
+    schedule_interval='0 * * * *',catchup=False,is_paused_upon_creation=True,
     tags=['slack','cs_reports','cs_team','power_users'])
 PythonOperator(task_id='build_and_post_pu_report',python_callable=run_pu_report,op_kwargs={'mode':'daily'},dag=daily_dag)
 
 weekly_dag=DAG('cs_pu_report_weekly',default_args=_default_args,
     description='Weekly power-user CS success report (LTV cohorts, last Mon-Sun) + 7-week trends, posted to Slack',
-    schedule_interval='0 10 * * 1',catchup=False,is_paused_upon_creation=True,
+    schedule_interval='0 * * * *',catchup=False,is_paused_upon_creation=True,
     tags=['slack','cs_reports','cs_team','power_users'])
 PythonOperator(task_id='build_and_post_pu_report',python_callable=run_pu_report,op_kwargs={'mode':'weekly'},dag=weekly_dag)
