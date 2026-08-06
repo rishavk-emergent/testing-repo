@@ -17,7 +17,7 @@ trend = last 7 days daily p50. Edit the query to retune - no code change.
 SPEC-DRIVEN: SECTIONS / ROWS / TILES / TREND_LINES declared as data below.
 
 Standalone: DejaVu font embedded as base64. Pillow >= 8.0 only.
-Schedule: 0 10 * * * (10:00 IST). Channel via CS_PU_REPORT_SLACK_CHANNEL env (default cs-associates).
+Schedule: 0 10 * * * (10:00 IST). Channel via CS_PU_REPORT_SLACK_CHANNEL env (default support-ops C0BEZ3YK4AE).
 Ships paused (posts to a real channel; unpause after validating).
 """
 from datetime import timedelta
@@ -34,7 +34,7 @@ from utils.slack.slack_config import SLACK_BOT_TOKEN_ALERTS as SLACK_TOKEN, REDA
 logger = logging.getLogger(__name__)
 
 # ==================== CONFIG ====================
-SLACK_CHANNEL = os.getenv('CS_PU_REPORT_SLACK_CHANNEL', 'C0B075CBPS7')   # cs-associates; override for tests
+SLACK_CHANNEL = os.getenv('CS_PU_REPORT_SLACK_CHANNEL', 'C0BEZ3YK4AE')   # support-ops; override for tests
 QUERY_ID      = 43298
 
 # ==================== EMBEDDED FONT (base64, DejaVu - reused from cs_report/cs_shift) ====================
