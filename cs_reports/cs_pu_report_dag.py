@@ -226,7 +226,7 @@ def slack_upload_v2(token, channel, images, comment):
 def run_pu_report(mode='daily', **context):
     redash=RedashClient(api_key=REDASH_API_KEY, base_url=REDASH_BASE_URL)
     cfg=(redash.fetch_query_results(query_id=CONFIG_QUERY_ID, max_retries=3) or [{}])[0]
-    channel=ENV_CHANNEL or cfg.get('channel_id') or 'C0BEZ3YK4AE'
+    channel=ENV_CHANNEL or cfg.get('weekly_channel_id' if mode=='weekly' else 'daily_channel_id') or cfg.get('channel_id') or 'C0BEZ3YK4AE'
     now=pendulum.now('Asia/Kolkata')
     # trigger gate (config-driven): DAG ticks hourly, fires only at trigger_hour (weekly also on weekly_day)
     if not FORCE_RUN:
