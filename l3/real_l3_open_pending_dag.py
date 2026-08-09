@@ -37,11 +37,15 @@ from airflow.operators.python import PythonOperator
 logger = logging.getLogger(__name__)
 
 # ==================== CONFIG ====================
-from utils.slack.slack_config import SLACK_BOT_TOKEN_ALERTS as SLACK_BOT_TOKEN
+from utils.slack import RedashClient
+from utils.slack.slack_config import SLACK_BOT_TOKEN_ALERTS as SLACK_BOT_TOKEN, REDASH_API_KEY, REDASH_BASE_URL
 from utils.slack.slack_client import SlackNotifier
 from utils.slack.bigquery_client import get_bigquery_client
 
 SLACK_CHANNEL_ID = os.getenv('REAL_L3_SLACK_CHANNEL', 'C0B4CHB1PRD')  # #daily-report-l3-escalations; override via env if needed
+# Team Untagged tickets post to a separate channel; defaults to the main channel until a dedicated one is set
+UNTAGGED_SLACK_CHANNEL_ID = os.getenv('REAL_L3_UNTAGGED_CHANNEL', 'C0B7TBXP60M')  # fallback if config unavailable
+CONFIG_QUERY_ID = 43625   # [RealL3] config: main_channel_id / untagged_channel_id (edit in Redash, no code push)
 
 # real_l3 tag (Trinity, non-archived, singleton)
 REAL_L3_TAG_ID = '6a1f2e835ad901b459b7665f'
@@ -320,7 +324,15 @@ def run_real_l3_to_slack(**context):
     logger.info("=" * 60)
 
     bq_client = get_bigquery_client()
-    notifier  = SlackNotifier(SLACK_BOT_TOKEN, SLACK_CHANNEL_ID)
+    # channels from Redash config (precedence: env override > config query > built-in default)
+    cfg = {}
+    try:
+        cfg = (RedashClient(api_key=REDASH_API_KEY, base_url=REDASH_BASE_URL).fetch_query_results(query_id=CONFIG_QUERY_ID, max_retries=3) or [{}])[0]
+    except Exception as e:
+        logger.warning("config query %s fetch failed, using defaults: %s", CONFIG_QUERY_ID, e)
+    main_channel     = os.getenv('REAL_L3_SLACK_CHANNEL') or cfg.get('main_channel_id') or SLACK_CHANNEL_ID
+    untagged_channel = os.getenv('REAL_L3_UNTAGGED_CHANNEL') or cfg.get('untagged_channel_id') or UNTAGGED_SLACK_CHANNEL_ID
+    notifier  = SlackNotifier(SLACK_BOT_TOKEN, main_channel)
 
     logger.info("[1] Querying BigQuery for real_l3 tickets...")
     try:
@@ -343,31 +355,33 @@ def run_real_l3_to_slack(**context):
     } for row in results]
     logger.info(f"      ✓ Got {len(rows)} rows")
 
-    logger.info("[2] Building parent + thread messages...")
-    open_msg, pending_msg, n_open, n_pending = build_slack_message(rows)
+    logger.info("[2] Partitioning by team (Team Untagged -> separate channel)...")
+    def _is_untagged(r):
+        t = (r.get("team") or "").strip()
+        return t in ("", "-", "\u2014", "\u2013", "Team Untagged")
+    untagged_rows = [r for r in rows if _is_untagged(r)]
+    main_rows     = [r for r in rows if not _is_untagged(r)]
+    logger.info("      main=%d untagged=%d", len(main_rows), len(untagged_rows))
 
-    logger.info(f"[3] Posting parent (OPEN: {n_open}) to {SLACK_CHANNEL_ID}...")
-    parent = notifier.send_message(
-        open_msg,
-        mrkdwn=True,
-        unfurl_links=False,
-        unfurl_media=False,
-    )
-    parent_ts = parent.get("ts")
-    logger.info(f"      ✓ Parent posted ts={parent_ts}")
+    def _post(channel, rowset, label):
+        o_msg, p_msg, n_o, n_p = build_slack_message(rowset)
+        if not o_msg:
+            logger.info("      %s: nothing to post", label); return
+        nt = SlackNotifier(SLACK_BOT_TOKEN, channel)
+        parent = nt.send_message(o_msg, mrkdwn=True, unfurl_links=False, unfurl_media=False)
+        pts = parent.get("ts")
+        logger.info("      %s -> %s: parent posted (OPEN %d) ts=%s", label, channel, n_o, pts)
+        if p_msg:
+            nt.send_message(p_msg, thread_ts=pts, mrkdwn=True, unfurl_links=False, unfurl_media=False)
+            logger.info("      %s -> %s: pending thread posted (PENDING %d)", label, channel, n_p)
 
-    if pending_msg:
-        logger.info(f"[4] Posting thread reply (PENDING: {n_pending})...")
-        notifier.send_message(
-            pending_msg,
-            thread_ts=parent_ts,
-            mrkdwn=True,
-            unfurl_links=False,
-            unfurl_media=False,
-        )
-        logger.info("      ✓ Pending thread reply posted")
+    logger.info("[3] Posting main (excl. Team Untagged) -> %s", main_channel)
+    _post(main_channel, main_rows, "main")
+    logger.info("[4] Posting Team Untagged -> %s", untagged_channel)
+    if untagged_rows:
+        _post(untagged_channel, untagged_rows, "untagged")
     else:
-        logger.info("[4] No pending tickets — skipping thread reply")
+        logger.info("      no Team Untagged tickets")
 
     logger.info("=" * 60)
     logger.info("REAL_L3 OPEN/PENDING: COMPLETE")
