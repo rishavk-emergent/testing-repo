@@ -87,6 +87,9 @@ def tiles_for(seg):
     if seg=='Human':
         tat={'label':'TAT P75 · CREATED→HUMAN FRT','top':('tat','frt_p75'),'prev':'frt_prev','dir':'low',
              'sub':[('created→ow','tat','ow_p75'),('esc→human frt','tat','hufrt_p75')]}
+    elif seg=='OW':
+        tat={'label':'TAT P75 · CREATED→OW','top':('tat','ow_p75'),'prev':'ow_prev','dir':'low',
+             'sub':[('p50','tat','ow_p50')]}
     else:
         tat={'label':'TAT P75 · CREATED→CLOSED','top':('tat','res_p75'),'prev':'res_prev','dir':'low',
              'sub':[('p50','tat','res_p50')]}
@@ -185,7 +188,7 @@ def render_report(by, period, mode='daily'):
                 text(lxx,sy,'%s  %s'%(_FMT[sf](row.get(sk)),cap),13,color=SUBD); sy+=22
         d.rounded_rectangle([_px(chart_x),_px(tiy),_px(chart_x+chart_w),_px(tiy+CONTENT_H)],
                             radius=_px(9),fill=_rgb(CARD),outline=_rgb(TILELINE),width=SS)
-        ctitle='p50 · created→human FRT' if seg=='Human' else 'p50 · created→closed'
+        ctitle='p50 · created→human FRT' if seg=='Human' else ('p50 · created→OW' if seg=='OW' else 'p50 · created→closed')
         spark(chart_x+14,tiy+10,chart_w-28,CONTENT_H-20,row,accent,ctitle)
         ty=tiy+CONTENT_H+ROW_GAP
 
