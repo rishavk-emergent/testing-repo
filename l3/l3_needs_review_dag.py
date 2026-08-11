@@ -1,16 +1,26 @@
 """
-L3 Needs Review Tickets — Slack DAG (daily, IST)
+L3 Needs Review Tickets — Slack DAG (twice daily, IST)
 
-Standalone DAG: twice a day it queries Trinity for currently OPEN/PENDING tickets
-at level L3 tagged `needs_review`, and posts a single flat list (oldest first)
-to the #daily-report-l3-escalations channel. No team grouping / thread (source has only
-date, ticket number, link and status).
+Standalone DAG: twice a day it posts the currently OPEN/PENDING tickets at level L3
+tagged `needs_review` as a single flat list (oldest first) to Slack.
 
-Schedule: '30 11,23 * * *' interpreted in Asia/Kolkata -> 11:30 AM and 11:30 PM IST.
-Data source: trinity_database.v_tickets (real-time Trinity view in BigQuery).
-Filter: level='L3' AND status IN ('OPEN','PENDING') AND needs_review tag in tag_ids.
-        needs_review tag _id = '6a1e3f824898b62618ffd100'.
-Triggers: NONE. Fully self-scheduled; not wired to any other DAG.
+CONFIG LIVES IN REDASH (edit there, no code push):
+  - Data   #43946  [L3 Needs Review] data   -> date / ticket_number / ticket_url / status
+           (the L3 + OPEN/PENDING + needs_review-tag filter that used to be inline here;
+            needs_review tag _id = '6a1e3f824898b62618ffd100')
+  - Config #43945  [L3 Needs Review] config -> channel_id, trigger_hours
+           channel_id     = Slack channel to post to (default #daily-report-l3-escalations)
+           trigger_hours  = CSV of IST hours to fire (e.g. '11,23')
+
+Schedule: Airflow ticks HOURLY at :30 ('30 * * * *' IST). The task fires only when the
+current IST hour is in trigger_hours -> so '11,23' reproduces 11:30 AM / 11:30 PM IST.
+Change the fire hours or the channel in Redash #43945; change the ticket filter in #43946.
+No code push needed for any of those.
+
+Env overrides (tests): L3_NEEDS_REVIEW_SLACK_CHANNEL redirects the channel;
+L3_NEEDS_REVIEW_FORCE_RUN=1 bypasses the trigger-hour gate.
+
+Data source: trinity_database.v_tickets (real-time Trinity view in BigQuery), read via Redash.
 Output: one Slack message — each ticket shown with date, age, Trinity link, status.
 """
 
@@ -25,39 +35,29 @@ from airflow.operators.python import PythonOperator
 logger = logging.getLogger(__name__)
 
 # ==================== CONFIG ====================
-from utils.slack.slack_config import SLACK_BOT_TOKEN_ALERTS as SLACK_BOT_TOKEN
+from utils.slack import RedashClient
+from utils.slack.slack_config import (
+    REDASH_API_KEY,
+    REDASH_BASE_URL,
+    SLACK_BOT_TOKEN_ALERTS as SLACK_BOT_TOKEN,
+)
 from utils.slack.slack_client import SlackNotifier
-from utils.slack.bigquery_client import get_bigquery_client
 
-SLACK_CHANNEL_ID = os.getenv('L3_NEEDS_REVIEW_SLACK_CHANNEL', 'C0B4CHB1PRD')  # #daily-report-l3-escalations; override via env if needed
+# Redash queries (all editable knobs live here — no code push):
+DATA_QUERY_ID   = 43946   # [L3 Needs Review] data   -> ticket rows
+CONFIG_QUERY_ID = 43945   # [L3 Needs Review] config -> channel_id, trigger_hours
 
-# needs_review tag (Trinity)
-NEEDS_REVIEW_TAG_ID = '6a1e3f824898b62618ffd100'
+DEFAULT_CHANNEL_ID = 'C0B4CHB1PRD'  # #daily-report-l3-escalations (fallback if config unreadable)
+DEFAULT_TRIGGER_HOURS = '11,23'     # IST hours to fire (fallback)
+
+# env overrides (tests): redirect channel / bypass the trigger-hour gate
+ENV_CHANNEL = os.getenv('L3_NEEDS_REVIEW_SLACK_CHANNEL')
+FORCE_RUN   = os.getenv('L3_NEEDS_REVIEW_FORCE_RUN') == '1'
 
 # Trinity bucket the message header links to (live needs-review view)
 TRINITY_BUCKET_URL = 'https://trinity-base.internal.emergent.host/tickets?bucket=6a1ee9ad5ad901b459b740b0'
 
 IST = timezone(timedelta(hours=5, minutes=30))
-
-# ==================== BIGQUERY QUERY ====================
-# v_tickets is versioned (every change appends a row); dedupe per _id.
-QUERY = f"""
-WITH latest_tickets AS (
-  SELECT *
-  FROM `emergent-default.trinity_database.v_tickets`
-  QUALIFY ROW_NUMBER() OVER (PARTITION BY _id ORDER BY source_timestamp DESC) = 1
-)
-SELECT
-  DATE(t.created_at) AS date,
-  CAST(t.num AS INT64) AS ticket_number,
-  CONCAT('https://trinity-base.internal.emergent.host/tickets/', t._id) AS ticket_url,
-  t.status
-FROM latest_tickets t
-WHERE t.level = 'L3'
-  AND UPPER(t.status) IN ('OPEN','PENDING')
-  AND '{NEEDS_REVIEW_TAG_ID}' IN UNNEST(t.tag_ids)
-ORDER BY t.created_at DESC
-"""
 
 
 # ==================== MESSAGE BUILDER ====================
@@ -79,7 +79,7 @@ def _format_date_display(date_str):
 
 def build_slack_message(rows: list) -> tuple:
     """
-    Build a single Slack message from the BigQuery rows.
+    Build a single Slack message from the Redash data rows.
 
     Each row dict has: date (str 'YYYY-MM-DD'), ticket_number, ticket_url, status.
     Returns: (message, ticket_count). Flat list (no team grouping), oldest first.
@@ -94,11 +94,17 @@ def build_slack_message(rows: list) -> tuple:
         ds = (r.get("date") or "").strip()
         date_sort = _parse_date_for_sort(ds)
         age_days = (today_ist - date_sort).days if date_sort != datetime.max.date() else 0
+        # ticket_number comes back from Redash JSON as a float — render as int
+        tn = r.get("ticket_number")
+        try:
+            ticket = str(int(float(tn))) if tn is not None and str(tn).strip() != "" else ""
+        except (TypeError, ValueError):
+            ticket = str(tn).strip()
         parsed.append({
             "date_display": _format_date_display(ds),
             "date_sort":    date_sort,
             "age_days":     age_days,
-            "ticket":       str(r.get("ticket_number", "")).strip(),
+            "ticket":       ticket,
             "url":          (r.get("ticket_url") or "").strip(),
             "status":       status,
         })
@@ -129,38 +135,48 @@ def build_slack_message(rows: list) -> tuple:
 
 def run_l3_needs_review_to_slack(**context):
     """
-    1. Query BigQuery for needs_review OPEN/PENDING L3 tickets.
-    2. Build a single flat-list Slack message.
-    3. Post it via SlackNotifier (shared bot token).
+    1. Read config (channel + trigger_hours) from Redash #43945; gate on the IST hour.
+    2. Fetch needs_review OPEN/PENDING L3 tickets from Redash #43946.
+    3. Build a single flat-list Slack message and post it via SlackNotifier.
     """
     logger.info("=" * 60)
     logger.info("L3 NEEDS REVIEW: QUERY & PUSH TO SLACK")
     logger.info("=" * 60)
 
-    bq_client = get_bigquery_client()
-    notifier  = SlackNotifier(SLACK_BOT_TOKEN, SLACK_CHANNEL_ID)
+    redash = RedashClient(api_key=REDASH_API_KEY, base_url=REDASH_BASE_URL)
 
-    logger.info("[1] Querying BigQuery for needs_review tickets...")
+    # [1] Config + trigger gate
+    cfg = (redash.fetch_query_results(query_id=CONFIG_QUERY_ID, max_retries=3) or [{}])[0]
+    channel = ENV_CHANNEL or cfg.get('channel_id') or DEFAULT_CHANNEL_ID
     try:
-        results = bq_client.query(QUERY).result()
+        hours = {int(str(h).strip()) for h in str(cfg.get('trigger_hours') or DEFAULT_TRIGGER_HOURS).split(',') if str(h).strip() != ''}
+    except (TypeError, ValueError):
+        hours = {int(h) for h in DEFAULT_TRIGGER_HOURS.split(',')}
+
+    now_ist = pendulum.now('Asia/Kolkata')
+    if not FORCE_RUN and now_ist.hour not in hours:
+        logger.info("L3 needs review: IST hour %d not in trigger_hours %s -> skip", now_ist.hour, sorted(hours))
+        return
+    logger.info("[gate] hour=%d trigger_hours=%s force=%s channel=%s", now_ist.hour, sorted(hours), FORCE_RUN, channel)
+
+    # [2] Data
+    logger.info("[1] Fetching needs_review tickets from Redash #%d...", DATA_QUERY_ID)
+    try:
+        rows = redash.fetch_query_results(query_id=DATA_QUERY_ID, max_retries=3) or []
     except Exception as e:
-        logger.error(f"      BigQuery query failed: {e}")
-        notifier.send_message(f"🚨 *L3 Needs Review Error*\n\nBigQuery query failed: {str(e)[:300]}")
+        logger.error("      Redash data fetch failed: %s", e)
+        SlackNotifier(SLACK_BOT_TOKEN, channel).send_message(
+            f"🚨 *L3 Needs Review Error*\n\nRedash data fetch failed: {str(e)[:300]}"
+        )
         raise
+    logger.info("      ✓ Got %d rows", len(rows))
 
-    rows = [{
-        "date":          row.date.isoformat() if row.date else "",
-        "ticket_number": row.ticket_number,
-        "ticket_url":    row.ticket_url,
-        "status":        row.status,
-    } for row in results]
-    logger.info(f"      ✓ Got {len(rows)} rows")
-
+    # [3] Build + post
     logger.info("[2] Building Slack message...")
     message, total = build_slack_message(rows)
 
-    logger.info(f"[3] Posting ({total} tickets) to {SLACK_CHANNEL_ID}...")
-    notifier.send_message(
+    logger.info("[3] Posting (%d tickets) to %s...", total, channel)
+    SlackNotifier(SLACK_BOT_TOKEN, channel).send_message(
         message,
         mrkdwn=True,
         unfurl_links=False,
@@ -186,10 +202,10 @@ default_args = {
 dag = DAG(
     'l3_needs_review_slack',
     default_args=default_args,
-    description='Post L3 needs-review OPEN/PENDING tickets to Slack twice a day IST',
-    schedule_interval='30 11,23 * * *',  # 11:30 AM and 11:30 PM IST
+    description='Post L3 needs-review OPEN/PENDING tickets to Slack; channel + fire hours from Redash #43945, data from #43946',
+    schedule_interval='30 * * * *',  # hourly tick at :30 IST; task self-gates on config trigger_hours
     catchup=False,
-    is_paused_upon_creation=False,  # deploy active so it fires on the next schedule without a manual unpause
+    is_paused_upon_creation=False,  # deploy active so it fires on the next scheduled tick
     tags=['slack', 'trinity', 'l3', 'needs_review', 'reporting', 'cs_team'],
 )
 
