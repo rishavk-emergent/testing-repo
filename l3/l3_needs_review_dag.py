@@ -22,6 +22,9 @@ L3_NEEDS_REVIEW_FORCE_RUN=1 bypasses the trigger-hour gate.
 
 Data source: trinity_database.v_tickets (real-time Trinity view in BigQuery), read via Redash.
 Output: one Slack message — each ticket shown with date, age, Trinity link, status.
+On a Redash failure the task posts NOTHING and raises (Airflow retries); a genuine zero-ticket
+day still posts the "0 needs review" all-clear. See the [2] Data block for how the two are told
+apart (the data query always returns >=1 row).
 """
 
 from datetime import datetime, timedelta, timezone
@@ -145,7 +148,9 @@ def run_l3_needs_review_to_slack(**context):
 
     redash = RedashClient(api_key=REDASH_API_KEY, base_url=REDASH_BASE_URL)
 
-    # [1] Config + trigger gate
+    # [1] Config + trigger gate. Config uses defaults on failure (not raise) so a Redash blip
+    # on a NON-trigger hourly tick just skips quietly instead of flooding Airflow with retries;
+    # if Redash is truly down at a trigger hour, the [2] data fetch below fails and raises anyway.
     cfg = (redash.fetch_query_results(query_id=CONFIG_QUERY_ID, max_retries=3) or [{}])[0]
     channel = ENV_CHANNEL or cfg.get('channel_id') or DEFAULT_CHANNEL_ID
     try:
@@ -159,16 +164,16 @@ def run_l3_needs_review_to_slack(**context):
         return
     logger.info("[gate] hour=%d trigger_hours=%s force=%s channel=%s", now_ist.hour, sorted(hours), FORCE_RUN, channel)
 
-    # [2] Data
+    # [2] Data. RedashClient returns None on a hard failure (it never raises). On failure we
+    # post NOTHING and raise so Airflow retries -- never a false "0 needs review" all-clear.
+    # #43946 always returns >=1 row (single-row anchor), so None here unambiguously means the
+    # fetch failed, not that there are zero tickets (a genuine empty day is one all-NULL row,
+    # which build_slack_message drops on the OPEN/PENDING status check -> "0 needs review").
     logger.info("[1] Fetching needs_review tickets from Redash #%d...", DATA_QUERY_ID)
-    try:
-        rows = redash.fetch_query_results(query_id=DATA_QUERY_ID, max_retries=3) or []
-    except Exception as e:
-        logger.error("      Redash data fetch failed: %s", e)
-        SlackNotifier(SLACK_BOT_TOKEN, channel).send_message(
-            f"🚨 *L3 Needs Review Error*\n\nRedash data fetch failed: {str(e)[:300]}"
-        )
-        raise
+    rows = redash.fetch_query_results(query_id=DATA_QUERY_ID, max_retries=3)
+    if rows is None:
+        logger.error("Redash data fetch failed (#%d) -- posting nothing; raising for Airflow retry", DATA_QUERY_ID)
+        raise RuntimeError(f"Redash data fetch failed for query #{DATA_QUERY_ID}")
     logger.info("      ✓ Got %d rows", len(rows))
 
     # [3] Build + post
