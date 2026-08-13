@@ -167,9 +167,9 @@ def write_xlsx(sheets, path):
 # ==================== REPORT BUILDER ====================
 TIERS = [('TOTAL', 'TOTAL (L1+L2+Expo)'), ('L1', 'L1'), ('L2', 'L2 (excl. Expo)'), ('Expo', 'Expo (L2 · mobile)')]
 # one tab per cohort: (cohort key, tab name <=31 chars, title-line sub)
-COH_TABS = [('ALL', 'Power Users', 'POWER USERS  ·  LTV ≥ $300'), ('A', 'Cohort A', 'COHORT A  ·  LTV ≥ $10k'),
-            ('B', 'Cohort B', 'COHORT B  ·  LTV $5k – $10k'), ('C', 'Cohort C', 'COHORT C  ·  LTV $1k – $5k'),
-            ('D', 'Cohort D', 'COHORT D  ·  LTV $300 – $1k')]
+COH_TABS = [('ALL', 'Power Users (LTV≥$300)', 'POWER USERS  ·  LTV ≥ $300'), ('A', 'Cohort A (LTV≥$10k)', 'COHORT A  ·  LTV ≥ $10k'),
+            ('B', 'Cohort B (LTV $5k-$10k)', 'COHORT B  ·  LTV $5k – $10k'), ('C', 'Cohort C (LTV $1k-$5k)', 'COHORT C  ·  LTV $1k – $5k'),
+            ('D', 'Cohort D (LTV $300-$1k)', 'COHORT D  ·  LTV $300 – $1k')]
 # always-visible headline rows, then the collapsed (click-to-expand) detail rows
 VISIBLE = [('Incoming', 'incoming', 'int'), ('p75 Created→Human frt', 'frt_p75', 'hm'),
            ('CSAT % Human', 'csat_pos_hu', 'pct'), ('Reopen Rate %', 'reopen_rate', 'pct')]
