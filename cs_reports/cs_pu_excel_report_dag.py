@@ -90,7 +90,10 @@ def _colref(c):
 
 class Sheet:
     def __init__(self, name):
-        self.name = name; self.rows = {}; self.merges = []; self.widths = {}
+        self.name = name; self.rows = {}; self.merges = []; self.widths = {}; self.rowopts = {}
+
+    def rowopt(self, r, level=0, hidden=False, collapsed=False):
+        self.rowopts[r] = (level, hidden, collapsed)
 
     def cell(self, r, c, value, style='def'):
         self.rows.setdefault(r, {})[c] = (value, style)
@@ -116,12 +119,17 @@ class Sheet:
                 else:
                     cells.append('<c r="%s" s="%d" t="inlineStr"><is><t xml:space="preserve">%s</t></is></c>'
                                  % (ref, s, escape('' if v is None else str(v))))
-            body.append('<row r="%d">%s</row>' % (r, ''.join(cells)))
+            lv, hd, cl = self.rowopts.get(r, (0, False, False))
+            attr = (' outlineLevel="%d"' % lv if lv else '') + (' hidden="1"' if hd else '') + (' collapsed="1"' if cl else '')
+            body.append('<row r="%d"%s>%s</row>' % (r, attr, ''.join(cells)))
         mg = ('<mergeCells count="%d">%s</mergeCells>' % (len(self.merges),
               ''.join('<mergeCell ref="%s"/>' % m for m in self.merges))) if self.merges else ''
+        outlined = any(o[0] for o in self.rowopts.values())
+        pr = '<sheetPr><outlinePr summaryBelow="0"/></sheetPr>' if outlined else ''
+        fmt = '<sheetFormatPr defaultRowHeight="15" outlineLevelRow="1"/>' if outlined else ''
         return ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
                 '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
-                + cols + '<sheetData>' + ''.join(body) + '</sheetData>' + mg + '</worksheet>')
+                + pr + fmt + cols + '<sheetData>' + ''.join(body) + '</sheetData>' + mg + '</worksheet>')
 
 
 def write_xlsx(sheets, path):
@@ -157,23 +165,16 @@ def write_xlsx(sheets, path):
     return path
 
 # ==================== REPORT BUILDER ====================
-COH = [('ALL', 'POWER USERS', 'LTV ≥ $300'), ('A', 'COHORT A', 'LTV ≥ $10k'),
-       ('B', 'COHORT B', 'LTV $5k – $10k'), ('C', 'COHORT C', 'LTV $1k – $5k'),
-       ('D', 'COHORT D', 'LTV $300 – $1k')]
 TIERS = [('TOTAL', 'TOTAL (L1+L2+Expo)'), ('L1', 'L1'), ('L2', 'L2 (excl. Expo)'), ('Expo', 'Expo (L2 · mobile)')]
-SNAP = [('Tier', None, None, None, None), ('Incoming', 'incoming', 'int', 'incoming_prev', 'neutral'),
-        ('Δ%', None, 'd', ('incoming', 'incoming_prev', 'neutral'), None), ('Closed', 'closed', 'int', None, None),
-        ('p75 Created→Human frt', 'frt_p75', 'hm', 'frt_prev', 'low'),
-        ('Δ%', None, 'd', ('frt_p75', 'frt_prev', 'low'), None),
-        ('p75 Created→OW', 'ow_p75', 'hm', None, None), ('p75 Esc→Human FRT', 'hufrt_p75', 'hm', None, None),
-        ('CSAT % Human', 'csat_pos_hu', 'pct', 'csat_prev', 'high'), ('Δ%', None, 'd', ('csat_pos_hu', 'csat_prev', 'high'), None),
-        ('Responses (n)', 'csat_n_hu', 'int', None, None), ('Reopen Rate %', 'reopen_rate', 'pct', 'reopen_prev', 'low'),
-        ('Δ%', None, 'd', ('reopen_rate', 'reopen_prev', 'low'), None), ('Reopens (n)', 'reopen_n', 'int', None, None)]
-METRICS = [('Incoming', 'incoming', 'int'), ('Closed', 'closed', 'int'),
-           ('p75 Created→Human frt', 'frt_p75', 'hm'), ('p75 Created→OW', 'ow_p75', 'hm'),
-           ('p75 Esc→Human FRT', 'hufrt_p75', 'hm'), ('CSAT % Human', 'csat_pos_hu', 'pct'),
-           ('Responses (n)', 'csat_n_hu', 'int'), ('Reopen Rate %', 'reopen_rate', 'pct'),
-           ('Reopens (n)', 'reopen_n', 'int')]
+# one tab per cohort: (cohort key, tab name <=31 chars, title-line sub)
+COH_TABS = [('ALL', 'Power Users', 'POWER USERS  ·  LTV ≥ $300'), ('A', 'Cohort A', 'COHORT A  ·  LTV ≥ $10k'),
+            ('B', 'Cohort B', 'COHORT B  ·  LTV $5k – $10k'), ('C', 'Cohort C', 'COHORT C  ·  LTV $1k – $5k'),
+            ('D', 'Cohort D', 'COHORT D  ·  LTV $300 – $1k')]
+# always-visible headline rows, then the collapsed (click-to-expand) detail rows
+VISIBLE = [('Incoming', 'incoming', 'int'), ('p75 Created→Human frt', 'frt_p75', 'hm'),
+           ('CSAT % Human', 'csat_pos_hu', 'pct'), ('Reopen Rate %', 'reopen_rate', 'pct')]
+DETAIL = [('Closed', 'closed', 'int'), ('p75 Created→OW', 'ow_p75', 'hm'),
+          ('p75 Esc→Human FRT', 'hufrt_p75', 'hm'), ('Responses (n)', 'csat_n_hu', 'int'), ('Reopens (n)', 'reopen_n', 'int')]
 
 
 def _n(v):
@@ -224,57 +225,43 @@ def _week_range(wk):
     return '%s - %s' % (s.strftime('%d/%m'), e.strftime('%d/%m'))
 
 
-def build_report(snap_rows, series_rows, path):
-    snap = {(r['cohort'], r['tier']): r for r in snap_rows if r.get('mode') == 'weekly'}
-    ncol = len(SNAP)
-    w1 = Sheet('Weekly')
-    w1.cell(1, 1, 'POWER-USER SUCCESS REPORT — WEEKLY (latest full week)  ·  LTV cohorts, Trinity  ·  TAT = p75', 'title')
-    w1.merge(1, 1, ncol); w1.width(1, 20)
-    for i in range(2, ncol + 1):
-        w1.width(i, 11)
-    rr = 3
-    for cid, ctitle, csub in COH:
-        w1.cell(rr, 1, '%s  ·  %s' % (ctitle, csub), 'section'); w1.merge(rr, 1, ncol); rr += 1
-        for i, col in enumerate(SNAP, 1):
-            w1.cell(rr, i, col[0], 'header' if i > 1 else 'tier')
-        rr += 1
-        for tid, tlabel in TIERS:
-            row = snap.get((cid, tid), {})
-            w1.cell(rr, 1, tlabel, 'bold')
-            for i, (h, key, fmt, extra, direction) in enumerate(SNAP, 1):
-                if i == 1:
-                    continue
-                if fmt == 'd':
-                    ck, pk, d = extra; _delta(w1, rr, i, row.get(ck), row.get(pk), d)
-                else:
-                    _put(w1, rr, i, _n(row.get(key)), fmt)
-            rr += 1
-        rr += 1
+def build_report(series_rows, path):
+    """One tab per cohort; each tab has the 4 tier blocks as a WoW trend (latest week left).
+    Headline rows always show; the 5 detail rows are collapsed behind an Excel row-group (click + to expand)."""
     weeks = sorted({r['wk'] for r in series_rows}, reverse=True)
     wlabel = {wk: _week_range(wk) for wk in weeks}
     idx = {(r['cohort'], r['tier'], r['wk']): r for r in series_rows}
     tcol = 1 + len(weeks)
-    w2 = Sheet('Weekly Trends (WoW)')
-    w2.cell(1, 1, 'WEEKLY TRENDS (WoW) — %d full weeks (latest left) · all metrics · TAT = p75' % len(weeks), 'title')
-    w2.merge(1, 1, tcol); w2.width(1, 24)
-    for i in range(2, tcol + 1):
-        w2.width(i, 13)
-    rr = 3
-    for cid, ctitle, csub in COH:
-        w2.cell(rr, 1, '%s  ·  %s' % (ctitle, csub), 'section'); w2.merge(rr, 1, tcol); rr += 1
+    sheets = []
+    for cid, tab, title in COH_TABS:
+        ws = Sheet(tab)
+        ws.cell(1, 1, 'POWER-USER SUCCESS REPORT — %s  ·  WoW (latest left) · TAT p75 · click + on the left to expand detail rows' % title, 'title')
+        ws.merge(1, 1, tcol); ws.width(1, 24)
+        for i in range(2, tcol + 1):
+            ws.width(i, 13)
+        rr = 3
         for tid, tlabel in TIERS:
-            w2.cell(rr, 1, tlabel, 'tier'); w2.merge(rr, 1, tcol); rr += 1
-            w2.cell(rr, 1, 'Metric \\ Week', 'header')
+            ws.cell(rr, 1, tlabel, 'section'); ws.merge(rr, 1, tcol); rr += 1
+            ws.cell(rr, 1, 'Metric \\ Week', 'header')
             for j, wk in enumerate(weeks, 2):
-                w2.cell(rr, j, wlabel[wk], 'header')
+                ws.cell(rr, j, wlabel[wk], 'header')
             rr += 1
-            for mlabel, mkey, mfmt in METRICS:
-                w2.cell(rr, 1, mlabel, 'bold')
+            for k, (mlabel, mkey, mfmt) in enumerate(VISIBLE):
+                ws.cell(rr, 1, mlabel, 'bold')
                 for j, wk in enumerate(weeks, 2):
-                    _put(w2, rr, j, _n(idx.get((cid, tid, wk), {}).get(mkey)), mfmt)
+                    _put(ws, rr, j, _n(idx.get((cid, tid, wk), {}).get(mkey)), mfmt)
+                if k == len(VISIBLE) - 1:
+                    ws.rowopt(rr, collapsed=True)   # summary row sits above the collapsed detail group
+                rr += 1
+            for mlabel, mkey, mfmt in DETAIL:
+                ws.cell(rr, 1, mlabel, 'bold')
+                for j, wk in enumerate(weeks, 2):
+                    _put(ws, rr, j, _n(idx.get((cid, tid, wk), {}).get(mkey)), mfmt)
+                ws.rowopt(rr, level=1, hidden=True)   # collapsed by default
                 rr += 1
             rr += 1
-    return write_xlsx([w1, w2], path)
+        sheets.append(ws)
+    return write_xlsx(sheets, path)
 
 # ==================== SLACK (stdlib) ====================
 def _sl(method, data, get=False):
@@ -343,14 +330,13 @@ def run_pu_excel(**context):
             logger.info('CS PU Excel: hour %d != trigger_hour %d -> skip', now.hour, th); return
         if now.format('dddd').lower() != str(cfg.get('weekly_day', 'monday')).strip().lower():
             logger.info('CS PU Excel: %s != weekly_day %s -> skip', now.format('dddd'), cfg.get('weekly_day')); return
-    snap = redash.fetch_query_results(query_id=int(cfg['snapshot_query_id']), max_retries=3) or []
     series = redash.fetch_query_results(query_id=int(cfg['series_query_id']), max_retries=3) or []
-    if not snap or not series:
-        raise Exception('empty rows: snapshot=%d series=%d' % (len(snap), len(series)))
+    if not series:
+        raise Exception('empty series rows from query %s' % cfg.get('series_query_id'))
     title = cfg.get('file_title', 'Power-User Success Report (weekly)')
     do_pin = str(cfg.get('do_pin', True)).lower() not in ('false', '0', 'no', '')
     path = '/tmp/pu_excel_report.xlsx'
-    build_report(snap, series, path)
+    build_report(series, path)
 
     # ---- replace-in-place using our own state (Airflow Variable) ----
     prev = None
