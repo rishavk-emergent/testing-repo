@@ -82,8 +82,9 @@ def _floats(csv):
 
 # ==================== SPEC ====================
 ROWS=[('Overall','OVERALL','all Prod SOS'),('OW','OVERWATCH','auto-resolved'),('Human','HUMAN','escalated to human')]
-def tiles_for(seg):
+def tiles_for(seg, mode='daily'):
     inc_cap = 'of all tickets' if seg=='Overall' else 'of Prod SOS'
+    win = 'week' if mode=='weekly' else '7d'   # CSAT/Reopen window
     if seg=='Human':
         tat={'label':'TAT P75 · CREATED→HUMAN FRT','top':('tat','frt_p75'),'prev':'frt_prev','dir':'low',
              'sub':[('created→ow','tat','ow_p75'),('esc→human frt','tat','hufrt_p75')]}
@@ -93,8 +94,8 @@ def tiles_for(seg):
     return [
         {'label':'INCOMING','top':('int','incoming'),'prev':'incoming_prev','dir':'neutral','sub':[(inc_cap,'pct','incoming_pct')]},
         tat,
-        {'label':'CSAT % POSITIVE','top':('pct','csat_pos_pct'),'prev':'csat_prev','dir':'high','sub':[('positive','int','csat_pos_n')]},
-        {'label':'REOPEN RATE','top':('pct','reopen_rate'),'prev':'reopen_prev','dir':'low','sub':[('reopens','int','reopen_n')]},
+        {'label':'CSAT %% POSITIVE (%s)'%win,'top':('pct','csat_pos_pct'),'prev':'csat_prev','dir':'high','sub':[('positive','int','csat_pos_n')]},
+        {'label':'REOPEN RATE (%s)'%win,'top':('pct','reopen_rate'),'prev':'reopen_prev','dir':'low','sub':[('reopens','int','reopen_n')]},
     ]
 
 # ==================== GEOMETRY ====================
@@ -113,30 +114,37 @@ def render_report(by, period, mode='daily'):
         d.text((_px(x),_px(y)),s,font=_font(bold,_px(px)),fill=_rgb(color),anchor=anchor)
     def tw(s,px,bold=False):
         return d.textlength(s,font=_font(bold,_px(px)))/SS
-    def spark(x0,y0,w,h,row,color,title):
-        labels=(row.get('trend_labels') or '').split(',')
-        arr=_floats(row.get('trend_tat'))
-        allv=[v for v in arr if v is not None]
-        px0,py0,px1,py1=x0+52,y0+22,x0+w,y0+h-20
+    def _fmtv(fmt,v): return _fmt_tat(v) if fmt=='tat' else _fmt_int(v)
+    def chart(x0,y0,w,h,title,series,fmt='int'):
+        # series: list of (label, [values], color); multi-line, y-axis formatted by `fmt`
         text(x0,y0+6,title,10,color=MUTE)
+        allv=[v for _,arr,_ in series for v in arr if v is not None]
+        px0,py0,px1,py1=x0+52,y0+26,x0+w,y0+h-20
         if not allv:
             text((px0+px1)/2,(py0+py1)/2,'no data',11,color=MUTE,anchor='mm'); return
         ymax=max(allv); ymax=ymax if ymax>0 else 1
-        n=max(len(labels),2)
+        n=max(max((len(arr) for _,arr,_ in series), default=2),2)
         X=lambda i: px0+(px1-px0)*(i/(n-1))
         Y=lambda v: py1-(py1-py0)*(min(v,ymax)/ymax)
         for gv in (0,ymax/2,ymax):
             yy=Y(gv); d.line([(_px(px0),_px(yy)),(_px(px1),_px(yy))],fill=_rgb(GRID),width=SS)
-            text(px0-8,yy,_fmt_tat(gv),9.5,color=MUTE,anchor='rm')
+            text(px0-8,yy,_fmtv(fmt,gv),9.5,color=MUTE,anchor='rm')
         for i in range(n):
             xx=X(i)
             d.line([(_px(xx),_px(py0)),(_px(xx),_px(py1))],fill=_rgb(GRID),width=SS)
             text(xx,py1+11,'%s%d'%(pfx,n-i),9.5,color=MUTE,anchor='mm')
-        pts=[(X(i),Y(v)) for i,v in enumerate(arr) if v is not None]
-        if len(pts)>=2:
-            d.line([(_px(a),_px(b)) for a,b in pts],fill=_rgb(color),width=_px(2.4),joint='curve')
-        for a,b in pts[-1:]:
-            d.ellipse([_px(a-3.5),_px(b-3.5),_px(a+3.5),_px(b+3.5)],fill=_rgb(color))
+        # legend (top-right), one dot+label per series
+        lx=px1
+        for lab,arr,col in reversed(series):
+            text(lx,y0+6,lab,9.5,color=SUB,anchor='rm'); lw=tw(lab,9.5)
+            d.ellipse([_px(lx-lw-13),_px(y0+6-3.5),_px(lx-lw-6),_px(y0+6+3.5)],fill=_rgb(col))
+            lx=lx-lw-13-12
+        for lab,arr,col in series:
+            pts=[(X(i),Y(v)) for i,v in enumerate(arr) if v is not None]
+            if len(pts)>=2:
+                d.line([(_px(a),_px(b)) for a,b in pts],fill=_rgb(col),width=_px(2.2),joint='curve')
+            for a,b in pts[-1:]:
+                d.ellipse([_px(a-3),_px(b-3),_px(a+3),_px(b+3)],fill=_rgb(col))
 
     # ---- header banner ----
     d.rounded_rectangle([_px(PM),_px(22),_px(W-PM),_px(22+BANNER_H)],radius=_px(16),fill=_rgb(NAVY))
@@ -162,7 +170,7 @@ def render_report(by, period, mode='daily'):
         text(ix,ty+ROW_LABEL_H/2,tlabel,15,bold=True,color=accent)
         if tnote: text(ix+tw(tlabel,15,True)+9,ty+ROW_LABEL_H/2,'('+tnote+')',11,color=MUTE)
         tiy=ty+ROW_LABEL_H
-        for i,tile in enumerate(tiles_for(seg)):
+        for i,tile in enumerate(tiles_for(seg, mode)):
             tx=ix+i*(tile_w+gap)
             d.rounded_rectangle([_px(tx),_px(tiy),_px(tx+tile_w),_px(tiy+CONTENT_H)],
                                 radius=_px(9),fill=_rgb(TILEBG),outline=_rgb(TILELINE),width=SS)
@@ -185,8 +193,18 @@ def render_report(by, period, mode='daily'):
                 text(lxx,sy,'%s  %s'%(_FMT[sf](row.get(sk)),cap),13,color=SUBD); sy+=22
         d.rounded_rectangle([_px(chart_x),_px(tiy),_px(chart_x+chart_w),_px(tiy+CONTENT_H)],
                             radius=_px(9),fill=_rgb(CARD),outline=_rgb(TILELINE),width=SS)
-        ctitle='p50 · created→human FRT' if seg=='Human' else 'p50 · created→closed'
-        spark(chart_x+14,tiy+10,chart_w-28,CONTENT_H-20,row,accent,ctitle)
+        # 3 Human-only charts (DoD view), one per row slot
+        hr=by.get('Human',{}) or {}
+        cx=chart_x+14; cy=tiy+10; cw=chart_w-28; chh=CONTENT_H-20
+        if seg=='Overall':
+            chart(cx,cy,cw,chh,'Human · cases & reopens',
+                  [('cases',_floats(hr.get('h_count')),'#2f6feb'),('reopens',_floats(hr.get('h_reopen')),'#a9c3ef')],'int')
+        elif seg=='OW':
+            chart(cx,cy,cw,chh,'Human · p75 created→human FRT',
+                  [('p75 frt',_floats(hr.get('h_frt')),'#d6336c')],'tat')
+        else:
+            chart(cx,cy,cw,chh,'Human · CSAT positive / negative',
+                  [('pos',_floats(hr.get('h_cpos')),DGOOD),('neg',_floats(hr.get('h_cneg')),DBAD)],'int')
         ty=tiy+CONTENT_H+ROW_GAP
 
     out=img.resize((W*2,total_h*2),Image.LANCZOS)
