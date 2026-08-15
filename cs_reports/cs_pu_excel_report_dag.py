@@ -1,16 +1,15 @@
 """
 CS Power-User Success Report — EXCEL to Slack (weekly, IST)  [replace-in-place, dependency-free .xlsx]
 
-Every Monday builds ONE .xlsx (2 tabs: Weekly snapshot + Weekly Trends WoW) for the LTV power-user
-cohorts and keeps a single copy in a Slack channel: it deletes last week's file+message, uploads the
+Every Monday builds ONE .xlsx (5 WoW-trend tabs: ALL power users + cohorts A/B/C/D) for the LTV
+power-user cohorts and keeps a single copy in a Slack channel: it deletes last week's file+message, uploads the
 fresh one, and (once the bot has pins:write) pins the new one / unpins the old. The "which file to
 delete" is never guessed — the previous file_id + message ts are stored in an Airflow Variable.
 
 WHERE THE LOGIC LIVES — all numbers + all config come from Redash; the DAG only fetches/renders/posts:
-  * CONFIG  #44390  — channel_id / trigger_hour / weekly_day / snapshot_query_id / series_query_id /
+  * CONFIG  #44390  — channel_id / trigger_hour / weekly_day / series_query_id /
                       file_title / do_pin. Edit here, no code push.
-  * DATA    snapshot_query_id (#43298, mode=weekly)  — latest-full-week tiles + prev-week deltas.
-            series_query_id   (#44374)               — 8-week WoW series, all metrics, TAT p75.
+  * DATA    series_query_id   (#44374)               — 8-week WoW series, all metrics, TAT p75.
 
 .xlsx is written with a tiny stdlib OOXML writer (zipfile + XML) — no openpyxl/pandas needed, so it
 runs on Composer regardless of installed packages (same "no external deps" spirit as the PNG DAGs).
@@ -344,11 +343,12 @@ def run_pu_excel(**context):
         prev = json.loads(Variable.get(STATE_VAR))
     except Exception:
         prev = None
-    if prev and prev.get('channel') == channel:
+    if prev:
+        pch = prev.get('channel') or channel   # clean up in the channel it was posted to (may differ if channel changed)
         if do_pin and prev.get('ts'):
-            _try('pins.remove', {'channel': channel, 'timestamp': prev['ts']})
+            _try('pins.remove', {'channel': pch, 'timestamp': prev['ts']})
         if prev.get('ts'):
-            _try('chat.delete', {'channel': channel, 'ts': prev['ts']})
+            _try('chat.delete', {'channel': pch, 'ts': prev['ts']})
         if prev.get('file_id'):
             _try('files.delete', {'file': prev['file_id']})
 
