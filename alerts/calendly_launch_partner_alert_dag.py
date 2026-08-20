@@ -111,6 +111,12 @@ def _host_mention(email, name):
     return '@' + (name or email or '?')
 
 
+def _is_internal(invitees):
+    # Skip our own test bookings — invitee on the @emergent.sh domain.
+    email = ((invitees[0].get('email') if invitees else '') or '').strip().lower()
+    return email.endswith('@emergent.sh')
+
+
 def _qa(inv, *keys):
     for qa in (inv.get('questions_and_answers') or []):
         q = (qa.get('question') or '').lower()
@@ -181,16 +187,21 @@ def run_lpd_alert(**context):
         for e in sorted(events, key=lambda x: x['created_at']):
             c = pendulum.parse(e['created_at'])
             if c > wm:
-                if _slack(channel, _fmt_alert(e, _invitees(token, e['uri']), lead, now)):
-                    alerted += 1
-                newmax = max(newmax, c)
+                inv = _invitees(token, e['uri'])
+                if not _is_internal(inv):                       # skip @emergent.sh test bookings
+                    if _slack(channel, _fmt_alert(e, inv, lead, now)):
+                        alerted += 1
+                newmax = max(newmax, c)                         # advance past skipped ones too
         state['watermark'] = newmax.to_iso8601_string()
     else:
         upcoming_uris = {e['uri'] for e in events}
         for e in events:
             mins = (pendulum.parse(e['start_time']) - now).total_minutes()
             if 0 <= mins <= lead and e['uri'] not in fired:
-                if _slack(channel, _fmt_alert(e, _invitees(token, e['uri']), lead, now)):
+                inv = _invitees(token, e['uri'])
+                if _is_internal(inv):                           # skip @emergent.sh test bookings
+                    fired.add(e['uri']); continue
+                if _slack(channel, _fmt_alert(e, inv, lead, now)):
                     fired.add(e['uri']); alerted += 1
         state['fired'] = [u for u in fired if u in upcoming_uris]   # prune past
 
