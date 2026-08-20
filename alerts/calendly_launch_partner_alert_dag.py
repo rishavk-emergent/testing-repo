@@ -96,28 +96,54 @@ def _slack(channel, text):
     return r.get('ok')
 
 
+def _host_mention(email, name):
+    # Slack email == Calendly host email -> resolve a real @mention; fall back to plain @name.
+    if email:
+        try:
+            req = urllib.request.Request('https://slack.com/api/users.lookupByEmail?' + urllib.parse.urlencode({'email': email}),
+                                         headers={'Authorization': 'Bearer ' + SLACK_TOKEN})
+            r = json.loads(urllib.request.urlopen(req, timeout=20).read())
+            if r.get('ok'):
+                return '<@%s>' % r['user']['id']
+            logger.info('[cal_lpd] lookupByEmail %s -> %s (plain name)', email, r.get('error'))
+        except Exception as e:
+            logger.warning('[cal_lpd] lookupByEmail %s failed: %s', email, e)
+    return '@' + (name or email or '?')
+
+
+def _qa(inv, *keys):
+    for qa in (inv.get('questions_and_answers') or []):
+        q = (qa.get('question') or '').lower()
+        if any(k in q for k in keys):
+            a = (qa.get('answer') or '').strip()
+            if a:
+                return a
+    return None
+
+
 def _fmt_alert(ev, invitees, lead_minutes, now):
     start = pendulum.parse(ev['start_time'])
     ist = start.in_timezone('Asia/Kolkata')
+    end = pendulum.parse(ev['end_time']) if ev.get('end_time') else None
+    dur = int(round((end - start).total_minutes())) if end else None
     mins = (start - now).total_minutes()
     head = (':calendar: *New Launch Partner Deployment booked*' if lead_minutes == 0
             else ':alarm_clock: *Launch Partner Deployment starts in ~%dh %dm*' % (int(mins // 60), int(mins % 60)))
-    lines = [head, '*When:* %s IST  (%s)' % (ist.format('ddd DD MMM, HH:mm'), start.format('HH:mm')+'Z')]
+    m = (ev.get('event_memberships') or [{}])[0]
     inv = invitees[0] if invitees else {}
-    if inv:
-        lines.append('*Invitee:* %s  <%s>' % (inv.get('name') or '?', inv.get('email') or '?'))
-        if inv.get('timezone'):
-            lines.append('*Invitee TZ:* %s' % inv['timezone'])
-        for qa in (inv.get('questions_and_answers') or [])[:4]:
-            if qa.get('answer'):
-                lines.append('   • _%s_: %s' % (qa.get('question'), qa.get('answer')))
-    hosts = [h.get('user_name') or h.get('user_email') for h in (ev.get('event_memberships') or [])]
-    if hosts:
-        lines.append('*Host:* %s' % ', '.join(x for x in hosts if x))
-    loc = ev.get('location') or {}
-    if loc.get('join_url'):
-        lines.append('*Join:* %s' % loc['join_url'])
-    lines.append('_booked at %s_' % pendulum.parse(ev['created_at']).in_timezone('Asia/Kolkata').format('DD MMM HH:mm')+' IST')
+    lines = [
+        head,
+        '*Host:* %s' % _host_mention(m.get('user_email'), m.get('user_name')),
+        '*Invitee:* %s  <%s>' % (inv.get('name') or '?', inv.get('email') or '?'),
+    ]
+    join = (ev.get('location') or {}).get('join_url')
+    if join:
+        lines.append('*Meeting link:* %s' % join)
+    lines.append('*Booked at:* %s IST' % ist.format('ddd DD MMM, HH:mm'))
+    if dur is not None:
+        lines.append('*Duration:* %d min' % dur)
+    lines.append('*Job ID:* %s' % (_qa(inv, 'job id', 'job_id') or '—'))
+    lines.append('*Description:* %s' % (_qa(inv, 'issue', 'description') or '—'))
     return '\n'.join(lines)
 
 
