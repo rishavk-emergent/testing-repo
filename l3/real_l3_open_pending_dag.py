@@ -40,12 +40,12 @@ logger = logging.getLogger(__name__)
 from utils.slack import RedashClient
 from utils.slack.slack_config import SLACK_BOT_TOKEN_ALERTS as SLACK_BOT_TOKEN, REDASH_API_KEY, REDASH_BASE_URL
 from utils.slack.slack_client import SlackNotifier
-from utils.slack.bigquery_client import get_bigquery_client
 
 SLACK_CHANNEL_ID = os.getenv('REAL_L3_SLACK_CHANNEL', 'C0B4CHB1PRD')  # #daily-report-l3-escalations; override via env if needed
 # Team Untagged tickets post to a separate channel; defaults to the main channel until a dedicated one is set
 UNTAGGED_SLACK_CHANNEL_ID = os.getenv('REAL_L3_UNTAGGED_CHANNEL', 'C0B7TBXP60M')  # fallback if config unavailable
 CONFIG_QUERY_ID = 43625   # [RealL3] config: main_channel_id / untagged_channel_id (edit in Redash, no code push)
+DATA_QUERY_ID   = 45385   # [RealL3] Open/Pending data (filter/dedup/columns editable in Redash, no code push)
 
 # real_l3 tag (Trinity, non-archived, singleton)
 REAL_L3_TAG_ID = '6a1f2e835ad901b459b7665f'
@@ -56,69 +56,8 @@ TRINITY_BUCKET_PENDING_URL = 'https://trinity-base.internal.emergent.host/ticket
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
-# ==================== BIGQUERY QUERY ====================
-# Notes:
-#   - v_tickets is versioned (every change appends a row). Dedupe per _id.
-#   - v_tickets drops team_id and slack_link during JSON flattening (bug in view layer),
-#     so we read both from the base table via regex over TO_JSON_STRING(data).
-#   - Base table _id is JSON-wrapped as {"$oid": "..."}, view _id is plain.
-#     Extract the 24-hex oid for the join.
-#   - NULLs are padded to '-' so the downstream message builder can render them
-#     consistently (and any future CSV transport doesn't strip them).
-
-QUERY = fr"""
-WITH
-  base_latest AS (
-    SELECT
-      REGEXP_EXTRACT(_id, r'[0-9a-f]{{24}}') AS ticket_id,
-      REGEXP_EXTRACT(TO_JSON_STRING(data),
-        r'"team_id"\s*:\s*\{{\s*"\$oid"\s*:\s*"([0-9a-f]{{24}})"') AS team_oid,
-      JSON_VALUE(data, '$.slack_link') AS slack_link
-    FROM `emergent-default.trinity_database.trinity-base-trinity_tickets`
-    QUALIFY ROW_NUMBER() OVER (PARTITION BY _id ORDER BY datastream_metadata.source_timestamp DESC) = 1
-  ),
-  latest_tickets AS (
-    SELECT *
-    FROM `emergent-default.trinity_database.v_tickets`
-    QUALIFY ROW_NUMBER() OVER (PARTITION BY _id ORDER BY source_timestamp DESC) = 1
-  ),
-  latest_agents AS (
-    SELECT *
-    FROM `emergent-default.trinity_database.v_agents`
-    QUALIFY ROW_NUMBER() OVER (PARTITION BY _id ORDER BY source_timestamp DESC) = 1
-  ),
-  latest_teams AS (
-    SELECT *
-    FROM `emergent-default.trinity_database.v_teams`
-    QUALIFY ROW_NUMBER() OVER (PARTITION BY _id ORDER BY source_timestamp DESC) = 1
-  ),
-  last_outbound AS (
-    -- Most recent outbound message per ticket (any of agent or Overwatch).
-    -- v_ticket_events doesn't need dedupe — each event is a single row.
-    SELECT ticket_id, MAX(created_at) AS last_outbound_ts
-    FROM `emergent-default.trinity_database.v_ticket_events`
-    WHERE type = 'message' AND direction = 'outbound'
-    GROUP BY ticket_id
-  )
-SELECT
-  DATE(t.created_at) AS date,
-  COALESCE(tm.name, 'Team Untagged') AS team,
-  CAST(t.num AS INT64) AS ticket_number,
-  COALESCE(NULLIF(TRIM(CONCAT(IFNULL(a.first_name,''),' ',IFNULL(a.last_name,''))),''), '-') AS assignee,
-  CONCAT('https://trinity-base.internal.emergent.host/tickets/', t._id) AS ticket_url,
-  COALESCE(b.slack_link, '-') AS slack_link,
-  t.status,
-  lo.last_outbound_ts
-FROM latest_tickets t
-LEFT JOIN base_latest    b  ON b.ticket_id = t._id
-LEFT JOIN latest_teams   tm ON tm._id      = b.team_oid
-LEFT JOIN latest_agents  a  ON a._id       = t.assigned_agent_id
-LEFT JOIN last_outbound  lo ON lo.ticket_id = t._id
-WHERE t.level = 'L3'
-  AND UPPER(t.status) IN ('OPEN','PENDING')
-  AND '{REAL_L3_TAG_ID}' IN UNNEST(t.tag_ids)
-ORDER BY t.created_at DESC
-"""
+# ==================== DATA (Redash #45385) ====================
+# SQL lives in Redash query 45385 now (was inline). Edit filter/dedup/columns there.
 
 
 # ==================== MESSAGE BUILDER ====================
@@ -323,7 +262,6 @@ def run_real_l3_to_slack(**context):
     logger.info("REAL_L3 OPEN/PENDING: QUERY & PUSH TO SLACK")
     logger.info("=" * 60)
 
-    bq_client = get_bigquery_client()
     # channels from Redash config (precedence: env override > config query > built-in default)
     cfg = {}
     try:
@@ -334,26 +272,31 @@ def run_real_l3_to_slack(**context):
     untagged_channel = os.getenv('REAL_L3_UNTAGGED_CHANNEL') or cfg.get('untagged_channel_id') or UNTAGGED_SLACK_CHANNEL_ID
     notifier  = SlackNotifier(SLACK_BOT_TOKEN, main_channel)
 
-    logger.info("[1] Querying BigQuery for real_l3 tickets...")
-    try:
-        query_job = bq_client.query(QUERY)
-        results   = query_job.result()
-    except Exception as e:
-        logger.error(f"      BigQuery query failed: {e}")
-        notifier.send_message(f"🚨 *RealL3 Report Error*\n\nBigQuery query failed: {str(e)[:300]}")
-        raise
-
-    rows = [{
-        "date":             row.date,
-        "team":             row.team,
-        "ticket_number":    row.ticket_number,
-        "assignee":         row.assignee,
-        "ticket_url":       row.ticket_url,
-        "slack_link":       row.slack_link,
-        "status":           row.status,
-        "last_outbound_ts": row.last_outbound_ts,
-    } for row in results]
-    logger.info(f"      ✓ Got {len(rows)} rows")
+    logger.info("[1] Fetching real_l3 tickets from Redash #%d...", DATA_QUERY_ID)
+    redash = RedashClient(api_key=REDASH_API_KEY, base_url=REDASH_BASE_URL)
+    rows = redash.fetch_query_results(query_id=DATA_QUERY_ID, max_retries=3)
+    if rows is None:
+        logger.error("Redash data fetch failed (#%d) -- posting nothing; raising for retry", DATA_QUERY_ID)
+        raise RuntimeError("Redash data fetch failed for query #%d" % DATA_QUERY_ID)
+    # Redash returns strings/floats; normalize the two typed fields the builder needs
+    # (date stays a 'YYYY-MM-DD' string -> builder already parses it).
+    for r in rows:
+        tn = r.get("ticket_number")
+        if tn is not None:
+            try: r["ticket_number"] = int(float(tn))
+            except (TypeError, ValueError): pass
+        lo = r.get("last_outbound_ts")
+        if isinstance(lo, str):
+            ss = lo.strip()
+            if not ss or ss in ("-", "None", "null"):
+                r["last_outbound_ts"] = None
+            else:
+                try:
+                    r["last_outbound_ts"] = datetime.fromisoformat(ss.replace("Z", "+00:00"))
+                except Exception:
+                    try: r["last_outbound_ts"] = datetime.strptime(ss[:19], "%Y-%m-%dT%H:%M:%S")
+                    except Exception: r["last_outbound_ts"] = None
+    logger.info("      ✓ Got %d rows", len(rows))
 
     logger.info("[2] Partitioning by team (Team Untagged -> separate channel)...")
     def _is_untagged(r):
