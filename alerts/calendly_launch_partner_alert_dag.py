@@ -170,44 +170,46 @@ def run_lpd_alert(**context):
     events = [e for e in _list_upcoming(token, org, now.strftime('%Y-%m-%dT%H:%M:%SZ'))
               if e.get('event_type') == et and e.get('status') == 'active']
 
+    # ---- Unified dedup: a `delivered` map {event_uri: start_time_iso}, shared by both modes. ----
+    #   * only add on SUCCESSFUL post (failed sends retry next poll)  -> no dropped alerts
+    #   * same record across on-book/lead                              -> mode switch can't dup/skip
+    #   * pruned by start_time (not by presence in the current page)   -> far-future beyond the page
+    #     cap just alerts when it first enters view, never re-alerts
     try:
         state = json.loads(Variable.get(STATE_VAR))
     except Exception:
         state = None
-    first_run = state is None
-    if first_run:
-        state = {'watermark': SEED_WATERMARK or now.to_iso8601_string(), 'fired': []}
-
-    fired = set(state.get('fired', []))
+    first_run = not isinstance(state, dict) or 'delivered' not in state
+    delivered = {} if first_run else dict(state.get('delivered', {}))
     alerted = 0
 
-    if lead == 0:
-        wm = pendulum.parse(state['watermark'])
-        newmax = wm
-        for e in sorted(events, key=lambda x: x['created_at']):
-            c = pendulum.parse(e['created_at'])
-            if c > wm:
-                inv = _invitees(token, e['uri'])
-                if not _is_internal(inv):                       # skip @emergent.sh test bookings
-                    if _slack(channel, _fmt_alert(e, inv, lead, now)):
-                        alerted += 1
-                newmax = max(newmax, c)                         # advance past skipped ones too
-        state['watermark'] = newmax.to_iso8601_string()
-    else:
-        upcoming_uris = {e['uri'] for e in events}
+    if first_run:
+        # seed with everything already on the calendar (+ optional watermark override): skip the backlog
+        cutoff = pendulum.parse(SEED_WATERMARK) if SEED_WATERMARK else None
         for e in events:
-            mins = (pendulum.parse(e['start_time']) - now).total_minutes()
-            if 0 <= mins <= lead and e['uri'] not in fired:
-                inv = _invitees(token, e['uri'])
-                if _is_internal(inv):                           # skip @emergent.sh test bookings
-                    fired.add(e['uri']); continue
-                if _slack(channel, _fmt_alert(e, inv, lead, now)):
-                    fired.add(e['uri']); alerted += 1
-        state['fired'] = [u for u in fired if u in upcoming_uris]   # prune past
+            if cutoff is None or pendulum.parse(e['created_at']) <= cutoff:
+                delivered[e['uri']] = e['start_time']
+    else:
+        for e in events:
+            uri = e['uri']
+            if uri in delivered:
+                continue
+            if lead > 0:                                        # lead mode: wait until within the window
+                mins = (pendulum.parse(e['start_time']) - now).total_minutes()
+                if not (0 <= mins <= lead):
+                    continue                                    # not yet -> don't mark delivered
+            inv = _invitees(token, uri)
+            if _is_internal(inv):                               # skip @emergent.sh test bookings
+                delivered[uri] = e['start_time']; continue
+            if _slack(channel, _fmt_alert(e, inv, lead, now)):
+                delivered[uri] = e['start_time']; alerted += 1  # mark done ONLY on success
+            # else: leave undelivered -> retried next poll
 
-    Variable.set(STATE_VAR, json.dumps(state))
-    logger.info('[cal_lpd] mode=%s lead=%s LPD_upcoming=%d alerted=%d first_run=%s',
-                'on_book' if lead == 0 else 'lead', lead, len(events), alerted, first_run)
+    # prune genuinely-past events (bounded); keeps future-but-unseen ones intact
+    delivered = {u: s for u, s in delivered.items() if pendulum.parse(s) > now.subtract(hours=6)}
+    Variable.set(STATE_VAR, json.dumps({'delivered': delivered}))
+    logger.info('[cal_lpd] mode=%s lead=%s LPD_upcoming=%d alerted=%d first_run=%s delivered=%d',
+                'on_book' if lead == 0 else 'lead', lead, len(events), alerted, first_run, len(delivered))
 
 
 # ==================== DAG ====================
