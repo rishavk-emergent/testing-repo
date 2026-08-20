@@ -37,9 +37,6 @@ from airflow.operators.python import PythonOperator
 logger = logging.getLogger(__name__)
 
 # ==================== CONFIG ====================
-from utils.slack import RedashClient
-from utils.slack.slack_config import SLACK_BOT_TOKEN_ALERTS as SLACK_BOT_TOKEN, REDASH_API_KEY, REDASH_BASE_URL
-from utils.slack.slack_client import SlackNotifier
 
 SLACK_CHANNEL_ID = os.getenv('REAL_L3_SLACK_CHANNEL', 'C0B4CHB1PRD')  # #daily-report-l3-escalations; override via env if needed
 # Team Untagged tickets post to a separate channel; defaults to the main channel until a dedicated one is set
@@ -258,6 +255,12 @@ def run_real_l3_to_slack(**context):
     3. Post parent via chat.postMessage; if PENDING exists, post the second as a
        threaded reply under the parent.
     """
+    # Lazy imports (EME-595): keep slack_config Variable.get() out of DAG-parse so a
+    # transient module/token issue can't make this a Broken DAG.
+    from utils.slack import RedashClient
+    from utils.slack.slack_config import SLACK_BOT_TOKEN_ALERTS as SLACK_BOT_TOKEN, REDASH_API_KEY, REDASH_BASE_URL
+    from utils.slack.slack_client import SlackNotifier
+
     logger.info("=" * 60)
     logger.info("REAL_L3 OPEN/PENDING: QUERY & PUSH TO SLACK")
     logger.info("=" * 60)
@@ -278,6 +281,7 @@ def run_real_l3_to_slack(**context):
     if rows is None:
         logger.error("Redash data fetch failed (#%d) -- posting nothing; raising for retry", DATA_QUERY_ID)
         raise RuntimeError("Redash data fetch failed for query #%d" % DATA_QUERY_ID)
+    rows = [r for r in rows if not r.get("is_anchor")]   # drop the always-present sentinel row (empty queue -> [])
     # Redash returns strings/floats; normalize the two typed fields the builder needs
     # (date stays a 'YYYY-MM-DD' string -> builder already parses it).
     for r in rows:
