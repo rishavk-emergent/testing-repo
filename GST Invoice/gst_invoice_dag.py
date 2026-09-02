@@ -605,7 +605,7 @@ dag_monthly = DAG(
     'gst_monthly_payments_slack',
     default_args=default_args,
     description='Monthly GST payments + proofs per accepted+recurring vendor (config-driven trigger day)',
-    schedule_interval='0 9 * * *',
+    schedule_interval='0 19 * * *',  # ticks 19:00 IST daily; the in-task gate fires only on config day (#40445 day=2)
     catchup=False,
     is_paused_upon_creation=True,   # posts to sensitive tf-cs-finance-collab; unpause after validation
     tags=['slack', 'gst', 'vendor', 'payments', 'cs_team'],
