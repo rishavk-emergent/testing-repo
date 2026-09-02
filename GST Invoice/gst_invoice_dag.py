@@ -319,25 +319,55 @@ def _colref(c0):
     return s
 
 
-def build_payments_xlsx(rows_2d, path):
-    """rows_2d: list of rows (each a list of cells, str or number). Writes a single-sheet .xlsx (stdlib, no deps)."""
-    def cell(r, c, v):
+def build_payments_xlsx(rows_2d, path, amount_col=3):
+    """Single-sheet .xlsx (stdlib, no deps): bold header band, auto-fit column widths, #,##0 amounts."""
+    n_cols = max((len(r) for r in rows_2d), default=1)
+    widths = []
+    for c in range(n_cols):
+        w = max((len(str(r[c])) for r in rows_2d if c < len(r) and r[c] not in ('', None)), default=8)
+        widths.append(min(max(w + 3, 11), 60))
+    cols_xml = '<cols>%s</cols>' % ''.join(
+        '<col min="%d" max="%d" width="%.2f" customWidth="1"/>' % (c + 1, c + 1, widths[c]) for c in range(n_cols))
+
+    def cell(r, c, v, header):
         ref = _colref(c) + str(r)
+        if header:
+            return '<c r="%s" s="1" t="inlineStr"><is><t xml:space="preserve">%s</t></is></c>' % (ref, escape(str(v)))
         if isinstance(v, bool):
             v = str(v)
         if isinstance(v, (int, float)):
-            return '<c r="%s"><v>%s</v></c>' % (ref, v)
+            style = ' s="2"' if c == amount_col else ''
+            return '<c r="%s"%s><v>%s</v></c>' % (ref, style, v)
         return '<c r="%s" t="inlineStr"><is><t xml:space="preserve">%s</t></is></c>' % (ref, escape(str(v)))
-    xml_rows = ''.join('<row r="%d">%s</row>' % (i, ''.join(cell(i, ci, v) for ci, v in enumerate(row)))
+
+    xml_rows = ''.join('<row r="%d">%s</row>' % (i, ''.join(cell(i, ci, v, i == 1) for ci, v in enumerate(row)))
                        for i, row in enumerate(rows_2d, 1))
     sheet = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
              '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
-             '<sheetData>%s</sheetData></worksheet>' % xml_rows)
+             '%s<sheetData>%s</sheetData></worksheet>' % (cols_xml, xml_rows))
+    styles = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+              '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+              '<numFmts count="1"><numFmt numFmtId="164" formatCode="#,##0"/></numFmts>'
+              '<fonts count="2">'
+              '<font><sz val="11"/><name val="Calibri"/></font>'
+              '<font><b/><sz val="11"/><color rgb="FFFFFFFF"/><name val="Calibri"/></font></fonts>'
+              '<fills count="3">'
+              '<fill><patternFill patternType="none"/></fill>'
+              '<fill><patternFill patternType="gray125"/></fill>'
+              '<fill><patternFill patternType="solid"><fgColor rgb="FF2E5A88"/></patternFill></fill></fills>'
+              '<borders count="1"><border/></borders>'
+              '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
+              '<cellXfs count="3">'
+              '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>'
+              '<xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1"><alignment vertical="center"/></xf>'
+              '<xf numFmtId="164" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>'
+              '</cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>')
     ctypes = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
               '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
               '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
               '<Default Extension="xml" ContentType="application/xml"/>'
               '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+              '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
               '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>')
     rrels = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
              '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
@@ -348,12 +378,14 @@ def build_payments_xlsx(rows_2d, path):
           '<sheets><sheet name="Payments" sheetId="1" r:id="rId1"/></sheets></workbook>')
     wbrels = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
               '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-              '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>')
+              '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'
+              '<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>')
     with zipfile.ZipFile(path, 'w', zipfile.ZIP_DEFLATED) as z:
         z.writestr('[Content_Types].xml', ctypes)
         z.writestr('_rels/.rels', rrels)
         z.writestr('xl/workbook.xml', wb)
         z.writestr('xl/_rels/workbook.xml.rels', wbrels)
+        z.writestr('xl/styles.xml', styles)
         z.writestr('xl/worksheets/sheet1.xml', sheet)
     return path
 
@@ -430,18 +462,18 @@ def run_gst_monthly(**context):
             logger.error('      payments fetch failed for %s: %s', email, e)
             continue
         # build the workbook: header, one row per payment, blank, then TOTAL per currency
-        rows2d = [['Payment ID', 'Order ID', 'Date', 'Amount', 'Currency']]
+        rows2d = [['Date', 'Payment ID', 'Order ID', 'Amount', 'Currency']]
         for p in pays:
-            rows2d.append([p.get('payment_id') or '-', p.get('order_id') or '-',
-                           p.get('date') or '', p.get('amount') or 0, p.get('currency') or ''])
+            rows2d.append([p.get('date') or '', p.get('payment_id') or '-', p.get('order_id') or '-',
+                           p.get('amount') or 0, p.get('currency') or ''])
         totals = {}
         for p in pays:
             totals[p.get('currency') or ''] = totals.get(p.get('currency') or '', 0) + (p.get('amount') or 0)
         rows2d.append(['', '', '', '', ''])
-        for cur, tot in (totals.items() or []):
+        for cur, tot in totals.items():
             rows2d.append(['', '', 'TOTAL', tot, cur])
         path = '/tmp/gst_%s.xlsx' % hashlib.md5(key.encode()).hexdigest()
-        build_payments_xlsx(rows2d, path)
+        build_payments_xlsx(rows2d, path, amount_col=3)
         title = '%s.xlsx' % email
         comment = ':receipt: GST payments — *%s*  ·  %d payment(s)  ·  window %s → %s' % (email, len(pays), since, as_of)
         try:
