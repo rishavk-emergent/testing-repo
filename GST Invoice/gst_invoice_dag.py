@@ -535,10 +535,19 @@ def run_gst_monthly(**context):
             continue
         since_ts = vs.get('last_trigger_at') or default_since   # exact instant of vendor's last trigger
         since_disp = str(since_ts)[:10]                          # date only, for display
-        try:
-            pays = redash_run(payments_qid, {'email': email, 'since_ts': since_ts, 'as_of_ts': as_of_ts}, max_wait=240) or []
-        except Exception as e:
-            logger.error('      payments fetch failed for %s: %s', email, e)
+        # the federated (EXTERNAL_QUERY) payments query can flake transiently under back-to-back load;
+        # retry a couple of times before giving up (a skipped vendor is retried next trigger anyway).
+        pays, err = None, None
+        for attempt in range(3):
+            try:
+                pays = redash_run(payments_qid, {'email': email, 'since_ts': since_ts, 'as_of_ts': as_of_ts}, max_wait=240) or []
+                break
+            except Exception as e:
+                err = e
+                logger.warning('      payments fetch attempt %d failed for %s: %s', attempt + 1, email, e)
+                time.sleep(5)
+        if pays is None:
+            logger.error('      payments fetch failed for %s after retries: %s', email, err)
             continue
         # NOTE: we post an Excel for EVERY eligible vendor, even with 0 payments in the window
         # (header-only sheet). Duplicate sheet rows are already collapsed by the email dedup above.
