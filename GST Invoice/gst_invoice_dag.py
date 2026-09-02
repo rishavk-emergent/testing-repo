@@ -540,11 +540,8 @@ def run_gst_monthly(**context):
         except Exception as e:
             logger.error('      payments fetch failed for %s: %s', email, e)
             continue
-        if not pays:
-            # nothing in this window -> don't post an empty file; leave state untouched so the
-            # vendor stays eligible (recurring re-fires next trigger; non-recurring hasn't fired yet).
-            logger.info('      skip %s (0 payments in window %s -> %s)', email, since_ts, as_of_ts)
-            continue
+        # NOTE: we post an Excel for EVERY eligible vendor, even with 0 payments in the window
+        # (header-only sheet). Duplicate sheet rows are already collapsed by the email dedup above.
         # Excel columns are config-driven: header headers[i] shows payment field fields[i].
         rows2d = [list(headers)]
         for p in pays:
