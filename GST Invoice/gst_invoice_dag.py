@@ -479,10 +479,18 @@ def run_gst_monthly(**context):
         headers, fields = list(DEFAULT_EXCEL_HEADERS), list(DEFAULT_EXCEL_FIELDS)
     amt_idx = fields.index(amount_field) if amount_field in fields else (len(fields) - 2 if len(fields) > 1 else 0)
 
-    vendors = [r for r in sheet_rows(sid, gid)
-               if (r.get(col_status, '') or '').strip().lower() == accepted
-               and (r.get(col_email, '') or '').strip()]
-    logger.info('      %d accepted vendor(s)', len(vendors))
+    # accepted vendors with an email; dedup by email (first accepted row wins) so a vendor with
+    # duplicate sheet rows still gets exactly ONE Excel.
+    vendors, seen = [], set()
+    for r in sheet_rows(sid, gid):
+        if (r.get(col_status, '') or '').strip().lower() != accepted:
+            continue
+        em = (r.get(col_email, '') or '').strip().lower()
+        if not em or em in seen:
+            continue
+        seen.add(em)
+        vendors.append(r)
+    logger.info('      %d accepted vendor(s) after email dedup', len(vendors))
 
     try:
         state = json.loads(Variable.get(MONTHLY_STATE_VAR))
@@ -507,6 +515,11 @@ def run_gst_monthly(**context):
             pays = redash_run(payments_qid, {'email': email, 'since_date': since, 'as_of_date': as_of}) or []
         except Exception as e:
             logger.error('      payments fetch failed for %s: %s', email, e)
+            continue
+        if not pays:
+            # nothing in this window -> don't post an empty file; leave state untouched so the
+            # vendor stays eligible (recurring re-fires next trigger; non-recurring hasn't fired yet).
+            logger.info('      skip %s (0 payments in window %s -> %s)', email, since, as_of)
             continue
         # Excel columns are config-driven: header headers[i] shows payment field fields[i].
         rows2d = [list(headers)]
