@@ -16,9 +16,15 @@ SHEET READ (no key): Composer workers run AS a Google service account (ADC); we 
 via the Sheets REST API + google.auth.default(). PREREQUISITE: share the sheet (Viewer) with the
 Composer runtime SA. Sidesteps the org policy that blocks service-account key downloads.
 
-CONFIG (editable in Redash, no code push):
-  * payments feed  -> #40082  (params: email, as_of_date)  email->user_id->prev-month money-in
-  * trigger days + channel -> #40445  (day, channel_id, channel_name)
+CONFIG (all editable in Redash, no code push):
+  * config #40445  -> ONE row per trigger day carrying EVERY monthly-DAG knob:
+      day, channel_id/name, sheet_id/gid, col_status/col_cadence/col_email/col_vendor/col_gst,
+      accepted_status, recurring_match, default_since, payments_query_id,
+      excel_headers/excel_fields/amount_field, master_text, thread_comment.
+    The DAG constants (COL_*, ACCEPTED_STATUS, DEFAULT_* ...) are FALLBACKS only.
+  * payments query #46587 -> SOURCE OF TRUTH: payment_transactions (Postgres, status='SUCCEEDED');
+    params email, since_date, as_of_date -> date/payment_id/order_id/amount/currency. Swap the
+    source by pointing payments_query_id at a different query — no code push.
 Channel: BOTH DAGs post to config #40445 channel_id (tf-cs-finance-collab, C0B9Y89RSL9);
 GST_INVOICE_SLACK_CHANNEL env overrides both for testing. Both ship PAUSED (sensitive channel).
 """
@@ -126,6 +132,11 @@ CREATE TABLE IF NOT EXISTS `{MONTHLY_STATE_TABLE}` (
   email STRING, period STRING, vendor STRING, n_payments INT64, pinged_at TIMESTAMP
 )
 """
+# --- ALL of the below are FALLBACKS ONLY ---
+# At runtime run_gst_monthly reads these from config #CONFIG_QUERY_ID (accepted_status, recurring_match,
+# col_status/col_cadence/col_email/col_vendor/col_gst, default_since, payments_query_id, excel_headers,
+# excel_fields, amount_field, master_text, thread_comment). They are used only if the config row is
+# blank/broken, so editing the Redash config needs no code push.
 ACCEPTED_STATUS = 'accepted'
 RECURRING_MATCH = 'recurring'
 COL_STATUS  = 'Status'
@@ -133,6 +144,12 @@ COL_CADENCE = 'Nature of Invoice generation'
 COL_EMAIL   = 'Email (Your registered email on Emergent)'
 COL_VENDOR  = 'Name of Vendor'
 COL_GST     = 'GST Number.'
+DEFAULT_MASTER_TEXT    = (":receipt: *GST Monthly Payments — {as_of}*  ·  *{n}* vendor(s)\n"
+                          "Please find each vendor's list of payments (Excel) in the thread below.")
+DEFAULT_THREAD_COMMENT = ':receipt: *{email}*  ·  {n} payment(s)  ·  {since} → {as_of}'
+DEFAULT_EXCEL_HEADERS  = ['Date', 'Payment ID', 'Order ID', 'Amount', 'Currency']
+DEFAULT_EXCEL_FIELDS   = ['date', 'payment_id', 'order_id', 'amount', 'currency']
+DEFAULT_AMOUNT_FIELD   = 'amount'
 
 
 # ==================== SHARED HELPERS ====================
@@ -193,6 +210,17 @@ def redash_run(query_id, parameters, max_wait=90):
 
 def _val(rowmap, col):
     return (rowmap.get(col) or '').strip()
+
+
+def _cfg_val(cfg, key, default=None):
+    """First non-empty value of `key` across config rows (config #CONFIG_QUERY_ID), else default."""
+    return next((r.get(key) for r in (cfg or []) if r.get(key) not in (None, '')), default)
+
+
+def _cfg_list(cfg, key, default):
+    """Config value split on commas into a trimmed list, else the default list."""
+    v = _cfg_val(cfg, key, None)
+    return [x.strip() for x in str(v).split(',') if x.strip()] if v else list(default)
 
 
 # ==================== DAG 1: ONBOARDING ALERT ====================
@@ -432,9 +460,28 @@ def run_gst_monthly(**context):
 
     as_of = now.format('YYYY-MM-DD')
     sid, gid, sheet_url = _sheet_loc(cfg)
+
+    # ---- every editable knob comes from config #CONFIG_QUERY_ID (fallback constants if blank) ----
+    col_status   = _cfg_val(cfg, 'col_status',  COL_STATUS)
+    col_email    = _cfg_val(cfg, 'col_email',   COL_EMAIL)
+    col_cadence  = _cfg_val(cfg, 'col_cadence', COL_CADENCE)
+    accepted     = str(_cfg_val(cfg, 'accepted_status', ACCEPTED_STATUS)).strip().lower()
+    recurring_kw = str(_cfg_val(cfg, 'recurring_match', RECURRING_MATCH)).strip().lower()
+    default_since = _cfg_val(cfg, 'default_since', DEFAULT_SINCE)
+    payments_qid = int(_cfg_val(cfg, 'payments_query_id', PAYMENTS_RANGE_QUERY_ID))
+    headers      = _cfg_list(cfg, 'excel_headers', DEFAULT_EXCEL_HEADERS)
+    fields       = _cfg_list(cfg, 'excel_fields',  DEFAULT_EXCEL_FIELDS)
+    amount_field = _cfg_val(cfg, 'amount_field',  DEFAULT_AMOUNT_FIELD)
+    master_tmpl  = _cfg_val(cfg, 'master_text',    DEFAULT_MASTER_TEXT)
+    comment_tmpl = _cfg_val(cfg, 'thread_comment', DEFAULT_THREAD_COMMENT)
+    if len(fields) != len(headers):   # mismatched config lists -> fall back to defaults
+        logger.warning('      excel_headers/excel_fields length mismatch; using defaults')
+        headers, fields = list(DEFAULT_EXCEL_HEADERS), list(DEFAULT_EXCEL_FIELDS)
+    amt_idx = fields.index(amount_field) if amount_field in fields else (len(fields) - 2 if len(fields) > 1 else 0)
+
     vendors = [r for r in sheet_rows(sid, gid)
-               if (r.get(COL_STATUS, '') or '').strip().lower() == ACCEPTED_STATUS
-               and (r.get(COL_EMAIL, '') or '').strip()]
+               if (r.get(col_status, '') or '').strip().lower() == accepted
+               and (r.get(col_email, '') or '').strip()]
     logger.info('      %d accepted vendor(s)', len(vendors))
 
     try:
@@ -447,45 +494,58 @@ def run_gst_monthly(**context):
     # ---- pass 1: build a workbook for every eligible vendor ----
     jobs = []
     for v in vendors:
-        email = v.get(COL_EMAIL, '').strip()
+        email = v.get(col_email, '').strip()
         key = email.lower()
-        recurring = RECURRING_MATCH in (v.get(COL_CADENCE, '') or '').lower()
+        recurring = recurring_kw in (v.get(col_cadence, '') or '').lower()
         vs = state.get(key, {})
         fire_v = True if recurring else (not bool(vs.get('nonrec_fired')))
         if not fire_v:
             logger.info('      skip %s (non-recurring, already fired once)', email)
             continue
-        since = vs.get('last_trigger_at') or DEFAULT_SINCE
+        since = vs.get('last_trigger_at') or default_since
         try:
-            pays = redash_run(PAYMENTS_RANGE_QUERY_ID, {'email': email, 'since_date': since, 'as_of_date': as_of}) or []
+            pays = redash_run(payments_qid, {'email': email, 'since_date': since, 'as_of_date': as_of}) or []
         except Exception as e:
             logger.error('      payments fetch failed for %s: %s', email, e)
             continue
-        rows2d = [['Date', 'Payment ID', 'Order ID', 'Amount', 'Currency']]
+        # Excel columns are config-driven: header headers[i] shows payment field fields[i].
+        rows2d = [list(headers)]
         for p in pays:
-            rows2d.append([p.get('date') or '', p.get('payment_id') or '-', p.get('order_id') or '-',
-                           p.get('amount') or 0, p.get('currency') or ''])
+            rows2d.append([(p.get(f) or 0) if f == amount_field
+                           else (str(p.get(f)) if p.get(f) not in (None, '') else '-')
+                           for f in fields])
         totals = {}
         for p in pays:
-            totals[p.get('currency') or ''] = totals.get(p.get('currency') or '', 0) + (p.get('amount') or 0)
-        rows2d.append(['', '', '', '', ''])
+            cur = p.get('currency') or ''
+            totals[cur] = totals.get(cur, 0) + (p.get(amount_field) or 0)
+        rows2d.append([''] * len(headers))
         for cur, tot in totals.items():
-            rows2d.append(['', '', 'TOTAL', tot, cur])
+            tr = [''] * len(headers)
+            tr[amt_idx] = tot
+            tr[amt_idx - 1 if amt_idx > 0 else 0] = 'TOTAL'
+            if 'currency' in fields:
+                tr[fields.index('currency')] = cur
+            rows2d.append(tr)
         path = '/tmp/gst_%s.xlsx' % hashlib.md5(key.encode()).hexdigest()
-        build_payments_xlsx(rows2d, path, amount_col=3)
+        build_payments_xlsx(rows2d, path, amount_col=amt_idx)
+        try:
+            comment = comment_tmpl.format(email=email, n=len(pays), since=since, as_of=as_of)
+        except Exception:
+            comment = DEFAULT_THREAD_COMMENT.format(email=email, n=len(pays), since=since, as_of=as_of)
         jobs.append({'key': key, 'recurring': recurring, 'path': path, 'title': '%s.xlsx' % email,
-                     'comment': ':receipt: *%s*  ·  %d payment(s)  ·  %s → %s' % (email, len(pays), since, as_of),
-                     'n': len(pays)})
+                     'comment': comment, 'n': len(pays)})
 
     if not jobs:
         Variable.set(MONTHLY_STATE_VAR, json.dumps(state))
         logger.info('GST MONTHLY: no eligible vendors this trigger')
         return
 
-    # ---- master message, then one Excel per vendor threaded beneath it ----
-    master_ts = slack_post(channel,
-        ":receipt: *GST Monthly Payments — %s*  ·  *%d* vendor(s)\n"
-        "Please find each vendor's list of payments (Excel) in the thread below." % (as_of, len(jobs)))
+    # ---- master message (config template), then one Excel per vendor threaded beneath it ----
+    try:
+        master = master_tmpl.format(as_of=as_of, n=len(jobs))
+    except Exception:
+        master = DEFAULT_MASTER_TEXT.format(as_of=as_of, n=len(jobs))
+    master_ts = slack_post(channel, master)
 
     posted = 0
     for j in jobs:
