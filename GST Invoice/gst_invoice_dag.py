@@ -24,7 +24,8 @@ GST_INVOICE_SLACK_CHANNEL env overrides both for testing. Both ship PAUSED (sens
 """
 
 from datetime import datetime, timedelta, timezone
-import logging, os, hashlib, time
+import logging, os, hashlib, time, json, io, zipfile
+from xml.sax.saxutils import escape
 
 import pendulum
 import requests
@@ -115,6 +116,9 @@ DOC_FIELDS = [
 ENV_CHANNEL_OVERRIDE = os.getenv('GST_INVOICE_SLACK_CHANNEL')   # test channel for dry runs; unset in prod
 FALLBACK_CHANNEL     = 'C0B9Y89RSL9'   # tf-cs-finance-collab (used only if config row blank)
 PAYMENTS_QUERY_ID    = 40082           # Redash: "[GST] Vendor monthly payments feed"
+PAYMENTS_RANGE_QUERY_ID = 46587        # Redash: "[GST] Vendor payments (range, ids)" (since,as_of] -> payment_id/order_id/date/amount
+MONTHLY_STATE_VAR    = 'GST_MONTHLY_STATE'   # Airflow Variable: {email: {last_trigger_at, nonrec_fired}}
+DEFAULT_SINCE        = '2020-01-01'          # first-ever trigger window lower bound (all history)
 CONFIG_QUERY_ID      = 40445           # Redash: "[GST] Monthly config" -> day, channel_id, channel_name
 MONTHLY_STATE_TABLE  = 'emergent-default.support.gst_monthly_pinged'
 MONTHLY_DDL = f"""
@@ -291,7 +295,12 @@ def run_gst_invoice(**context):
     logger.info('GST INVOICE ALERT: COMPLETE (%d alerted)', len(pinged))
 
 
-# ==================== DAG 2: MONTHLY PAYMENTS ====================
+# ==================== DAG 2: MONTHLY GST PAYMENT EXCELS ====================
+# For each ACCEPTED vendor on a trigger day, upload ONE .xlsx named <email>.xlsx listing that vendor's
+# payments since their last trigger (Payment ID / Order ID / Date / Amount + total).
+#   - recurring   : fires every trigger; resets the vendor's non-recurring "once" flag.
+#   - non-recurring: fires ONCE per non-recurring stint (flag set on fire; cleared whenever recurring).
+# State (per vendor) lives in an Airflow Variable so a mode flip resumes/one-shots correctly.
 
 def _fmt_amt(a, c):
     a = int(round(a or 0))
@@ -299,46 +308,76 @@ def _fmt_amt(a, c):
         return u'₹%s' % format(a, ',')
     if c == 'USD':
         return '$%s' % format(a, ',')
-    return '%s %s' % (format(a, ','), c)
+    return '%s %s' % (format(a, ','), c or '')
 
 
-def build_payments_master_blocks(vendor, gst, email, period, payments, sheet_url):
-    totals = {}
-    for p in payments:
-        totals[p['currency']] = totals.get(p['currency'], 0) + (p['amount'] or 0)
-    tot = '  ·  '.join(_fmt_amt(v, c) for c, v in totals.items()) or '—'
-    return [
-        {'type': 'header', 'text': {'type': 'plain_text',
-         'text': ':receipt: GST Monthly Payments — %s' % (vendor or '(no name)')[:120], 'emoji': True}},
-        {'type': 'section', 'fields': [
-            {'type': 'mrkdwn', 'text': '*Vendor*\n`%s`' % (vendor or '—')},
-            {'type': 'mrkdwn', 'text': '*Period*\n`%s`' % period},
-            {'type': 'mrkdwn', 'text': '*Emergent email*\n`%s`' % (email or '—')},
-            {'type': 'mrkdwn', 'text': '*GST No.*\n`%s`' % (gst or '—')},
-        ]},
-        {'type': 'context', 'elements': [{'type': 'mrkdwn',
-         'text': ':moneybag: *%d* payment(s)  ·  total *%s*  ·  :thread: proofs in thread'
-                 % (len(payments), tot)}]},
-        {'type': 'section', 'text': {'type': 'mrkdwn',
-         'text': ':page_with_curl: <%s|Open source sheet (Excel)>' % sheet_url}},
-    ]
+def _colref(c0):
+    s, c = '', c0 + 1
+    while c:
+        c, r = divmod(c - 1, 26)
+        s = chr(65 + r) + s
+    return s
 
 
-def build_payments_thread_blocks(period, payments):
-    lines = ['*%d.* `%s`  ·  *%s*  ·  %s  ·  %s\n     proof: `%s`'
-             % (i, str(p.get('created_at'))[:10], p.get('reference_type'),
-                _fmt_amt(p.get('amount'), p.get('currency')), p.get('provider'), p.get('reference_id'))
-             for i, p in enumerate(payments, 1)]
-    return [
-        {'type': 'header', 'text': {'type': 'plain_text', 'text': ':page_facing_up: Payment proofs — %s' % period, 'emoji': True}},
-        {'type': 'section', 'text': {'type': 'mrkdwn', 'text': '\n'.join(lines) if lines else '_no payments this period_'}},
-        {'type': 'context', 'elements': [{'type': 'mrkdwn',
-         'text': 'Verify each proof id against the processor (Stripe/Razorpay) to confirm legitimacy.'}]},
-    ]
+def build_payments_xlsx(rows_2d, path):
+    """rows_2d: list of rows (each a list of cells, str or number). Writes a single-sheet .xlsx (stdlib, no deps)."""
+    def cell(r, c, v):
+        ref = _colref(c) + str(r)
+        if isinstance(v, bool):
+            v = str(v)
+        if isinstance(v, (int, float)):
+            return '<c r="%s"><v>%s</v></c>' % (ref, v)
+        return '<c r="%s" t="inlineStr"><is><t xml:space="preserve">%s</t></is></c>' % (ref, escape(str(v)))
+    xml_rows = ''.join('<row r="%d">%s</row>' % (i, ''.join(cell(i, ci, v) for ci, v in enumerate(row)))
+                       for i, row in enumerate(rows_2d, 1))
+    sheet = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+             '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+             '<sheetData>%s</sheetData></worksheet>' % xml_rows)
+    ctypes = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+              '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+              '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+              '<Default Extension="xml" ContentType="application/xml"/>'
+              '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+              '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>')
+    rrels = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+             '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+             '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>')
+    wb = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+          '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+          'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+          '<sheets><sheet name="Payments" sheetId="1" r:id="rId1"/></sheets></workbook>')
+    wbrels = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+              '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+              '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>')
+    with zipfile.ZipFile(path, 'w', zipfile.ZIP_DEFLATED) as z:
+        z.writestr('[Content_Types].xml', ctypes)
+        z.writestr('_rels/.rels', rrels)
+        z.writestr('xl/workbook.xml', wb)
+        z.writestr('xl/_rels/workbook.xml.rels', wbrels)
+        z.writestr('xl/worksheets/sheet1.xml', sheet)
+    return path
+
+
+def slack_upload_file(channel, path, title, comment):
+    ln = os.path.getsize(path)
+    g = requests.get('https://slack.com/api/files.getUploadURLExternal',
+                     params={'filename': title, 'length': ln},
+                     headers={'Authorization': 'Bearer %s' % SLACK_BOT_TOKEN}, timeout=30).json()
+    if not g.get('ok'):
+        raise Exception('getUploadURL: %s' % g.get('error'))
+    requests.post(g['upload_url'], data=open(path, 'rb').read(),
+                  headers={'Content-Type': 'application/octet-stream'}, timeout=60)
+    c = requests.post('https://slack.com/api/files.completeUploadExternal',
+                      headers={'Authorization': 'Bearer %s' % SLACK_BOT_TOKEN},
+                      data={'channel_id': channel, 'initial_comment': comment,
+                            'files': json.dumps([{'id': g['file_id'], 'title': title}])}, timeout=30).json()
+    if not c.get('ok'):
+        raise Exception('completeUpload: %s' % c.get('error'))
 
 
 def run_gst_monthly(**context):
-    logger.info('GST MONTHLY PAYMENTS')
+    from airflow.models import Variable
+    logger.info('GST MONTHLY PAYMENT EXCELS')
 
     now = pendulum.now('Asia/Kolkata')
     dom, last_dom = now.day, now.end_of('month').day
@@ -349,57 +388,74 @@ def run_gst_monthly(**context):
             days.add(int(r['day']))
         except Exception:
             pass
-    cfg_channel = next((r.get('channel_id') for r in cfg if r.get('channel_id')), None)
-    channel = ENV_CHANNEL_OVERRIDE or cfg_channel or FALLBACK_CHANNEL
+    channel = ENV_CHANNEL_OVERRIDE or next((r.get('channel_id') for r in cfg if r.get('channel_id')), None) or FALLBACK_CHANNEL
     fire = (dom in days) or (99 in days and dom == last_dom)
-    logger.info('[0] IST day=%d (last=%d), trigger days=%s, channel=%s -> fire=%s',
-                dom, last_dom, sorted(days), channel, fire)
+    logger.info('[0] IST day=%d (last=%d), trigger days=%s, channel=%s -> fire=%s', dom, last_dom, sorted(days), channel, fire)
     if not fire:
         logger.info('GST MONTHLY: not a trigger day, exiting')
         return
 
     as_of = now.format('YYYY-MM-DD')
-    period = now.subtract(months=1).format('MMM YYYY')
-    sid, gid, sheet_url = _sheet_loc(cfg)   # reuse the config rows already fetched above
-
-    client = get_bigquery_client()
-    client.query(MONTHLY_DDL).result()
-
+    sid, gid, sheet_url = _sheet_loc(cfg)
     vendors = [r for r in sheet_rows(sid, gid)
                if (r.get(COL_STATUS, '') or '').strip().lower() == ACCEPTED_STATUS
-               and RECURRING_MATCH in (r.get(COL_CADENCE, '') or '').lower()
                and (r.get(COL_EMAIL, '') or '').strip()]
-    logger.info('      %d accepted + recurring vendor(s)', len(vendors))
-    if not vendors:
-        return
+    logger.info('      %d accepted vendor(s)', len(vendors))
 
-    done = {(r.email, r.period) for r in client.query(
-        f"SELECT email, period FROM `{MONTHLY_STATE_TABLE}`").result()}
+    try:
+        state = json.loads(Variable.get(MONTHLY_STATE_VAR))
+        if not isinstance(state, dict):
+            state = {}
+    except Exception:
+        state = {}
 
-    posted, now_iso = [], datetime.now(timezone.utc).isoformat()
+    posted = 0
     for v in vendors:
         email = v.get(COL_EMAIL, '').strip()
-        if (email.lower(), period) in done:
-            logger.info('      skip %s (already posted for %s)', email, period)
+        key = email.lower()
+        recurring = RECURRING_MATCH in (v.get(COL_CADENCE, '') or '').lower()
+        vs = state.get(key, {})
+        # decide whether this vendor fires in this run
+        if recurring:
+            fire_v = True
+        else:
+            fire_v = not bool(vs.get('nonrec_fired'))
+        if not fire_v:
+            logger.info('      skip %s (non-recurring, already fired once)', email)
             continue
+        since = vs.get('last_trigger_at') or DEFAULT_SINCE
         try:
-            payments = redash_run(PAYMENTS_QUERY_ID, {'email': email, 'as_of_date': as_of}) or []
-            ts = slack_post(channel, 'GST Monthly Payments — %s' % v.get(COL_VENDOR, email),
-                            blocks=build_payments_master_blocks(v.get(COL_VENDOR, ''), v.get(COL_GST, ''),
-                                                                email, period, payments, sheet_url))
-            slack_post(channel, 'Payment proofs — %s' % period,
-                       blocks=build_payments_thread_blocks(period, payments), thread_ts=ts)
-            posted.append({'email': email.lower(), 'period': period, 'vendor': v.get(COL_VENDOR, ''),
-                           'n_payments': len(payments), 'pinged_at': now_iso})
-            logger.info('      posted %s (%d payments)', email, len(payments))
+            pays = redash_run(PAYMENTS_RANGE_QUERY_ID, {'email': email, 'since_date': since, 'as_of_date': as_of}) or []
         except Exception as e:
-            logger.error('      failed for %s: %s', email, e)
+            logger.error('      payments fetch failed for %s: %s', email, e)
+            continue
+        # build the workbook: header, one row per payment, blank, then TOTAL per currency
+        rows2d = [['Payment ID', 'Order ID', 'Date', 'Amount', 'Currency']]
+        for p in pays:
+            rows2d.append([p.get('payment_id') or '-', p.get('order_id') or '-',
+                           p.get('date') or '', p.get('amount') or 0, p.get('currency') or ''])
+        totals = {}
+        for p in pays:
+            totals[p.get('currency') or ''] = totals.get(p.get('currency') or '', 0) + (p.get('amount') or 0)
+        rows2d.append(['', '', '', '', ''])
+        for cur, tot in (totals.items() or []):
+            rows2d.append(['', '', 'TOTAL', tot, cur])
+        path = '/tmp/gst_%s.xlsx' % hashlib.md5(key.encode()).hexdigest()
+        build_payments_xlsx(rows2d, path)
+        title = '%s.xlsx' % email
+        comment = ':receipt: GST payments — *%s*  ·  %d payment(s)  ·  window %s → %s' % (email, len(pays), since, as_of)
+        try:
+            slack_upload_file(channel, path, title, comment)
+        except Exception as e:
+            logger.error('      upload failed for %s: %s', email, e)
+            continue  # leave state untouched -> retried next trigger
+        # advance state only after a successful upload
+        state[key] = {'last_trigger_at': as_of, 'nonrec_fired': (False if recurring else True)}
+        posted += 1
+        logger.info('      uploaded %s (%d payments, since %s)', title, len(pays), since)
 
-    if posted:
-        errs = client.insert_rows_json(client.get_table(MONTHLY_STATE_TABLE), posted)
-        if errs:
-            logger.error('      state-table insert errors: %s', errs)
-    logger.info('GST MONTHLY: COMPLETE (%d vendor(s) posted)', len(posted))
+    Variable.set(MONTHLY_STATE_VAR, json.dumps(state))
+    logger.info('GST MONTHLY: COMPLETE (%d excel(s) uploaded)', posted)
 
 
 # ==================== DAG DEFINITIONS ====================
