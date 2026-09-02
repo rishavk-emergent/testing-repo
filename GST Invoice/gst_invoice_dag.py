@@ -552,6 +552,8 @@ def run_gst_monthly(**context):
         for p in pays:
             cur = p.get('currency') or ''
             totals[cur] = totals.get(cur, 0) + (p.get(amount_field) or 0)
+        if not totals:               # 0-payment vendor -> still show a TOTAL 0 INR row
+            totals = {'INR': 0}
         rows2d.append([''] * len(headers))
         for cur, tot in totals.items():
             tr = [''] * len(headers)
