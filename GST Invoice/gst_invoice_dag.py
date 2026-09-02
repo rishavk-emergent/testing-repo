@@ -18,9 +18,10 @@ Composer runtime SA. Sidesteps the org policy that blocks service-account key do
 
 CONFIG (all editable in Redash, no code push):
   * config #40445  -> ONE row per trigger day carrying EVERY monthly-DAG knob:
-      day, channel_id/name, sheet_id/gid, col_status/col_cadence/col_email/col_vendor/col_gst,
-      accepted_status, recurring_match, default_since, payments_query_id,
-      excel_headers/excel_fields/amount_field, master_text, thread_comment.
+      day, trigger_hour, trigger_minute (IST fire time), channel_id/name, sheet_id/gid,
+      col_status/col_cadence/col_email/col_vendor/col_gst, accepted_status, recurring_match,
+      default_since, payments_query_id, excel_headers/excel_fields/amount_field, master_text, thread_comment.
+    The DAG ticks every 15 min and the in-task gate fires on (day, trigger_hour:trigger_minute), once/day.
     The DAG constants (COL_*, ACCEPTED_STATUS, DEFAULT_* ...) are FALLBACKS only.
   * payments query #46587 -> SOURCE OF TRUTH: credit_ledger money-in (complete, incl. renewals) +
     federated pay_ backfill from payment_transactions. Params email, since_ts, as_of_ts (exact
@@ -453,11 +454,38 @@ def run_gst_monthly(**context):
         except Exception:
             pass
     channel = ENV_CHANNEL_OVERRIDE or next((r.get('channel_id') for r in cfg if r.get('channel_id')), None) or FALLBACK_CHANNEL
-    fire = (dom in days) or (99 in days and dom == last_dom)
-    logger.info('[0] IST day=%d (last=%d), trigger days=%s, channel=%s -> fire=%s', dom, last_dom, sorted(days), channel, fire)
+
+    # config-driven trigger TIME (IST). DAG ticks every 15 min; fire on the first tick at/after HH:MM on
+    # a config day, exactly once per day (guarded by state['_last_fire_date']) — robust to scheduler jitter.
+    try:
+        trig_hour = int(_cfg_val(cfg, 'trigger_hour', 19))
+    except Exception:
+        trig_hour = 19
+    try:
+        trig_min = int(_cfg_val(cfg, 'trigger_minute', 0))
+    except Exception:
+        trig_min = 0
+
+    try:
+        state = json.loads(Variable.get(MONTHLY_STATE_VAR))
+        if not isinstance(state, dict):
+            state = {}
+    except Exception:
+        state = {}
+
+    today_key = now.format('YYYY-MM-DD')
+    day_match = (dom in days) or (99 in days and dom == last_dom)
+    time_reached = (now.hour * 60 + now.minute) >= (trig_hour * 60 + trig_min)
+    already_today = (state.get('_last_fire_date') == today_key)
+    fire = day_match and time_reached and not already_today
+    logger.info('[0] IST %s %02d:%02d, days=%s target=%02d:%02d day_match=%s time_reached=%s fired_today=%s channel=%s -> fire=%s',
+                today_key, now.hour, now.minute, sorted(days), trig_hour, trig_min, day_match, time_reached, already_today, channel, fire)
     if not fire:
-        logger.info('GST MONTHLY: not a trigger day, exiting')
+        logger.info('GST MONTHLY: gate closed (day/time/already-fired), exiting')
         return
+    # claim today up-front so later 15-min ticks (and task retries) never double-fire
+    state['_last_fire_date'] = today_key
+    Variable.set(MONTHLY_STATE_VAR, json.dumps(state))
 
     as_of_ts = now.isoformat()        # exact trigger instant (IST) -> stored in state + query upper bound
     as_of = now.format('YYYY-MM-DD')  # display only (master / thread comment)
@@ -493,13 +521,6 @@ def run_gst_monthly(**context):
         seen.add(em)
         vendors.append(r)
     logger.info('      %d accepted vendor(s) after email dedup', len(vendors))
-
-    try:
-        state = json.loads(Variable.get(MONTHLY_STATE_VAR))
-        if not isinstance(state, dict):
-            state = {}
-    except Exception:
-        state = {}
 
     # ---- pass 1: build a workbook for every eligible vendor ----
     jobs = []
@@ -605,7 +626,7 @@ dag_monthly = DAG(
     'gst_monthly_payments_slack',
     default_args=default_args,
     description='Monthly GST payments + proofs per accepted+recurring vendor (config-driven trigger day)',
-    schedule_interval='0 19 * * *',  # ticks 19:00 IST daily; the in-task gate fires only on config day (#40445 day=2)
+    schedule_interval='*/15 * * * *',  # ticks every 15 min IST; in-task gate fires on config day + config time (#40445 day/trigger_hour/trigger_minute), once/day
     catchup=False,
     is_paused_upon_creation=True,   # posts to sensitive tf-cs-finance-collab; unpause after validation
     tags=['slack', 'gst', 'vendor', 'payments', 'cs_team'],
