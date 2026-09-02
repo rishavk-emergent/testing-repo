@@ -536,7 +536,7 @@ def run_gst_monthly(**context):
         since_ts = vs.get('last_trigger_at') or default_since   # exact instant of vendor's last trigger
         since_disp = str(since_ts)[:10]                          # date only, for display
         try:
-            pays = redash_run(payments_qid, {'email': email, 'since_ts': since_ts, 'as_of_ts': as_of_ts}) or []
+            pays = redash_run(payments_qid, {'email': email, 'since_ts': since_ts, 'as_of_ts': as_of_ts}, max_wait=240) or []
         except Exception as e:
             logger.error('      payments fetch failed for %s: %s', email, e)
             continue
