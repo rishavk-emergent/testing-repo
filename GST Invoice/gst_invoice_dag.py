@@ -22,9 +22,10 @@ CONFIG (all editable in Redash, no code push):
       accepted_status, recurring_match, default_since, payments_query_id,
       excel_headers/excel_fields/amount_field, master_text, thread_comment.
     The DAG constants (COL_*, ACCEPTED_STATUS, DEFAULT_* ...) are FALLBACKS only.
-  * payments query #46587 -> SOURCE OF TRUTH: payment_transactions (Postgres, status='SUCCEEDED');
-    params email, since_date, as_of_date -> date/payment_id/order_id/amount/currency. Swap the
-    source by pointing payments_query_id at a different query — no code push.
+  * payments query #46587 -> SOURCE OF TRUTH: credit_ledger money-in (complete, incl. renewals) +
+    federated pay_ backfill from payment_transactions. Params email, since_ts, as_of_ts (exact
+    IST instants; window is (since_ts, as_of_ts]) -> date/payment_id/order_id/subscription_id/
+    internal_id/amount/currency. Swap source by pointing payments_query_id elsewhere — no code push.
 Channel: BOTH DAGs post to config #40445 channel_id (tf-cs-finance-collab, C0B9Y89RSL9);
 GST_INVOICE_SLACK_CHANNEL env overrides both for testing. Both ship PAUSED (sensitive channel).
 """
@@ -458,7 +459,8 @@ def run_gst_monthly(**context):
         logger.info('GST MONTHLY: not a trigger day, exiting')
         return
 
-    as_of = now.format('YYYY-MM-DD')
+    as_of_ts = now.isoformat()        # exact trigger instant (IST) -> stored in state + query upper bound
+    as_of = now.format('YYYY-MM-DD')  # display only (master / thread comment)
     sid, gid, sheet_url = _sheet_loc(cfg)
 
     # ---- every editable knob comes from config #CONFIG_QUERY_ID (fallback constants if blank) ----
@@ -510,16 +512,17 @@ def run_gst_monthly(**context):
         if not fire_v:
             logger.info('      skip %s (non-recurring, already fired once)', email)
             continue
-        since = vs.get('last_trigger_at') or default_since
+        since_ts = vs.get('last_trigger_at') or default_since   # exact instant of vendor's last trigger
+        since_disp = str(since_ts)[:10]                          # date only, for display
         try:
-            pays = redash_run(payments_qid, {'email': email, 'since_date': since, 'as_of_date': as_of}) or []
+            pays = redash_run(payments_qid, {'email': email, 'since_ts': since_ts, 'as_of_ts': as_of_ts}) or []
         except Exception as e:
             logger.error('      payments fetch failed for %s: %s', email, e)
             continue
         if not pays:
             # nothing in this window -> don't post an empty file; leave state untouched so the
             # vendor stays eligible (recurring re-fires next trigger; non-recurring hasn't fired yet).
-            logger.info('      skip %s (0 payments in window %s -> %s)', email, since, as_of)
+            logger.info('      skip %s (0 payments in window %s -> %s)', email, since_ts, as_of_ts)
             continue
         # Excel columns are config-driven: header headers[i] shows payment field fields[i].
         rows2d = [list(headers)]
@@ -542,9 +545,9 @@ def run_gst_monthly(**context):
         path = '/tmp/gst_%s.xlsx' % hashlib.md5(key.encode()).hexdigest()
         build_payments_xlsx(rows2d, path, amount_col=amt_idx)
         try:
-            comment = comment_tmpl.format(email=email, n=len(pays), since=since, as_of=as_of)
+            comment = comment_tmpl.format(email=email, n=len(pays), since=since_disp, as_of=as_of)
         except Exception:
-            comment = DEFAULT_THREAD_COMMENT.format(email=email, n=len(pays), since=since, as_of=as_of)
+            comment = DEFAULT_THREAD_COMMENT.format(email=email, n=len(pays), since=since_disp, as_of=as_of)
         jobs.append({'key': key, 'recurring': recurring, 'path': path, 'title': '%s.xlsx' % email,
                      'comment': comment, 'n': len(pays)})
 
@@ -567,7 +570,7 @@ def run_gst_monthly(**context):
         except Exception as e:
             logger.error('      upload failed for %s: %s', j['title'], e)
             continue  # leave state untouched -> retried next trigger
-        state[j['key']] = {'last_trigger_at': as_of, 'nonrec_fired': (False if j['recurring'] else True)}
+        state[j['key']] = {'last_trigger_at': as_of_ts, 'nonrec_fired': (False if j['recurring'] else True)}
         posted += 1
         logger.info('      threaded %s (%d payments)', j['title'], j['n'])
 
