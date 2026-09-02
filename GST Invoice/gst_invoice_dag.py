@@ -390,7 +390,7 @@ def build_payments_xlsx(rows_2d, path, amount_col=3):
     return path
 
 
-def slack_upload_file(channel, path, title, comment):
+def slack_upload_file(channel, path, title, comment, thread_ts=None):
     ln = os.path.getsize(path)
     g = requests.get('https://slack.com/api/files.getUploadURLExternal',
                      params={'filename': title, 'length': ln},
@@ -399,10 +399,13 @@ def slack_upload_file(channel, path, title, comment):
         raise Exception('getUploadURL: %s' % g.get('error'))
     requests.post(g['upload_url'], data=open(path, 'rb').read(),
                   headers={'Content-Type': 'application/octet-stream'}, timeout=60)
+    data = {'channel_id': channel, 'initial_comment': comment,
+            'files': json.dumps([{'id': g['file_id'], 'title': title}])}
+    if thread_ts:
+        data['thread_ts'] = thread_ts
     c = requests.post('https://slack.com/api/files.completeUploadExternal',
                       headers={'Authorization': 'Bearer %s' % SLACK_BOT_TOKEN},
-                      data={'channel_id': channel, 'initial_comment': comment,
-                            'files': json.dumps([{'id': g['file_id'], 'title': title}])}, timeout=30).json()
+                      data=data, timeout=30).json()
     if not c.get('ok'):
         raise Exception('completeUpload: %s' % c.get('error'))
 
@@ -441,17 +444,14 @@ def run_gst_monthly(**context):
     except Exception:
         state = {}
 
-    posted = 0
+    # ---- pass 1: build a workbook for every eligible vendor ----
+    jobs = []
     for v in vendors:
         email = v.get(COL_EMAIL, '').strip()
         key = email.lower()
         recurring = RECURRING_MATCH in (v.get(COL_CADENCE, '') or '').lower()
         vs = state.get(key, {})
-        # decide whether this vendor fires in this run
-        if recurring:
-            fire_v = True
-        else:
-            fire_v = not bool(vs.get('nonrec_fired'))
+        fire_v = True if recurring else (not bool(vs.get('nonrec_fired')))
         if not fire_v:
             logger.info('      skip %s (non-recurring, already fired once)', email)
             continue
@@ -461,7 +461,6 @@ def run_gst_monthly(**context):
         except Exception as e:
             logger.error('      payments fetch failed for %s: %s', email, e)
             continue
-        # build the workbook: header, one row per payment, blank, then TOTAL per currency
         rows2d = [['Date', 'Payment ID', 'Order ID', 'Amount', 'Currency']]
         for p in pays:
             rows2d.append([p.get('date') or '', p.get('payment_id') or '-', p.get('order_id') or '-',
@@ -474,20 +473,33 @@ def run_gst_monthly(**context):
             rows2d.append(['', '', 'TOTAL', tot, cur])
         path = '/tmp/gst_%s.xlsx' % hashlib.md5(key.encode()).hexdigest()
         build_payments_xlsx(rows2d, path, amount_col=3)
-        title = '%s.xlsx' % email
-        comment = ':receipt: GST payments — *%s*  ·  %d payment(s)  ·  window %s → %s' % (email, len(pays), since, as_of)
+        jobs.append({'key': key, 'recurring': recurring, 'path': path, 'title': '%s.xlsx' % email,
+                     'comment': ':receipt: *%s*  ·  %d payment(s)  ·  %s → %s' % (email, len(pays), since, as_of),
+                     'n': len(pays)})
+
+    if not jobs:
+        Variable.set(MONTHLY_STATE_VAR, json.dumps(state))
+        logger.info('GST MONTHLY: no eligible vendors this trigger')
+        return
+
+    # ---- master message, then one Excel per vendor threaded beneath it ----
+    master_ts = slack_post(channel,
+        ":receipt: *GST Monthly Payments — %s*  ·  *%d* vendor(s)\n"
+        "Please find each vendor's list of payments (Excel) in the thread below." % (as_of, len(jobs)))
+
+    posted = 0
+    for j in jobs:
         try:
-            slack_upload_file(channel, path, title, comment)
+            slack_upload_file(channel, j['path'], j['title'], j['comment'], thread_ts=master_ts)
         except Exception as e:
-            logger.error('      upload failed for %s: %s', email, e)
+            logger.error('      upload failed for %s: %s', j['title'], e)
             continue  # leave state untouched -> retried next trigger
-        # advance state only after a successful upload
-        state[key] = {'last_trigger_at': as_of, 'nonrec_fired': (False if recurring else True)}
+        state[j['key']] = {'last_trigger_at': as_of, 'nonrec_fired': (False if j['recurring'] else True)}
         posted += 1
-        logger.info('      uploaded %s (%d payments, since %s)', title, len(pays), since)
+        logger.info('      threaded %s (%d payments)', j['title'], j['n'])
 
     Variable.set(MONTHLY_STATE_VAR, json.dumps(state))
-    logger.info('GST MONTHLY: COMPLETE (%d excel(s) uploaded)', posted)
+    logger.info('GST MONTHLY: COMPLETE (master + %d excel(s) in thread)', posted)
 
 
 # ==================== DAG DEFINITIONS ====================
