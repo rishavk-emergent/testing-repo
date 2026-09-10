@@ -1,15 +1,17 @@
 """
-L3 EOD Report — a GENERIC Slack-poster shell. ALL logic + layout live in Redash; the DAG changes
-never (no per-report code). It just: read config -> gate on time -> run the message query -> post.
+L3 reports — a GENERIC Slack-poster shell driving TWO DAGs (daily + weekly). ALL logic + layout live
+in Redash, so the DAG code never changes per report.
 
-Redash (edit freely, no code push):
-  * config  #47194  [L3 EOD] config  -> channel_id, trigger_hour, trigger_minute, message_query_id
-  * message #47195  [L3 EOD] message -> a single column `message` = the ENTIRE Slack text
-                     (title + code-block table, all built in SQL). Change filters/columns/labels/layout there.
+Each DAG just: read its config -> gate on time (+ optional day-of-week) -> run its message query -> post.
+  * l3_eod_report     (daily)   -> config #47194 -> message #47195  ([L3 EOD] table)
+  * l3_weekly_report  (weekly)  -> config #47574 -> message #47573  ([L3 Weekly] table, Sun 11:30 IST)
 
-The DAG ticks every 15 min; an in-task gate fires ONCE/day at trigger_hour:trigger_minute IST
-(guarded by an Airflow Variable) — so the fire time is changeable in Redash, not code.
-Env L3_EOD_SLACK_CHANNEL overrides the destination for testing. Ships paused.
+Config columns (edit in Redash, no code push): channel_id, trigger_hour, trigger_minute, message_query_id,
+and (weekly) trigger_dow — isoweekday 1=Mon..7=Sun; when set, the DAG only fires on that weekday.
+The message query builds the ENTIRE Slack message (title + table) in pure SQL.
+
+Both DAGs tick every 15 min; an in-task gate fires ONCE/day at the config time (guarded by a per-DAG
+Airflow Variable). Env L3_EOD_SLACK_CHANNEL overrides the channel for testing. Ship paused.
 """
 
 from datetime import timedelta
@@ -27,11 +29,8 @@ from utils.slack.slack_config import (
 
 logger = logging.getLogger(__name__)
 
-CONFIG_QUERY_ID  = 47194
-STATE_VAR        = 'L3_EOD_STATE'
-ENV_CHANNEL      = os.getenv('L3_EOD_SLACK_CHANNEL')
+ENV_CHANNEL      = os.getenv('L3_EOD_SLACK_CHANNEL')   # test override; unset in prod
 FALLBACK_CHANNEL = 'C0B4CHB1PRD'
-FALLBACK_MSG_QID = 47195
 TRIG_HOUR, TRIG_MIN = 23, 30
 
 
@@ -58,6 +57,13 @@ def _cfg(cfg, key, default=None):
     return next((r.get(key) for r in (cfg or []) if r.get(key) not in (None, '')), default)
 
 
+def _int(cfg, key, default):
+    try:
+        return int(_cfg(cfg, key, default))
+    except Exception:
+        return default
+
+
 def slack_post(channel, text):
     d = requests.post('https://slack.com/api/chat.postMessage',
                       headers={'Authorization': 'Bearer %s' % SLACK_BOT_TOKEN,
@@ -69,24 +75,19 @@ def slack_post(channel, text):
     return d['ts']
 
 
-def run_report(**context):
+def run_report(config_query_id, state_var, **context):
     from airflow.models import Variable
-    logger.info('L3 EOD REPORT (generic shell)')
+    logger.info('L3 REPORT (config #%s)', config_query_id)
 
-    cfg = redash_run(CONFIG_QUERY_ID) or []
+    cfg = redash_run(config_query_id) or []
     channel = ENV_CHANNEL or _cfg(cfg, 'channel_id', FALLBACK_CHANNEL)
-    msg_qid = int(_cfg(cfg, 'message_query_id', FALLBACK_MSG_QID))
-    try:
-        trig_hour = int(_cfg(cfg, 'trigger_hour', TRIG_HOUR))
-    except Exception:
-        trig_hour = TRIG_HOUR
-    try:
-        trig_min = int(_cfg(cfg, 'trigger_minute', TRIG_MIN))
-    except Exception:
-        trig_min = TRIG_MIN
+    msg_qid = int(_cfg(cfg, 'message_query_id'))
+    trig_hour = _int(cfg, 'trigger_hour', TRIG_HOUR)
+    trig_min  = _int(cfg, 'trigger_minute', TRIG_MIN)
+    trig_dow  = _cfg(cfg, 'trigger_dow')          # optional; isoweekday 1..7, None = every day
 
     try:
-        state = json.loads(Variable.get(STATE_VAR))
+        state = json.loads(Variable.get(state_var))
         if not isinstance(state, dict):
             state = {}
     except Exception:
@@ -94,11 +95,12 @@ def run_report(**context):
 
     now = pendulum.now('Asia/Kolkata')
     today_key = now.format('YYYY-MM-DD')
+    dow_ok = (trig_dow is None) or (now.isoweekday() == int(trig_dow))
     time_reached = (now.hour * 60 + now.minute) >= (trig_hour * 60 + trig_min)
     already = (state.get('_last_fire_date') == today_key)
-    fire = time_reached and not already
-    logger.info('[gate] IST %s %02d:%02d target=%02d:%02d reached=%s fired_today=%s -> fire=%s',
-                today_key, now.hour, now.minute, trig_hour, trig_min, time_reached, already, fire)
+    fire = dow_ok and time_reached and not already
+    logger.info('[gate] IST %s dow=%d %02d:%02d target=%02d:%02d dow_req=%s dow_ok=%s reached=%s fired=%s -> fire=%s',
+                today_key, now.isoweekday(), now.hour, now.minute, trig_hour, trig_min, trig_dow, dow_ok, time_reached, already, fire)
     if not fire:
         logger.info('gate closed, exiting')
         return
@@ -110,7 +112,7 @@ def run_report(**context):
     slack_post(channel, message)
 
     state['_last_fire_date'] = today_key
-    Variable.set(STATE_VAR, json.dumps(state))
+    Variable.set(state_var, json.dumps(state))
     logger.info('posted to %s (message query %s)', channel, msg_qid)
 
 
@@ -124,14 +126,30 @@ default_args = {
     'retry_delay': timedelta(minutes=3),
 }
 
-dag = DAG(
+# ---- daily (config #47194, fires every day at its config time) ----
+dag_daily = DAG(
     'l3_eod_report',
     default_args=default_args,
-    description='Generic Slack poster: posts the message built entirely in Redash (#47195), once/day at config time',
+    description='Generic poster: L3 EOD table built in Redash (#47195), once/day at config #47194 time',
     schedule_interval='*/15 * * * *',
     catchup=False,
     max_active_runs=1,
     is_paused_upon_creation=True,
     tags=['slack', 'trinity', 'l3', 'report', 'cs_team'],
 )
-PythonOperator(task_id='run_report', python_callable=run_report, dag=dag)
+PythonOperator(task_id='run_report', python_callable=run_report,
+               op_kwargs={'config_query_id': 47194, 'state_var': 'L3_EOD_STATE'}, dag=dag_daily)
+
+# ---- weekly (config #47574, fires only on trigger_dow, e.g. Sunday, at its config time) ----
+dag_weekly = DAG(
+    'l3_weekly_report',
+    default_args=default_args,
+    description='Generic poster: L3 Weekly table built in Redash (#47573), once on config day-of-week+time (#47574)',
+    schedule_interval='*/15 * * * *',
+    catchup=False,
+    max_active_runs=1,
+    is_paused_upon_creation=True,
+    tags=['slack', 'trinity', 'l3', 'report', 'weekly', 'cs_team'],
+)
+PythonOperator(task_id='run_report', python_callable=run_report,
+               op_kwargs={'config_query_id': 47574, 'state_var': 'L3_WEEKLY_STATE'}, dag=dag_weekly)
