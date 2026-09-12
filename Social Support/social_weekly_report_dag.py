@@ -3,15 +3,18 @@ Social weekly report — DB-free. Reads #social-support live at report time and 
 reaction table (incoming / open / close / takedown / ignored), Mon 10:00 IST. No DB, tracker, or
 backfill: the channel is the source of truth, read fresh each run.
 
-TUNABLES live in Redash config #47889 (scan_channel_id, report_channel_id, trigger_hour/minute/dow,
-and the emoji->bucket map emoji_assigned/resolved/taken_down/rejected) — change them with no code push.
-The scan/bucket/render logic is reviewed code here (ruff/pytest/PR apply).
+Split of concerns (both edit without touching the other):
+  * config query #47889 — tunables: scan/report channels, trigger day/time, emoji->bucket map.
+  * message query #47894 — RENDER: builds the whole Slack message (title + table) from the counts,
+    so layout/labels/widths/row-filtering are query-editable with no code push.
+Only the scan + bucketing (how each post is classified) is reviewed code here (ruff/pytest/PR apply).
 
 Flow: read config #47889 -> gate (Mon 10:00 IST, once/day) -> scan the channel for the PREVIOUS week
 (Mon–Sun IST) via conversations.history -> bucket each Brand24 mention by its CURRENT reactions
 (coded meaning: 👀 open · ✅ close · 👍 takedown · ❌ ignored; one bucket per post, precedence
-takedown>close>ignored>open) -> render the table -> post via the alerts bot. Ships paused.
-Env SOCIAL_WEEKLY_SLACK_CHANNEL overrides the destination for testing.
+takedown>close>ignored>open) -> pass the per-platform counts to message query #47894 -> post the
+`message` it returns via the alerts bot. Ships paused. Env SOCIAL_WEEKLY_SLACK_CHANNEL overrides the
+destination for testing.
 """
 
 from datetime import timedelta
@@ -23,7 +26,8 @@ from airflow.operators.python import PythonOperator
 
 logger = logging.getLogger(__name__)
 
-CONFIG_QUERY_ID = 47889
+CONFIG_QUERY_ID  = 47889   # tunables: channels, trigger, emoji->bucket map
+MESSAGE_QUERY_ID = 47894   # RENDER: builds the Slack table from counts passed as params (edit layout here)
 STATE_VAR       = 'SOCIAL_WEEKLY_STATE'
 ENV_CHANNEL     = os.getenv('SOCIAL_WEEKLY_SLACK_CHANNEL')   # test override; unset in prod
 TRIG_HOUR, TRIG_MIN, TRIG_DOW = 10, 0, 1                     # Mon 10:00 IST
@@ -36,7 +40,6 @@ FB_EMOJI = {
     'rejected':   'x,heavy_multiplication_x,negative_squared_cross_mark',
 }
 PLATS = ['linkedin', 'x', 'trustpilot', 'other']
-LABEL = {'overall': 'Overall', 'linkedin': 'LinkedIn', 'x': 'X', 'trustpilot': 'Trustpilot', 'other': 'Other'}
 
 
 def _load_state(V, state_var):
@@ -86,22 +89,15 @@ def _bucket(reactions, sets):
     return 'open'   # 👀-only or untouched
 
 
-def _render(rows, wk_start, wk_end):
-    def row(label, r):
-        return (label.ljust(11) + str(r['incoming']).rjust(9) + str(r['open']).rjust(6)
-                + str(r['close']).rjust(7) + str(r['takedown']).rjust(10) + str(r['ignored']).rjust(9))
-    body = [row(LABEL['overall'], rows['overall'])]
-    for p in PLATS:
-        if p == 'other' and rows[p]['incoming'] == 0:
-            continue
-        body.append(row(LABEL[p], rows[p]))
-    hdr = ('PLATFORM'.ljust(11) + 'INCOMING'.rjust(9) + 'OPEN'.rjust(6)
-           + 'CLOSE'.rjust(7) + 'TAKEDOWN'.rjust(10) + 'IGNORED'.rjust(9))
-    date_lbl = '%s %d – %s %d, %d' % (wk_start.strftime('%b'), wk_start.day,
-                                      wk_end.strftime('%b'), wk_end.day, wk_end.year)
-    return ('*🗣️ Social Support — Weekly Report*\n_' + date_lbl + '_\n'
-            + '👀 open · ✅ close · 👍 takedown · ❌ ignored\n'
-            + '```\n' + hdr + '\n' + ('─' * len(hdr)) + '\n' + '\n'.join(body) + '\n```')
+def _rows_csv(rows):
+    """One line per segment: 'seg,incoming,open,close,takedown,ignored', ';'-joined. Safe for the
+    Redash text param (digits + segment keys only). The render/message query decides layout + which
+    rows to show."""
+    order = ['overall'] + PLATS
+    return ';'.join(
+        '%s,%d,%d,%d,%d,%d' % (seg, r['incoming'], r['open'], r['close'], r['takedown'], r['ignored'])
+        for seg, r in ((s, rows[s]) for s in order)
+    )
 
 
 def run_report(**context):
@@ -191,7 +187,16 @@ def run_report(**context):
             rows[s]['incoming'] += 1
             rows[s][b] += 1
 
-    message = _render(rows, wk_start, wk_end)
+    # Render lives in Redash message query #47894: pass the counts as params, it builds the table.
+    mrows = redash.fetch_query_results(MESSAGE_QUERY_ID, parameters={
+        'rows': _rows_csv(rows),
+        'wk_start': wk_start.to_date_string(),
+        'wk_end': wk_end.to_date_string(),
+    }) or []
+    message = mrows[0].get('message') if mrows else None
+    if not message:
+        raise Exception('message query %s returned no `message`' % MESSAGE_QUERY_ID)
+
     SlackNotifier(SLACK_BOT_TOKEN_ALERTS).send_message(
         message, channel_id=channel, unfurl_links=False, unfurl_media=False)
 
