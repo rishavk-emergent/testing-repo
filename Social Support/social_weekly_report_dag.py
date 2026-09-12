@@ -1,22 +1,21 @@
 """
-Social weekly report — DB-FREE, fully config-driven. Reads #social-support live at report time and
-posts a per-platform reaction table. EVERYTHING (knobs + the channel-scan/bucket/render logic) lives
-in the Redash config query #47889 — the DAG is a thin shell that gates on time and exec()s the `code`
-column, so behaviour changes with no code push (the L3-style "logic in the query" model, adapted:
-Slack isn't queryable by Redash, so the query ships the *code* the DAG runs against Slack).
+Social weekly report — DB-free. Reads #social-support live at report time and posts a per-platform
+reaction table (incoming / open / close / takedown / ignored), Mon 10:00 IST. No DB, tracker, or
+backfill: the channel is the source of truth, read fresh each run.
 
-Flow: read config #47889 -> gate (Mon 10:00 IST, once/day) -> exec `code` with an injected context
-{cfg, slack_call(method,params), now, json} -> the code sets `message` -> post via the alerts bot.
-Window (previous week Mon–Sun) + emoji->bucket mapping are computed inside `code`.
+TUNABLES live in Redash config #47889 (scan_channel_id, report_channel_id, trigger_hour/minute/dow,
+and the emoji->bucket map emoji_assigned/resolved/taken_down/rejected) — change them with no code push.
+The scan/bucket/render logic is reviewed code here (ruff/pytest/PR apply).
 
-NOTE: this DAG runs Python fetched from Redash via exec(). That is a deliberate design choice for this
-report (all logic in the query); it also means the code in #47889 is NOT covered by this repo's
-ruff/pytest/PR review — edit it with the same care as shipping code. Env SOCIAL_WEEKLY_SLACK_CHANNEL
-overrides the destination for testing. Ships paused.
+Flow: read config #47889 -> gate (Mon 10:00 IST, once/day) -> scan the channel for the PREVIOUS week
+(Mon–Sun IST) via conversations.history -> bucket each Brand24 mention by its CURRENT reactions
+(coded meaning: 👀 open · ✅ close · 👍 takedown · ❌ ignored; one bucket per post, precedence
+takedown>close>ignored>open) -> render the table -> post via the alerts bot. Ships paused.
+Env SOCIAL_WEEKLY_SLACK_CHANNEL overrides the destination for testing.
 """
 
 from datetime import timedelta
-import logging, os, json
+import logging, os, json, re, html
 
 import pendulum
 from airflow import DAG
@@ -28,6 +27,16 @@ CONFIG_QUERY_ID = 47889
 STATE_VAR       = 'SOCIAL_WEEKLY_STATE'
 ENV_CHANNEL     = os.getenv('SOCIAL_WEEKLY_SLACK_CHANNEL')   # test override; unset in prod
 TRIG_HOUR, TRIG_MIN, TRIG_DOW = 10, 0, 1                     # Mon 10:00 IST
+
+# Fallback emoji->bucket map (config #47889 overrides each). Coded meaning:
+FB_EMOJI = {
+    'assigned':   'eyes',
+    'resolved':   'white_check_mark,heavy_check_mark,ballot_box_with_check',
+    'taken_down': '+1,thumbsup',
+    'rejected':   'x,heavy_multiplication_x,negative_squared_cross_mark',
+}
+PLATS = ['linkedin', 'x', 'trustpilot', 'other']
+LABEL = {'overall': 'Overall', 'linkedin': 'LinkedIn', 'x': 'X', 'trustpilot': 'Trustpilot', 'other': 'Other'}
 
 
 def _load_state(V, state_var):
@@ -42,6 +51,59 @@ def _load_state(V, state_var):
     return state
 
 
+def _emoji_set(cfg, key, fallback):
+    return {x.strip() for x in str(cfg.get(key) or fallback).split(',') if x.strip()}
+
+
+def _clean(s):
+    # Brand24 double-encodes HTML entities; unescape twice.
+    return html.unescape(html.unescape(s or '')).strip()
+
+
+def _source_from_filter(filter_name):
+    tok = (filter_name.split(' on ')[-1] if ' on ' in filter_name else filter_name).strip().lower()
+    if tok in ('x', 'twitter'):
+        return 'x'
+    for known in ('linkedin', 'trustpilot', 'reddit', 'facebook', 'instagram', 'youtube'):
+        if known in tok:
+            return known
+    return tok or 'other'
+
+
+def _platform(src):
+    return src if src in ('linkedin', 'x', 'trustpilot') else 'other'
+
+
+def _bucket(reactions, sets):
+    """One bucket per post; precedence takedown > close(resolved) > ignored(rejected) > open."""
+    names = {r.get('name') for r in reactions}
+    if names & sets['taken_down']:
+        return 'takedown'
+    if names & sets['resolved']:
+        return 'close'
+    if names & sets['rejected']:
+        return 'ignored'
+    return 'open'   # 👀-only or untouched
+
+
+def _render(rows, wk_start, wk_end):
+    def row(label, r):
+        return (label.ljust(11) + str(r['incoming']).rjust(9) + str(r['open']).rjust(6)
+                + str(r['close']).rjust(7) + str(r['takedown']).rjust(10) + str(r['ignored']).rjust(9))
+    body = [row(LABEL['overall'], rows['overall'])]
+    for p in PLATS:
+        if p == 'other' and rows[p]['incoming'] == 0:
+            continue
+        body.append(row(LABEL[p], rows[p]))
+    hdr = ('PLATFORM'.ljust(11) + 'INCOMING'.rjust(9) + 'OPEN'.rjust(6)
+           + 'CLOSE'.rjust(7) + 'TAKEDOWN'.rjust(10) + 'IGNORED'.rjust(9))
+    date_lbl = '%s %d – %s %d, %d' % (wk_start.strftime('%b'), wk_start.day,
+                                      wk_end.strftime('%b'), wk_end.day, wk_end.year)
+    return ('*🗣️ Social Support — Weekly Report*\n_' + date_lbl + '_\n'
+            + '👀 open · ✅ close · 👍 takedown · ❌ ignored\n'
+            + '```\n' + hdr + '\n' + ('─' * len(hdr)) + '\n' + '\n'.join(body) + '\n```')
+
+
 def run_report(**context):
     from airflow.models import Variable
     from utils.slack.slack_config import REDASH_API_KEY, REDASH_BASE_URL, SLACK_BOT_TOKEN_ALERTS
@@ -51,10 +113,10 @@ def run_report(**context):
     import urllib.parse
 
     redash = RedashClient(REDASH_API_KEY, REDASH_BASE_URL)
-    rows = redash.fetch_query_results(CONFIG_QUERY_ID) or []
-    if not rows:
+    rows_cfg = redash.fetch_query_results(CONFIG_QUERY_ID) or []
+    if not rows_cfg:
         raise Exception('config query %s returned no rows' % CONFIG_QUERY_ID)
-    cfg = rows[0]
+    cfg = rows_cfg[0]
 
     def _int(key, default):
         try:
@@ -64,11 +126,11 @@ def run_report(**context):
 
     trig_hour = _int('trigger_hour', TRIG_HOUR)
     trig_min  = _int('trigger_minute', TRIG_MIN)
-    trig_dow  = _int('trigger_dow', TRIG_DOW)   # fall back to Monday, like hour/minute — a missing
-    #                                             config must not silently make the weekly report daily
+    trig_dow  = _int('trigger_dow', TRIG_DOW)
     channel = ENV_CHANNEL or cfg.get('report_channel_id')
-    if not channel:
-        raise Exception('no report_channel_id in config and SOCIAL_WEEKLY_SLACK_CHANNEL unset')
+    scan_channel = cfg.get('scan_channel_id')
+    if not channel or not scan_channel:
+        raise Exception('config %s missing report/scan channel' % CONFIG_QUERY_ID)
 
     state = _load_state(Variable, STATE_VAR)
     now = pendulum.now('Asia/Kolkata')
@@ -77,32 +139,66 @@ def run_report(**context):
     time_reached = (now.hour * 60 + now.minute) >= (trig_hour * 60 + trig_min)
     already = (state.get('_last_fire_date') == today_key)
     fire = dow_ok and time_reached and not already
-    logger.info('[gate] IST %s dow=%d %02d:%02d target=dow%s %02d:%02d dow_ok=%s reached=%s fired=%s -> fire=%s',
+    logger.info('[gate] IST %s dow=%d %02d:%02d target=dow%d %02d:%02d dow_ok=%s reached=%s fired=%s -> fire=%s',
                 today_key, now.isoweekday(), now.hour, now.minute, trig_dow, trig_hour, trig_min,
                 dow_ok, time_reached, already, fire)
     if not fire:
         logger.info('gate closed, exiting')
         return
 
-    def slack_call(method, params):
+    # window = previous complete week, Mon 00:00 -> next Mon 00:00 (covers Mon..Sun)
+    this_mon = now.start_of('week')           # pendulum weeks start Monday
+    wk_start = this_mon.subtract(days=7)
+    wk_end = this_mon.subtract(seconds=1)     # previous Sunday 23:59:59
+    oldest, latest = wk_start.timestamp(), this_mon.timestamp()
+
+    sets = {k: _emoji_set(cfg, 'emoji_%s' % k, fb) for k, fb in FB_EMOJI.items()}
+
+    def slack_get(method, params):
         url = 'https://slack.com/api/%s?%s' % (method, urllib.parse.urlencode(params))
         req = urllib.request.Request(url, headers={'Authorization': 'Bearer %s' % SLACK_BOT_TOKEN_ALERTS})
-        return json.loads(urllib.request.urlopen(req, timeout=30).read())
+        r = json.loads(urllib.request.urlopen(req, timeout=30).read())
+        if not r.get('ok'):
+            raise Exception('slack %s: %s' % (method, r.get('error')))
+        return r
 
-    # Behaviour lives in the config query (per design): exec its `code`, which scans the channel and
-    # sets `message`. Injected context is the ONLY surface the code may rely on.
-    ns = {'cfg': cfg, 'slack_call': slack_call, 'now': now, 'json': json}
-    exec(cfg['code'], ns)  # noqa: S102 — intentional: report logic ships in Redash config #47889
-    message = ns.get('message')
-    if not message:
-        raise Exception('config %s `code` did not set `message`' % CONFIG_QUERY_ID)
+    # paginate conversations.history over the window
+    msgs, cursor = [], None
+    while True:
+        p = {'channel': scan_channel, 'oldest': '%.6f' % oldest, 'latest': '%.6f' % latest,
+             'limit': 200, 'inclusive': 'true'}
+        if cursor:
+            p['cursor'] = cursor
+        r = slack_get('conversations.history', p)
+        msgs.extend(r.get('messages', []))
+        cursor = (r.get('response_metadata') or {}).get('next_cursor')
+        if not cursor:
+            break
 
+    rows = {seg: {'incoming': 0, 'open': 0, 'close': 0, 'takedown': 0, 'ignored': 0}
+            for seg in PLATS + ['overall']}
+    for m in msgs:
+        text = m.get('text', '') or ''
+        atts = m.get('attachments') or []
+        if 'New mentions' not in text or not atts:
+            continue
+        if 'brand24' not in (atts[0].get('title_link', '') or ''):
+            continue
+        mf = re.search(r'Filter:\s*([^\n]+)', text)
+        seg = _platform(_source_from_filter(_clean(mf.group(1)) if mf else ''))
+        b = _bucket(m.get('reactions', []) or [], sets)
+        for s in (seg, 'overall'):
+            rows[s]['incoming'] += 1
+            rows[s][b] += 1
+
+    message = _render(rows, wk_start, wk_end)
     SlackNotifier(SLACK_BOT_TOKEN_ALERTS).send_message(
         message, channel_id=channel, unfurl_links=False, unfurl_media=False)
 
     state['_last_fire_date'] = today_key
     Variable.set(STATE_VAR, json.dumps(state))
-    logger.info('posted to %s (exec config %s)', channel, CONFIG_QUERY_ID)
+    logger.info('posted to %s (%d mentions, window %s..%s)', channel,
+                rows['overall']['incoming'], wk_start.to_date_string(), wk_end.to_date_string())
 
 
 default_args = {
@@ -118,7 +214,7 @@ default_args = {
 dag = DAG(
     'social_weekly_report',
     default_args=default_args,
-    description='DB-free social weekly report: exec channel-scan code from Redash #47889, Mon 10:00 IST',
+    description='DB-free social weekly report: scan #social-support live, config #47889, Mon 10:00 IST',
     schedule_interval='*/15 * * * *',
     catchup=False,
     max_active_runs=1,
