@@ -1,23 +1,22 @@
 """
 L3 reports — a GENERIC, REGISTRY-DRIVEN Slack-poster shell. ONE file builds every L3 report DAG from a
-registry, so adding a new L3 report needs NO code change: create its config + message queries in Redash,
-then add a row to the L3_REPORT_REGISTRY Airflow Variable.
+static REGISTRY list below. ALL per-report logic + layout + timing live in Redash (config + message
+queries), so a *content* change never touches this file; adding a whole new L3 report is a one-line
+entry in REGISTRY + a PR.
 
 Each generated DAG: read its config -> gate on time (+ optional day-of-week) -> run its message query -> post.
-Built-in default registry (used when the Variable is unset/invalid):
   * l3_eod_report     (daily)   -> config #47194 -> message #47195  ([L3 EOD] table, 23:30 IST)
   * l3_weekly_report  (weekly)  -> config #47574 -> message #47573  ([L3 Weekly] table, Sun 11:30 IST)
   * l3_morning_report (daily)   -> config #47887 -> message #47886  ([L3 Morning] table, 11:30 IST)
 
-Registry entry (JSON): {"dag_id", "config_query_id", "state_var", "tags"?}
 Config columns (edit in Redash, no code push): channel_id, trigger_hour, trigger_minute, message_query_id,
 and trigger_dow — isoweekday 1=Mon..7=Sun; when set the DAG fires only that weekday. The message query
 builds the ENTIRE Slack message (title + table) in pure SQL.
 
-L3_REPORT_REGISTRY MUST be an ENV-BACKED Variable (provision as AIRFLOW_VAR_L3_REPORT_REGISTRY) so this
-file parses cheaply every ~30s with no metadata-DB hit; unset/blank/invalid -> the built-in
-DEFAULT_REGISTRY. All DAGs tick every 15 min; a per-DAG in-task gate fires ONCE/day at the config time
-(guarded by state_var). Env L3_EOD_SLACK_CHANNEL overrides the channel for testing. Ships paused.
+REGISTRY is a plain in-file list (no Variable / DB read at parse time — Airflow parses this every ~30s,
+so DAG top level must stay DB/API-free). All DAGs tick every 15 min; a per-DAG in-task gate fires
+ONCE/day at the config time (guarded by state_var). Env L3_EOD_SLACK_CHANNEL overrides the channel for
+testing. Ships paused.
 """
 
 from datetime import timedelta
@@ -26,7 +25,6 @@ import logging, os, json
 import pendulum
 from airflow import DAG
 from airflow.operators.python import PythonOperator
-from airflow.models import Variable
 
 logger = logging.getLogger(__name__)
 
@@ -34,30 +32,13 @@ ENV_CHANNEL      = os.getenv('L3_EOD_SLACK_CHANNEL')   # test override; unset in
 FALLBACK_CHANNEL = 'C0B4CHB1PRD'
 TRIG_HOUR, TRIG_MIN = 23, 30
 
-# Built-in fallback (used when the L3_REPORT_REGISTRY Variable is unset/invalid). To add an L3 report in
-# prod, edit the Variable rather than this list — no code push needed.
-DEFAULT_REGISTRY = [
+# The L3 reports this file builds. Add a report = one entry here (its config + message queries live in
+# Redash). Kept as a plain list on purpose: read at parse time with zero metadata-DB hit.
+REGISTRY = [
     {"dag_id": "l3_eod_report",     "config_query_id": 47194, "state_var": "L3_EOD_STATE",     "tags": []},
     {"dag_id": "l3_weekly_report",  "config_query_id": 47574, "state_var": "L3_WEEKLY_STATE",  "tags": ["weekly"]},
     {"dag_id": "l3_morning_report", "config_query_id": 47887, "state_var": "L3_MORNING_STATE", "tags": []},
 ]
-
-
-def _registry():
-    """Read L3_REPORT_REGISTRY (env-backed) at parse time; fall back to DEFAULT_REGISTRY on
-    missing/blank/invalid so a bad Variable can never break DAG parsing."""
-    try:
-        raw = Variable.get('L3_REPORT_REGISTRY', default_var=None)
-    except Exception:
-        raw = None
-    if not raw:
-        return DEFAULT_REGISTRY
-    try:
-        reg = json.loads(raw)
-    except Exception:
-        logger.warning('L3_REPORT_REGISTRY is not valid JSON; using DEFAULT_REGISTRY')
-        return DEFAULT_REGISTRY
-    return reg if isinstance(reg, list) and reg else DEFAULT_REGISTRY
 
 
 def _cfg(cfg, key, default=None):
@@ -165,8 +146,5 @@ def _build(entry):
 
 
 # Airflow discovers DAG objects that live in module globals — emit one per registry entry.
-for _entry in _registry():
-    try:
-        globals()[_entry['dag_id']] = _build(_entry)
-    except Exception:
-        logger.exception('skipping bad L3 registry entry: %r', _entry)
+for _entry in REGISTRY:
+    globals()[_entry['dag_id']] = _build(_entry)
