@@ -64,7 +64,8 @@ def run_report(**context):
 
     trig_hour = _int('trigger_hour', TRIG_HOUR)
     trig_min  = _int('trigger_minute', TRIG_MIN)
-    trig_dow  = cfg.get('trigger_dow')
+    trig_dow  = _int('trigger_dow', TRIG_DOW)   # fall back to Monday, like hour/minute — a missing
+    #                                             config must not silently make the weekly report daily
     channel = ENV_CHANNEL or cfg.get('report_channel_id')
     if not channel:
         raise Exception('no report_channel_id in config and SOCIAL_WEEKLY_SLACK_CHANNEL unset')
@@ -72,7 +73,7 @@ def run_report(**context):
     state = _load_state(Variable, STATE_VAR)
     now = pendulum.now('Asia/Kolkata')
     today_key = now.format('YYYY-MM-DD')
-    dow_ok = (trig_dow in (None, '')) or (now.isoweekday() == int(trig_dow))
+    dow_ok = (now.isoweekday() == trig_dow)
     time_reached = (now.hour * 60 + now.minute) >= (trig_hour * 60 + trig_min)
     already = (state.get('_last_fire_date') == today_key)
     fire = dow_ok and time_reached and not already
