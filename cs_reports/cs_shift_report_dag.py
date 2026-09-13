@@ -252,7 +252,7 @@ def run_shift_report(mode, **context):
 
 # ==================== DAGS ====================
 _default_args = {
-    'owner': 'cs_team', 'depends_on_past': False,
+    'owner': 'rishav.k@emergent.sh', 'depends_on_past': False,
     'start_date': pendulum.datetime(2025, 1, 1, tz='Asia/Kolkata'),
     'email_on_failure': False, 'email_on_retry': False,
     'retries': 2, 'retry_delay': timedelta(minutes=3),
