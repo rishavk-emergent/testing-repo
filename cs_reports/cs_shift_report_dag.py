@@ -1,14 +1,16 @@
 """
-CS L1/L2 Shift Report - one file, two DAGs (daily + weekly), two PNGs per run (L1 + L2).
+CS L1/L2 Shift Report - one file, two DAGs (daily + weekly), three PNGs per run (L1, L2 Full Stack, L2 Expo).
 
 Reads a Redash query (so the shift roster / SQL is edited in Redash, not here):
   * daily  DAG  (cs_shift_report_daily)  -> query 37455, schedule 0 10 * * *  (10:00 IST)
   * weekly DAG  (cs_shift_report_weekly) -> query 37461, schedule 0 10 * * 1  (Mon 10:00 IST)
 
-Each run renders TWO PNGs with Pillow (no matplotlib): one for L1, one for L2. Each PNG has:
+Each run renders THREE PNGs with Pillow (no matplotlib): L1, L2 Full Stack, L2 Expo. Each PNG has:
   Section 1 - tier summary: total closed / OW / Human + p50 TATs (Created->OW, Esc->Human, Created->Human)
   Section 2 - per shift -> per agent table: closed, reopen, reopen %, median TAT, CSAT %
-Both PNGs are posted to one Slack message.
+The L2 split: agent tables come from the shift_config roster (Expo people vs the rest); the summary tiles
+split by ticket tag (canonical Expo = `expo` AND NOT `deployment`, per Redash #40438; else Full Stack).
+All three PNGs post in one Slack message.
 
 Standalone: DejaVu font embedded as base64 (reused from the cs_report DAGs); Pillow >= 8.0.
 Channel: cs-associates (C0B075CBPS7); override CS_SHIFT_REPORT_SLACK_CHANNEL env for testing.
@@ -20,8 +22,6 @@ from airflow import DAG
 from airflow.operators.python import PythonOperator
 from PIL import Image, ImageDraw, ImageFont
 
-from utils.slack import RedashClient
-from utils.slack.slack_config import REDASH_API_KEY, REDASH_BASE_URL, SLACK_BOT_TOKEN_ALERTS as SLACK_TOKEN
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +80,14 @@ def _csat_color(v, csat_n):
     return RED
 
 # ==================== RENDER ====================
-COLS = [('Closed', 'closed'), ('Med TAT', 'tat'), ('Reopen (last 7d)', 'reopen'), ('Reopen% (last 7d)', 'reopenp'), ('CSAT% (last 7d)', 'csat')]
+# 4 close-EVENT columns (closer-attributed, from #37455) first, a divider, then the original 5.
+COLS = [
+    ('Total Closed Events', 'total_ce'), ('New Closed', 'new_closes'),
+    ('Re-closed·Other', 'reopen_closes_other'), ('Re-closed·Self', 'self_reopen_closes'),
+    ('Closed', 'closed'), ('Med TAT', 'tat'), ('Reopen (last 7d)', 'reopen'),
+    ('Reopen% (last 7d)', 'reopenp'), ('CSAT% (last 7d)', 'csat'),
+]
+CLOSE_COLS = 4  # first N columns are the close-event group; a vertical divider follows them
 
 def _split_rows(rows, tier):
     summ = next((r for r in rows if r.get('section') == 'summary' and r.get('tier') == tier), None)
@@ -96,7 +103,7 @@ def _split_rows(rows, tier):
 def render_tier(rows, tier, mode, period_label):
     summ, shift_groups = _split_rows(rows, tier)
     # ---- geometry (base px) ----
-    Wb = 1180
+    Wb = 1680
     margin = 44
     row_h = 34
     title_h = 70
@@ -117,8 +124,9 @@ def render_tier(rows, tier, mode, period_label):
 
     # numeric columns: evenly spaced right edges, inset from the right margin
     name_x = margin + 8
-    n = len(COLS); col_w = 132; right_edge = Wb - margin - 8
+    n = len(COLS); col_w = 140; right_edge = Wb - margin - 8
     col_rx = [right_edge - (n - 1 - i) * col_w for i in range(n)]
+    sep_x = col_rx[CLOSE_COLS - 1] + col_w / 2  # divider between the close-event group and the rest
 
     y = 32
     # ---- title ----
@@ -159,6 +167,7 @@ def render_tier(rows, tier, mode, period_label):
         text(Wb - margin - 12, y + shift_hdr_h / 2, '%d agents' % len(grp), 10, color=SUB, anchor='rm')
         y += shift_hdr_h + 6
         # column header
+        tbl_top = y
         text(name_x, y + col_hdr_h / 2, 'AGENT', 9, bold=True, color=SUB)
         for (label, _), rx in zip(COLS, col_rx):
             text(rx, y + col_hdr_h / 2, label.upper(), 9, bold=True, color=SUB, anchor='rm')
@@ -169,8 +178,15 @@ def render_tier(rows, tier, mode, period_label):
             cy = y + row_h / 2
             if i % 2 == 0:
                 d.rectangle([_px(margin), _px(y), _px(Wb - margin), _px(y + row_h)], fill=CARD)
-            text(name_x, cy, (r.get('agent_name') or '-')[:34], 11.5, color=INK)
+            text(name_x, cy, (r.get('agent_name') or '-')[:30], 11.5, color=INK)
+            _ne = _num(r.get('new_closes')) or 0
+            _ro = _num(r.get('reopen_closes_other')) or 0
+            _rs = _num(r.get('self_reopen_closes')) or 0
             vals = [
+                (_fmt_int(_ne + _ro + _rs), INK),               # Total Closed Events
+                (_fmt_int(r.get('new_closes')), INK),           # New Closed
+                (_fmt_int(r.get('reopen_closes_other')), INK),  # Re-closed · Other
+                (_fmt_int(r.get('self_reopen_closes')), INK),   # Re-closed · Self
                 (_fmt_int(r.get('total_closed')), INK),
                 (_fmt_tat(r.get('median_tat')), INK),
                 (_fmt_int(r.get('reopen_count')), INK),
@@ -180,6 +196,7 @@ def render_tier(rows, tier, mode, period_label):
             for (s, col), rx in zip(vals, col_rx):
                 text(rx, cy, s, 11.5, color=col, anchor='rm')
             y += row_h
+        d.line([(_px(sep_x), _px(tbl_top)), (_px(sep_x), _px(y))], fill=BORDER, width=SS)
         y += gap
 
     img = img.resize((Wb, Hb), Image.LANCZOS)
@@ -215,6 +232,8 @@ def _period_label(mode):
     return now.subtract(days=1).format('DD/MM/YYYY')
 
 def run_shift_report(mode, **context):
+    from utils.slack import RedashClient
+    from utils.slack.slack_config import REDASH_API_KEY, REDASH_BASE_URL, SLACK_BOT_TOKEN_ALERTS as SLACK_TOKEN
     redash = RedashClient(api_key=REDASH_API_KEY, base_url=REDASH_BASE_URL)
     rows = redash.fetch_query_results(query_id=SHIFT_QUERY_ID, max_retries=3)
     if not rows:
@@ -224,7 +243,8 @@ def run_shift_report(mode, **context):
         raise Exception('no %s rows from query %s' % (mode, SHIFT_QUERY_ID))
     period = _period_label(mode)
     images = [('L1 Shift Report', render_tier(rows, 'L1', mode, period)),
-              ('L2 Shift Report', render_tier(rows, 'L2', mode, period))]
+              ('L2 Full Stack Shift Report', render_tier(rows, 'L2 Full Stack', mode, period)),
+              ('L2 Expo Shift Report', render_tier(rows, 'L2 Expo', mode, period))]
     head = 'WEEKLY' if mode == 'weekly' else 'DAILY'
     caption = ':bar_chart: *L1/L2 Shift Report - %s - %s*' % (head, period)
     slack_upload_v2(SLACK_TOKEN, SLACK_CHANNEL, images, caption)
