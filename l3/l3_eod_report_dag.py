@@ -35,7 +35,7 @@ TRIG_HOUR, TRIG_MIN = 23, 30
 # The L3 reports this file builds. Add a report = one entry here (its config + message queries live in
 # Redash). Kept as a plain list on purpose: read at parse time with zero metadata-DB hit.
 REGISTRY = [
-    {"dag_id": "l3_eod_report",     "config_query_id": 47194, "state_var": "L3_EOD_STATE",     "tags": []},
+    {"dag_id": "l3_eod_report",     "config_query_id": 48522, "state_var": "L3_EOD_STATE",     "tags": []},
     {"dag_id": "l3_weekly_report",  "config_query_id": 47574, "state_var": "L3_WEEKLY_STATE",  "tags": ["weekly"]},
     {"dag_id": "l3_morning_report", "config_query_id": 47887, "state_var": "L3_MORNING_STATE", "tags": []},
 ]
@@ -78,9 +78,12 @@ def run_report(config_query_id, state_var, **context):
     logger.info('L3 REPORT (config #%s)', config_query_id)
     redash = RedashClient(REDASH_API_KEY, REDASH_BASE_URL)
 
-    cfg = redash.fetch_query_results(config_query_id) or []
+    cfg = []
+    try:
+        cfg = redash.fetch_query_results(config_query_id) or []
+    except Exception as e:
+        logger.warning('config query %s fetch failed, using defaults: %s', config_query_id, e)
     channel = ENV_CHANNEL or _cfg(cfg, 'channel_id', FALLBACK_CHANNEL)
-    msg_qid = int(_cfg(cfg, 'message_query_id'))
     trig_hour = _int(cfg, 'trigger_hour', TRIG_HOUR)
     trig_min  = _int(cfg, 'trigger_minute', TRIG_MIN)
     trig_dow  = _cfg(cfg, 'trigger_dow')          # optional; isoweekday 1..7, None = every day
@@ -98,6 +101,10 @@ def run_report(config_query_id, state_var, **context):
     if not fire:
         logger.info('gate closed, exiting')
         return
+
+    # Resolved past the gate: it has no default, so an unreachable config query must
+    # not blow up a non-trigger tick.
+    msg_qid = int(_cfg(cfg, 'message_query_id'))
 
     rows = redash.fetch_query_results(msg_qid) or []
     message = (rows[0].get('message') if rows else None)
