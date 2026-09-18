@@ -5,9 +5,10 @@ queries), so a *content* change never touches this file; adding a whole new L3 r
 entry in REGISTRY + a PR.
 
 Each generated DAG: read its config -> gate on time (+ optional day-of-week) -> run its message query -> post.
-  * l3_eod_report     (daily)   -> config #47194 -> message #47195  ([L3 EOD] table, 23:30 IST)
+  * l3_eod_report     (daily)   -> config #48522 -> message #47886  ([L3 Report] table, 23:30 IST)
+  * l3_morning_report (daily)   -> config #47887 -> message #47886  ([L3 Report] table, 11:30 IST)
   * l3_weekly_report  (weekly)  -> config #47574 -> message #47573  ([L3 Weekly] table, Sun 11:30 IST)
-  * l3_morning_report (daily)   -> config #47887 -> message #47886  ([L3 Morning] table, 11:30 IST)
+  (morning + eod share ONE message query #47886 — same 'L3 Report' table: Open/Pending + Closed 24h/48h.)
 
 Config columns (edit in Redash, no code push): channel_id, trigger_hour, trigger_minute, message_query_id,
 and trigger_dow — isoweekday 1=Mon..7=Sun; when set the DAG fires only that weekday. The message query
