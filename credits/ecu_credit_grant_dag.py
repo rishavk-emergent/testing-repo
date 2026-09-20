@@ -6,7 +6,7 @@ FLOW (all per-run config lives in Redash #48782, no code push to change values):
      "Request ECU" button (Slack Workflow-Builder form link).
   2. A teammate fills that form -> Slack Workflow Builder drops a structured "ECU REQUEST" message
      into the intake channel (credit-audit-channel). That message's ts IS the request_id.
-  3. Each 30-min tick the DAG polls the intake channel; for every NEW request it posts a
+  3. Each 15-min tick the DAG polls the intake channel; for every NEW request it posts a
      card (customer/amount/reason) as a threaded reply under the day's master message, with
      two buttons — ✅ Approve / ❌ Reject — whose `value` is the intake ts (so a click threads
      back under the right request in the intake channel).
@@ -357,7 +357,7 @@ dag = DAG(
     'ecu_credit_grant',
     default_args=default_args,
     description='Human-in-the-loop ECU credit grants: form -> card w/ approve/reject -> grant+approve (config #%d)' % CONFIG_QUERY_ID,
-    schedule_interval='*/30 * * * *',
+    schedule_interval='*/15 * * * *',
     catchup=False,
     max_active_runs=1,
     is_paused_upon_creation=True,
