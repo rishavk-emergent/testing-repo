@@ -167,8 +167,9 @@ def run_ecu(config_query_id, state_var, **context):
     # ---- card blocks ----
     def card_blocks(req, status_line=None, with_buttons=True):
         body = (":inbox_tray: *New Request*\n"
-                "• customer: `%s`\n• amount: *%s ECU*\n• reason: %s\n• requested_by: %s"
-                % (req.get('customer_email'), req.get('amount'), req.get('reason'), req.get('requested_by')))
+                "• *Customer Email:* %s\n• *Amount:* %s ECU\n• *Reason:* %s\n• *Requested By:* %s"
+                % (req.get('customer_email'), req.get('amount'), req.get('reason'),
+                   req.get('requested_by_mention') or req.get('requested_by')))
         blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": body}}]
         if with_buttons:
             rid = req['intake_ts']
@@ -227,12 +228,19 @@ def run_ecu(config_query_id, state_var, **context):
             amount = float(amount_raw)
         except Exception:
             amount = None
+        rb = field(text, 'Requested By')
+        rb_mention = rb  # fall back to raw text if it can't be resolved to a Slack user
+        if rb and '@' in rb:
+            lk = slack_get('users.lookupByEmail', email=rb)
+            if lk.get('ok'):
+                rb_mention = '<@%s>' % lk['user']['id']
         req = {
             'intake_ts': intake_ts,
             'customer_email': field(text, 'Customer Email'),
             'amount': amount,
             'reason': field(text, 'Reason'),
-            'requested_by': field(text, 'Requested By'),
+            'requested_by': rb,
+            'requested_by_mention': rb_mention,
             'status': 'pending',
             'posted_at': now.to_iso8601_string(),
             'approval_request_id': None,
