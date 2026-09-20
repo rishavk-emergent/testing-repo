@@ -26,10 +26,10 @@ Airflow Variable ONLY after the action truly succeeds, so partial failures alway
 and a request is acted on exactly once. If grant returns PENDING_APPROVAL its approval id is
 stored so a retry re-approves that same id instead of re-granting (no duplicate issuance).
 
-SECRETS are NOT in the config query — they are env-backed Airflow Variables:
-  SLACK_BOT_TOKEN_EMERGENT_CS  (the dedicated Emergent-CS bot; needs chat:write, channels/groups:history,
-                                users:read.email) and  ECU_SUPPORT_BEARER  (support-tool approver JWT).
-Provision both in Composer as AIRFLOW_VAR_* before unpausing. Ships paused.
+AUTH: the Emergent-CS bot token (chat:write, channels/groups:history, users:read.email) lives in the
+config query #48782 as `slack_bot_token` (by owner's choice — note it is a live secret readable by anyone
+with Redash access to that query). The support-tool approver JWT stays an env-backed Airflow Variable
+ECU_SUPPORT_BEARER (billing credential). Provision ECU_SUPPORT_BEARER in Composer before unpausing. Ships paused.
 
 Top level stays DB/API-free (Airflow re-parses every ~30s): only constants + the DAG object.
 """
@@ -78,20 +78,20 @@ def run_ecu(config_query_id, state_var, **context):
     from utils.slack.slack_config import REDASH_API_KEY, REDASH_BASE_URL
     from utils.slack.redash_client import RedashClient
 
-    slack_token   = V.get('SLACK_BOT_TOKEN_EMERGENT_CS', default_var=None)
     support_bearer = V.get('ECU_SUPPORT_BEARER', default_var=None)
-    if not slack_token:
-        raise Exception('Airflow Variable SLACK_BOT_TOKEN_EMERGENT_CS is not set')
 
     IST = 'Asia/Kolkata'
     now = pendulum.now(IST)
 
-    # ---- config ----
+    # ---- config (incl. the Emergent-CS bot token — by design the token lives in the query, #48782) ----
     cfg = []
     try:
         cfg = RedashClient(REDASH_API_KEY, REDASH_BASE_URL).fetch_query_results(config_query_id) or []
     except Exception as e:
         logger.warning('config query %s fetch failed, using fallbacks: %s', config_query_id, e)
+    slack_token = _cfg(cfg, 'slack_bot_token')
+    if not slack_token:
+        raise Exception('slack_bot_token missing from config query %s (Redash unreachable or column removed)' % config_query_id)
     main_ch   = _cfg(cfg, 'main_channel_id', FB_MAIN_CHANNEL)
     intake_ch = _cfg(cfg, 'intake_channel_id', FB_INTAKE_CHANNEL)
     workflow_url = _cfg(cfg, 'workflow_url')
