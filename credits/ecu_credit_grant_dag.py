@@ -77,8 +77,7 @@ def run_ecu(config_query_id, state_var, **context):
     import json, re
     import requests
     from airflow.models import Variable as V
-    from utils.slack.slack_config import REDASH_API_KEY, REDASH_BASE_URL
-    from utils.slack.redash_client import RedashClient
+    from utils.redash import RedashClient
 
     IST = 'Asia/Kolkata'
     now = pendulum.now(IST)
@@ -86,7 +85,7 @@ def run_ecu(config_query_id, state_var, **context):
     # ---- config (incl. the Emergent-CS bot token — by design the token lives in the query, #48782) ----
     cfg = []
     try:
-        cfg = RedashClient(REDASH_API_KEY, REDASH_BASE_URL).fetch_query_results(config_query_id) or []
+        cfg = RedashClient().fetch_query_results(config_query_id) or []
     except Exception as e:
         logger.warning('config query %s fetch failed, using fallbacks: %s', config_query_id, e)
     slack_token = _cfg(cfg, 'slack_bot_token')
@@ -102,10 +101,12 @@ def run_ecu(config_query_id, state_var, **context):
     per_request_cap = _int(cfg, 'per_request_cap', 0)
     reason_default = _cfg(cfg, 'reason_default', 'Customer Support')
     marker = _cfg(cfg, 'request_marker', FB_MARKER)
+    excluded_ts = {x.strip() for x in (_cfg(cfg, 'excluded_request_ts', '') or '').split(',') if x.strip()}  # test/legacy submissions to ignore
     supa_url      = _cfg(cfg, 'supabase_url')
     supa_anon     = _cfg(cfg, 'supabase_anon_key')
     supa_email    = _cfg(cfg, 'supabase_email')
     supa_password = _cfg(cfg, 'supabase_password')
+    click_bot_id  = _cfg(cfg, 'click_bot_id')   # Slack bot_id of the Zapier app that posts CLICK ledger replies
 
     # ---- tiny Slack + support-tool helpers (utils/ is intentionally NOT modified) ----
     def slack_get(method, **params):
@@ -244,6 +245,7 @@ def run_ecu(config_query_id, state_var, **context):
             master_ts = resp['ts']
             state['master'][today] = master_ts
             state['bearer'] = mint_bearer()   # refresh the support-tool bearer once/day, here at the master post
+            V.set(state_var, json.dumps(state))   # PERSIST master immediately — a later error must not cause a duplicate master next run
             logger.info('posted master for %s -> %s (bearer refreshed=%s)', today, master_ts, bool(state.get('bearer')))
     if master_ts is None:
         # Before trigger time on a fresh day: nothing to thread cards under yet.
@@ -260,6 +262,8 @@ def run_ecu(config_query_id, state_var, **context):
         if marker not in text:
             continue
         intake_ts = m['ts']
+        if intake_ts in excluded_ts:
+            continue  # test/legacy submission, treat as already handled
         if intake_ts in state['requests']:
             continue
         amount_raw = field(text, 'ECU Amount')
@@ -289,28 +293,24 @@ def run_ecu(config_query_id, state_var, **context):
         if resp.get('ok'):
             req['card_ts'] = resp['ts']
             state['requests'][intake_ts] = req
+            V.set(state_var, json.dumps(state))   # PERSIST each posted card immediately — never re-post it
             logger.info('posted card for request %s (card %s)', intake_ts, req['card_ts'])
 
     # ---- 3. process pending requests: read CLICK replies, act, update card ----
-    for intake_ts, req in list(state['requests'].items()):
-        if req.get('status') != 'pending' or not req.get('card_ts'):
-            continue
-
-        # expiry
-        posted = pendulum.parse(req['posted_at'])
-        if now.diff(posted).in_hours() >= stale_hours:
-            req['status'] = 'expired'
-            update_card(req, ":hourglass: *Expired* — no approver action within %dh (no credit issued)" % stale_hours, with_buttons=False)
-            logger.info('request %s expired', intake_ts)
-            continue
-
-        # read CLICK ledger in the intake thread; take the first click by an allowlisted approver
+    # Each request is handled in isolation and state is persisted after EVERY request (success or
+    # error) so a single failing Slack/API call can never abort the run or lose the day's state.
+    def _process_pending(intake_ts, req):
+        # Read the CLICK ledger FIRST — a valid approver click near the 72h deadline must not be lost
+        # to expiry. Only trust replies posted by the Zapier app identity (click_bot_id); the user id
+        # embedded in plain text alone is forgeable by anyone who can post in the intake channel.
         replies = slack_get('conversations.replies', channel=intake_ch, ts=intake_ts, limit=50)
         decision = None  # (action, clicker_uid)
         for r in replies.get('messages', []):
             t = r.get('text', '')
             if not t.startswith('CLICK'):
                 continue
+            if click_bot_id and r.get('bot_id') != click_bot_id:
+                continue  # not from the trusted Zapier identity -> ignore
             am = re.search(r'action=(\S+)', t)
             um = re.search(r'user=(\S+)', t)
             if not am or not um:
@@ -318,8 +318,15 @@ def run_ecu(config_query_id, state_var, **context):
             if um.group(1) in approver_ids:
                 decision = (am.group(1), um.group(1))
                 break
+
         if not decision:
-            continue  # still pending, check next tick
+            # no qualifying approver click yet -> expire only once past the deadline
+            posted = pendulum.parse(req['posted_at'])
+            if now.diff(posted).in_hours() >= stale_hours:
+                req['status'] = 'expired'
+                update_card(req, ":hourglass: *Expired* — no approver action within %dh (no credit issued)" % stale_hours, with_buttons=False)
+                logger.info('request %s expired', intake_ts)
+            return
 
         action, clicker = decision
         who = email_for(clicker)
@@ -329,21 +336,21 @@ def run_ecu(config_query_id, state_var, **context):
             req['decided_by'] = who
             update_card(req, ":x: *Rejected* by %s — no credit issued · _%s_" % (who, ist_now_str()), with_buttons=False)
             logger.info('request %s rejected by %s', intake_ts, who)
-            continue
+            return
 
         if action != ACTION_APPROVE:
-            continue
+            return
 
         # DAG-side cap guard (server SOP is separate): never auto-approve above per_request_cap
         if per_request_cap and req.get('amount') and req['amount'] > per_request_cap:
             update_card(req, ":warning: amount %s exceeds DAG cap (%s) — handle manually" % (req['amount'], per_request_cap), with_buttons=True)
             logger.warning('request %s amount %s over cap %s', intake_ts, req['amount'], per_request_cap)
-            continue
+            return
 
         if not get_bearer():
             update_card(req, ":warning: *Approval failed* — could not mint support token, will retry · _%s_" % ist_now_str(), with_buttons=True)
-            logger.error('could not mint bearer (ECU_SUPABASE_REFRESH / anon key?) for %s', intake_ts)
-            continue
+            logger.error('could not mint bearer (supabase creds?) for %s', intake_ts)
+            return
 
         # grant (idempotent): reuse a stored approval id if grant already ran
         approval_id = req.get('approval_request_id')
@@ -354,14 +361,16 @@ def run_ecu(config_query_id, state_var, **context):
             if sc == 200 and body.get('success'):
                 if body.get('status') == 'PENDING_APPROVAL' and body.get('approval_request_id'):
                     approval_id = body['approval_request_id']
-                    req['approval_request_id'] = approval_id  # persisted below; safe to re-approve
+                    req['approval_request_id'] = approval_id
+                    V.set(state_var, json.dumps(state))  # persist approval id NOW so a retry re-approves, never re-grants
                 else:
                     ok = True  # under SOP: applied immediately, no approve step
+                    req['status'] = 'approved'; req['decided_by'] = who
+                    V.set(state_var, json.dumps(state))  # persist BEFORE proceeding so a crash can't re-grant
             else:
                 update_card(req, ":warning: *Approval failed* — grant error, will retry · _%s_" % ist_now_str(), with_buttons=True)
                 logger.error('grant failed for %s: %s %s', intake_ts, sc, body)
-                V.set(state_var, json.dumps(state))  # persist approval_id if any
-                continue
+                return
 
         if approval_id and not ok:
             sc, body = approve_refund(approval_id)
@@ -369,14 +378,23 @@ def run_ecu(config_query_id, state_var, **context):
             if not ok:
                 update_card(req, ":warning: *Approval failed* — approve error, will retry · _%s_" % ist_now_str(), with_buttons=True)
                 logger.error('approve failed for %s: %s %s', intake_ts, sc, body)
-                V.set(state_var, json.dumps(state))
-                continue
+                return
 
         # success — lock the card
         req['status'] = 'approved'
         req['decided_by'] = who
         update_card(req, ":white_check_mark: *Approved* by %s · %s ECU issued · _%s_" % (who, req.get('amount'), ist_now_str()), with_buttons=False)
         logger.info('request %s APPROVED by %s (%s ECU)', intake_ts, who, req.get('amount'))
+
+    for intake_ts, req in list(state['requests'].items()):
+        if req.get('status') != 'pending' or not req.get('card_ts'):
+            continue
+        try:
+            _process_pending(intake_ts, req)
+        except Exception as e:
+            logger.error('error processing request %s (left pending for next tick): %s', intake_ts, e)
+        finally:
+            V.set(state_var, json.dumps(state))  # persist after EVERY request, success or error
 
     V.set(state_var, json.dumps(state))
     logger.info('tick done: %d tracked requests', len(state['requests']))
