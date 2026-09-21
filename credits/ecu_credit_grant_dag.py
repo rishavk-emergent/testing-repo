@@ -26,14 +26,12 @@ Airflow Variable ONLY after the action truly succeeds, so partial failures alway
 and a request is acted on exactly once. If grant returns PENDING_APPROVAL its approval id is
 stored so a retry re-approves that same id instead of re-granting (no duplicate issuance).
 
-AUTH: the Emergent-CS bot token lives in config query #48782 as `slack_bot_token` (a live secret readable
-by anyone with Redash access to that query). The support-tool approver bearer is NOT stored — it is MINTED
-on demand from a rotating Supabase refresh token: `supabase_url` + `supabase_anon_key` (public) are in the
-config query, and the single rotating refresh token is the Airflow Variable ECU_SUPABASE_REFRESH, which the
-DAG exchanges (grant_type=refresh_token) for an approver JWT and then rewrites with the newly rotated
-refresh token. The refresh happens ONCE/DAY — at the moment the daily master message is posted — and the
-minted bearer is cached in state['bearer'] and reused for every grant/approve that day (the minted token
-is valid for days). Seed ECU_SUPABASE_REFRESH once (from a fresh SSO login) before unpausing. Ships paused.
+AUTH: the Emergent-CS bot token lives in config query #48782 as `slack_bot_token`. The support-tool approver
+bearer is NOT stored — it is MINTED via Supabase password grant (grant_type=password) from `supabase_url` +
+`supabase_anon_key` (public) + `supabase_email` + `supabase_password`, all in the config query (slack_bot_token
+and supabase_password are live secrets — anyone with Redash access to the query can read them). Stateless: no
+refresh-token rotation. The mint happens ONCE/DAY at the daily master post and the bearer is cached in
+state['bearer'] and reused for every grant/approve that day (a minted token is valid ~7 days). Ships paused.
 
 Top level stays DB/API-free (Airflow re-parses every ~30s): only constants + the DAG object.
 """
@@ -104,8 +102,10 @@ def run_ecu(config_query_id, state_var, **context):
     per_request_cap = _int(cfg, 'per_request_cap', 0)
     reason_default = _cfg(cfg, 'reason_default', 'Customer Support')
     marker = _cfg(cfg, 'request_marker', FB_MARKER)
-    supa_url  = _cfg(cfg, 'supabase_url')
-    supa_anon = _cfg(cfg, 'supabase_anon_key')
+    supa_url      = _cfg(cfg, 'supabase_url')
+    supa_anon     = _cfg(cfg, 'supabase_anon_key')
+    supa_email    = _cfg(cfg, 'supabase_email')
+    supa_password = _cfg(cfg, 'supabase_password')
 
     # ---- tiny Slack + support-tool helpers (utils/ is intentionally NOT modified) ----
     def slack_get(method, **params):
@@ -124,30 +124,26 @@ def run_ecu(config_query_id, state_var, **context):
     _bearer_cache = {}
 
     def mint_bearer():
-        """Mint a fresh support-tool approver bearer from the rotating Supabase refresh token.
-        Reads ECU_SUPABASE_REFRESH, exchanges it (grant_type=refresh_token), writes the NEW
-        rotated refresh token back so the chain stays alive, and caches the access token for
-        the rest of this run. Returns None (logged) on any failure so the caller can retry."""
+        """Mint a fresh support-tool approver bearer via Supabase password grant
+        (grant_type=password) using supabase_url/anon_key/email/password from the config query.
+        Stateless — no refresh-token rotation. The minted access token is valid ~7 days; cached
+        for the rest of this run. Returns None (logged) on failure so the caller can retry."""
         if _bearer_cache.get('tok'):
             return _bearer_cache['tok']
-        rt = V.get('ECU_SUPABASE_REFRESH', default_var=None)
-        if not (supa_url and supa_anon and rt):
-            logger.error('cannot mint bearer: missing supabase_url/anon_key (config) or ECU_SUPABASE_REFRESH (Variable)')
+        if not (supa_url and supa_anon and supa_email and supa_password):
+            logger.error('cannot mint bearer: missing supabase_url/anon_key/email/password in config query')
             return None
         try:
-            resp = requests.post(supa_url.rstrip('/') + '/auth/v1/token?grant_type=refresh_token',
+            resp = requests.post(supa_url.rstrip('/') + '/auth/v1/token?grant_type=password',
                                  headers={'apikey': supa_anon, 'Content-Type': 'application/json'},
-                                 json={'refresh_token': rt}, timeout=30)
+                                 json={'email': supa_email, 'password': supa_password}, timeout=30)
         except Exception as e:
-            logger.error('supabase refresh request error: %s', e)
+            logger.error('supabase password grant request error: %s', e)
             return None
         if resp.status_code != 200:
-            logger.error('supabase refresh failed: %s %s', resp.status_code, resp.text[:200])
+            logger.error('supabase password grant failed: %s %s', resp.status_code, resp.text[:200])
             return None
-        d = resp.json()
-        if d.get('refresh_token'):
-            V.set('ECU_SUPABASE_REFRESH', d['refresh_token'])   # rotate + persist for next run
-        _bearer_cache['tok'] = d.get('access_token')
+        _bearer_cache['tok'] = resp.json().get('access_token')
         return _bearer_cache['tok']
 
     def get_bearer():
