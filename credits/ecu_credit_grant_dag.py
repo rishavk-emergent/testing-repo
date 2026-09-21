@@ -26,10 +26,13 @@ Airflow Variable ONLY after the action truly succeeds, so partial failures alway
 and a request is acted on exactly once. If grant returns PENDING_APPROVAL its approval id is
 stored so a retry re-approves that same id instead of re-granting (no duplicate issuance).
 
-AUTH: the Emergent-CS bot token (chat:write, channels/groups:history, users:read.email) lives in the
-config query #48782 as `slack_bot_token` (by owner's choice — note it is a live secret readable by anyone
-with Redash access to that query). The support-tool approver JWT stays an env-backed Airflow Variable
-ECU_SUPPORT_BEARER (billing credential). Provision ECU_SUPPORT_BEARER in Composer before unpausing. Ships paused.
+AUTH: the Emergent-CS bot token lives in config query #48782 as `slack_bot_token` (a live secret readable
+by anyone with Redash access to that query). The support-tool approver bearer is NOT stored — it is MINTED
+on demand from a rotating Supabase refresh token: `supabase_url` + `supabase_anon_key` (public) are in the
+config query, and the single rotating refresh token is the Airflow Variable ECU_SUPABASE_REFRESH, which the
+DAG exchanges (grant_type=refresh_token) for a short-lived approver JWT and then rewrites with the newly
+rotated refresh token every time it mints. Seed ECU_SUPABASE_REFRESH once (from a fresh SSO login) before
+unpausing. Ships paused.
 
 Top level stays DB/API-free (Airflow re-parses every ~30s): only constants + the DAG object.
 """
@@ -78,8 +81,6 @@ def run_ecu(config_query_id, state_var, **context):
     from utils.slack.slack_config import REDASH_API_KEY, REDASH_BASE_URL
     from utils.slack.redash_client import RedashClient
 
-    support_bearer = V.get('ECU_SUPPORT_BEARER', default_var=None)
-
     IST = 'Asia/Kolkata'
     now = pendulum.now(IST)
 
@@ -102,6 +103,8 @@ def run_ecu(config_query_id, state_var, **context):
     per_request_cap = _int(cfg, 'per_request_cap', 0)
     reason_default = _cfg(cfg, 'reason_default', 'Customer Support')
     marker = _cfg(cfg, 'request_marker', FB_MARKER)
+    supa_url  = _cfg(cfg, 'supabase_url')
+    supa_anon = _cfg(cfg, 'supabase_anon_key')
 
     # ---- tiny Slack + support-tool helpers (utils/ is intentionally NOT modified) ----
     def slack_get(method, **params):
@@ -117,18 +120,51 @@ def run_ecu(config_query_id, state_var, **context):
                           json=payload, timeout=30)
         return r.json()
 
+    _bearer_cache = {}
+
+    def mint_bearer():
+        """Mint a fresh support-tool approver bearer from the rotating Supabase refresh token.
+        Reads ECU_SUPABASE_REFRESH, exchanges it (grant_type=refresh_token), writes the NEW
+        rotated refresh token back so the chain stays alive, and caches the access token for
+        the rest of this run. Returns None (logged) on any failure so the caller can retry."""
+        if _bearer_cache.get('tok'):
+            return _bearer_cache['tok']
+        rt = V.get('ECU_SUPABASE_REFRESH', default_var=None)
+        if not (supa_url and supa_anon and rt):
+            logger.error('cannot mint bearer: missing supabase_url/anon_key (config) or ECU_SUPABASE_REFRESH (Variable)')
+            return None
+        try:
+            resp = requests.post(supa_url.rstrip('/') + '/auth/v1/token?grant_type=refresh_token',
+                                 headers={'apikey': supa_anon, 'Content-Type': 'application/json'},
+                                 json={'refresh_token': rt}, timeout=30)
+        except Exception as e:
+            logger.error('supabase refresh request error: %s', e)
+            return None
+        if resp.status_code != 200:
+            logger.error('supabase refresh failed: %s %s', resp.status_code, resp.text[:200])
+            return None
+        d = resp.json()
+        if d.get('refresh_token'):
+            V.set('ECU_SUPABASE_REFRESH', d['refresh_token'])   # rotate + persist for next run
+        _bearer_cache['tok'] = d.get('access_token')
+        return _bearer_cache['tok']
+
     def grant_tokens(email, amount, detail):
+        bearer = mint_bearer()
+        if not bearer:
+            return None, {'error': 'no_bearer'}
         r = requests.post(SUPPORT_HOST + '/api/grant-tokens',
-                          headers={'Authorization': 'Bearer ' + (support_bearer or ''),
-                                   'Content-Type': 'application/json'},
+                          headers={'Authorization': 'Bearer ' + bearer, 'Content-Type': 'application/json'},
                           json={'email': email, 'ecu_amount': amount, 'ecu_type': 'ecu',
                                 'reason': reason_default, 'reason_detail': detail}, timeout=30)
         return r.status_code, (r.json() if r.content else {})
 
     def approve_refund(refund_id):
+        bearer = mint_bearer()
+        if not bearer:
+            return None, {'error': 'no_bearer'}
         r = requests.post(SUPPORT_HOST + '/api/approve-refund',
-                          headers={'Authorization': 'Bearer ' + (support_bearer or ''),
-                                   'Content-Type': 'application/json'},
+                          headers={'Authorization': 'Bearer ' + bearer, 'Content-Type': 'application/json'},
                           json={'refund_id': refund_id}, timeout=30)
         return r.status_code, (r.json() if r.content else {})
 
@@ -301,9 +337,9 @@ def run_ecu(config_query_id, state_var, **context):
             logger.warning('request %s amount %s over cap %s', intake_ts, req['amount'], per_request_cap)
             continue
 
-        if not support_bearer:
-            update_card(req, ":warning: *Approval failed* — support token missing, will retry", with_buttons=True)
-            logger.error('ECU_SUPPORT_BEARER not set; cannot grant %s', intake_ts)
+        if not mint_bearer():
+            update_card(req, ":warning: *Approval failed* — could not mint support token, will retry · _%s_" % ist_now_str(), with_buttons=True)
+            logger.error('could not mint bearer (ECU_SUPABASE_REFRESH / anon key?) for %s', intake_ts)
             continue
 
         # grant (idempotent): reuse a stored approval id if grant already ran
