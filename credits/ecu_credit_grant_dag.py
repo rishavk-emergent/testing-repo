@@ -30,9 +30,10 @@ AUTH: the Emergent-CS bot token lives in config query #48782 as `slack_bot_token
 by anyone with Redash access to that query). The support-tool approver bearer is NOT stored — it is MINTED
 on demand from a rotating Supabase refresh token: `supabase_url` + `supabase_anon_key` (public) are in the
 config query, and the single rotating refresh token is the Airflow Variable ECU_SUPABASE_REFRESH, which the
-DAG exchanges (grant_type=refresh_token) for a short-lived approver JWT and then rewrites with the newly
-rotated refresh token every time it mints. Seed ECU_SUPABASE_REFRESH once (from a fresh SSO login) before
-unpausing. Ships paused.
+DAG exchanges (grant_type=refresh_token) for an approver JWT and then rewrites with the newly rotated
+refresh token. The refresh happens ONCE/DAY — at the moment the daily master message is posted — and the
+minted bearer is cached in state['bearer'] and reused for every grant/approve that day (the minted token
+is valid for days). Seed ECU_SUPABASE_REFRESH once (from a fresh SSO login) before unpausing. Ships paused.
 
 Top level stays DB/API-free (Airflow re-parses every ~30s): only constants + the DAG object.
 """
@@ -149,8 +150,13 @@ def run_ecu(config_query_id, state_var, **context):
         _bearer_cache['tok'] = d.get('access_token')
         return _bearer_cache['tok']
 
+    def get_bearer():
+        # The bearer is refreshed ONCE/DAY at the master post (stored in state['bearer']); reuse
+        # it all day. Fall back to minting on demand only if it's missing (e.g. that refresh failed).
+        return state.get('bearer') or mint_bearer()
+
     def grant_tokens(email, amount, detail):
-        bearer = mint_bearer()
+        bearer = get_bearer()
         if not bearer:
             return None, {'error': 'no_bearer'}
         r = requests.post(SUPPORT_HOST + '/api/grant-tokens',
@@ -160,7 +166,7 @@ def run_ecu(config_query_id, state_var, **context):
         return r.status_code, (r.json() if r.content else {})
 
     def approve_refund(refund_id):
-        bearer = mint_bearer()
+        bearer = get_bearer()
         if not bearer:
             return None, {'error': 'no_bearer'}
         r = requests.post(SUPPORT_HOST + '/api/approve-refund',
@@ -241,7 +247,8 @@ def run_ecu(config_query_id, state_var, **context):
         if resp.get('ok'):
             master_ts = resp['ts']
             state['master'][today] = master_ts
-            logger.info('posted master for %s -> %s', today, master_ts)
+            state['bearer'] = mint_bearer()   # refresh the support-tool bearer once/day, here at the master post
+            logger.info('posted master for %s -> %s (bearer refreshed=%s)', today, master_ts, bool(state.get('bearer')))
     if master_ts is None:
         # Before trigger time on a fresh day: nothing to thread cards under yet.
         V.set(state_var, json.dumps(state))
@@ -337,7 +344,7 @@ def run_ecu(config_query_id, state_var, **context):
             logger.warning('request %s amount %s over cap %s', intake_ts, req['amount'], per_request_cap)
             continue
 
-        if not mint_bearer():
+        if not get_bearer():
             update_card(req, ":warning: *Approval failed* — could not mint support token, will retry · _%s_" % ist_now_str(), with_buttons=True)
             logger.error('could not mint bearer (ECU_SUPABASE_REFRESH / anon key?) for %s', intake_ts)
             continue
