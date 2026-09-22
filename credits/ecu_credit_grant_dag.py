@@ -203,13 +203,40 @@ def run_ecu(config_query_id, state_var, **context):
         m = re.search(r'\*?' + re.escape(label) + r':\*?\s*(.+)', text or '')
         return unwrap(m.group(1).strip()) if m else None
 
+    def reason_full(text):
+        # Reason may be multi-line — capture everything from the Reason label up to the next
+        # field label (Requested By) or end of message, so the WHOLE reason is preserved.
+        m = re.search(r'\*?Reason:\*?\s*(.*?)\s*(?=\n\*?Requested By:|\Z)', text or '', re.DOTALL)
+        return m.group(1).strip() if m else None
+
+    def _chunk(s, n=2900):
+        # split into <=n-char pieces on line boundaries (Slack section text max is 3000 chars)
+        out, cur = [], ''
+        for line in (s or '').split('\n'):
+            while len(line) > n:
+                if cur:
+                    out.append(cur); cur = ''
+                out.append(line[:n]); line = line[n:]
+            if len(cur) + len(line) + 1 > n:
+                out.append(cur); cur = line
+            else:
+                cur = (cur + '\n' + line) if cur else line
+        if cur:
+            out.append(cur)
+        return out or ['']
+
     # ---- card blocks ----
     def card_blocks(req, status_line=None, with_buttons=True):
-        body = (":inbox_tray: *New Request*\n"
-                "• *Customer Email:* %s\n• *Amount:* %s ECU\n• *Reason:* %s\n• *Requested By:* %s"
-                % (req.get('customer_email'), req.get('amount'), req.get('reason'),
+        head = (":inbox_tray: *New Request*\n"
+                "• *Customer Email:* %s\n• *Amount:* %s ECU\n• *Requested By:* %s"
+                % (req.get('customer_email'), req.get('amount'),
                    req.get('requested_by_mention') or req.get('requested_by')))
-        blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": body}}]
+        blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": head}}]
+        # Reason gets its own block(s) so the FULL (possibly long/multi-line) reason is shown,
+        # chunked to stay under Slack's 3000-char-per-section limit.
+        reason = req.get('reason') or '_(none)_'
+        for c in _chunk('*Reason:*\n' + reason):
+            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": c}})
         if with_buttons:
             rid = req['intake_ts']
             blocks.append({"type": "actions", "block_id": rid, "elements": [
@@ -287,7 +314,7 @@ def run_ecu(config_query_id, state_var, **context):
             'intake_ts': intake_ts,
             'customer_email': field(text, 'Customer Email'),
             'amount': amount,
-            'reason': field(text, 'Reason'),
+            'reason': reason_full(text),
             'requested_by': rb,
             'requested_by_mention': rb_mention,
             'status': 'pending',
