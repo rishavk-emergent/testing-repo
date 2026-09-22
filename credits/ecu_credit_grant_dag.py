@@ -235,7 +235,7 @@ def run_ecu(config_query_id, state_var, **context):
         # Reason gets its own block(s) so the FULL (possibly long/multi-line) reason is shown,
         # chunked to stay under Slack's 3000-char-per-section limit.
         reason = req.get('reason') or '_(none)_'
-        for c in _chunk('*Reason:*\n' + reason):
+        for c in _chunk('*Reason:*\n' + reason, 1000):
             blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": c}})
         if with_buttons:
             rid = req['intake_ts']
