@@ -222,8 +222,14 @@ def run_ecu(config_query_id, state_var, **context):
         return blocks
 
     def update_card(req, status_line, with_buttons):
-        slack_post('chat.update', {"channel": main_ch, "ts": req['card_ts'],
-                                   "text": "ECU request", "blocks": card_blocks(req, status_line, with_buttons)})
+        # best-effort: a chat.update failure must never abort the run or wrongly lock terminal state
+        try:
+            r = slack_post('chat.update', {"channel": main_ch, "ts": req['card_ts'],
+                                           "text": "ECU request", "blocks": card_blocks(req, status_line, with_buttons)})
+            return bool(r.get('ok'))
+        except Exception as e:
+            logger.error('card update failed for %s: %s', req.get('intake_ts'), e)
+            return False
 
     def ist_now_str():
         return pendulum.now(IST).format('YYYY-MM-DD HH:mm') + ' IST'
@@ -323,19 +329,19 @@ def run_ecu(config_query_id, state_var, **context):
             # no qualifying approver click yet -> expire only once past the deadline
             posted = pendulum.parse(req['posted_at'])
             if now.diff(posted).in_hours() >= stale_hours:
-                req['status'] = 'expired'
-                update_card(req, ":hourglass: *Expired* — no approver action within %dh (no credit issued)" % stale_hours, with_buttons=False)
-                logger.info('request %s expired', intake_ts)
+                if update_card(req, ":hourglass: *Expired* — no approver action within %dh (no credit issued)" % stale_hours, with_buttons=False):
+                    req['status'] = 'expired'   # terminal only after the card updated (no billing -> safe to retry)
+                    logger.info('request %s expired', intake_ts)
             return
 
         action, clicker = decision
         who = email_for(clicker)
 
         if action == ACTION_REJECT:
-            req['status'] = 'rejected'
-            req['decided_by'] = who
-            update_card(req, ":x: *Rejected* by %s — no credit issued · _%s_" % (who, ist_now_str()), with_buttons=False)
-            logger.info('request %s rejected by %s', intake_ts, who)
+            if update_card(req, ":x: *Rejected* by %s — no credit issued · _%s_" % (who, ist_now_str()), with_buttons=False):
+                req['status'] = 'rejected'   # terminal only after the card updated (no billing -> safe to retry)
+                req['decided_by'] = who
+                logger.info('request %s rejected by %s', intake_ts, who)
             return
 
         if action != ACTION_APPROVE:
@@ -380,13 +386,19 @@ def run_ecu(config_query_id, state_var, **context):
                 logger.error('approve failed for %s: %s %s', intake_ts, sc, body)
                 return
 
-        # success — lock the card
+        # success — credit is already issued, so persist 'approved' regardless (never re-grant);
+        # the card update is best-effort (cosmetic) and only stale if chat.update fails.
         req['status'] = 'approved'
         req['decided_by'] = who
         update_card(req, ":white_check_mark: *Approved* by %s · %s ECU issued · _%s_" % (who, req.get('amount'), ist_now_str()), with_buttons=False)
         logger.info('request %s APPROVED by %s (%s ECU)', intake_ts, who, req.get('amount'))
 
     for intake_ts, req in list(state['requests'].items()):
+        if intake_ts in excluded_ts:
+            if req.get('status') == 'pending':
+                req['status'] = 'excluded'   # excluded at runtime AFTER being tracked -> never act on it
+                V.set(state_var, json.dumps(state))
+            continue
         if req.get('status') != 'pending' or not req.get('card_ts'):
             continue
         try:
