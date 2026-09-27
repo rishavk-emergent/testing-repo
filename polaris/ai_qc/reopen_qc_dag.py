@@ -27,12 +27,18 @@ WHAT IT DOES (every 5 min)
 
 DOWNSTREAM (unchanged): Redash #36967 / #37182 / #36969 read this table.
 
-CONFIG (Airflow Variable or Composer Secret; env fallback):
-  POLARIS_BASE_URL  — base URL of the Polaris backend that serves /api/reopen/pending.
-                      (dev pod: https://data-dashboard-mtd.internal.preview.emergentagent.com ;
-                       set to the prod Polaris host for the prod DAG.)
-  POLARIS_API_KEY   — optional; sent as `Authorization: Bearer <key>` if set
-                      (the endpoint is currently open, so this is future-proofing).
+CONFIG — lives in Redash (edit there, no code push), house convention:
+  Query [polaris-reopen-qc] config (#49612) returns ONE row with columns:
+    polaris_base_url — base URL of the Polaris backend serving /api/reopen/pending
+                       (dev pod default; set to the prod Polaris host for the prod DAG)
+    polaris_api_key  — optional bearer for that endpoint (NULL = endpoint is open)
+    pull_limit       — rows classified + returned per /pending call
+    max_batches      — safety cap on batches drained per 5-min tick
+    http_timeout     — seconds to wait on /pending (LLM classifier runs synchronously)
+    wake_retries     — retries for a cold pod on the first hit
+  Only the config-query id is (optionally) overridable via env/Variable REOPEN_QC_CONFIG_QUERY_ID;
+  everything else is read from the row, with hardcoded fallbacks if Redash is unreachable.
+  (Reading a Redash query is a SELECT — unaffected by the BigQuery write-permission change.)
 
 DEPENDENCIES (Composer PyPI): `requests`, `google-cloud-bigquery` (both already present).
 
@@ -45,44 +51,55 @@ from __future__ import annotations
 import logging
 from datetime import timedelta
 
+import os
+
 import pendulum
 import requests
 from airflow import DAG
 from airflow.models import Variable
 from airflow.operators.python import PythonOperator
 
+from utils.slack import RedashClient
+from utils.slack.slack_config import REDASH_API_KEY, REDASH_BASE_URL
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Config
+# Config — the connection/tuning lives in Redash (edit there, no code push).
+# Only the config-query id is overridable via env/Variable; the rest is read
+# from that query's single row, with hardcoded fallbacks if Redash is down.
 # ---------------------------------------------------------------------------
 BQ_TABLE = "emergent-default.support.reopen_classifications"
-PULL_LIMIT = 500          # rows classified + returned per /pending call
-MAX_BATCHES = 25          # safety cap (25 * 500 = 12.5k rows / tick, well over the 8-day feed)
-HTTP_TIMEOUT = 285        # seconds — /pending runs the LLM classifier synchronously
-WAKE_RETRIES = 3          # the pod may be cold; retry the first hit
+CONFIG_QUERY_ID = int(os.getenv("REOPEN_QC_CONFIG_QUERY_ID", "49612"))  # [polaris-reopen-qc] config
 
-_DEFAULT_BASE = "https://data-dashboard-mtd.internal.preview.emergentagent.com"
-
-try:
-    from utils.secrets import get_secret          # Composer Secret Manager helper
-except Exception:                                  # pragma: no cover - local/test fallback
-    def get_secret(_k):
-        return None
+_FALLBACK = {
+    "polaris_base_url": "https://data-dashboard-mtd.internal.preview.emergentagent.com",
+    "polaris_api_key": None,
+    "pull_limit": 500,
+    "max_batches": 25,
+    "http_timeout": 285,
+    "wake_retries": 3,
+}
 
 
-def _cfg(name: str, default: str | None = None) -> str | None:
-    v = get_secret(name)
-    if v:
-        return v
+def _load_config() -> dict:
+    """Read the one-row Redash config query; fall back to _FALLBACK if unreachable."""
+    cfg = dict(_FALLBACK)
     try:
-        v = Variable.get(name, default_var=None)
-    except Exception:
-        v = None
-    if v:
-        return v
-    import os
-    return os.environ.get(name, default)
+        redash = RedashClient(api_key=REDASH_API_KEY, base_url=REDASH_BASE_URL)
+        rows = redash.fetch_query_results(query_id=CONFIG_QUERY_ID, max_retries=3)
+        if rows:
+            row = rows[0]
+            for k in _FALLBACK:
+                if row.get(k) is not None:
+                    cfg[k] = row[k]
+    except Exception as e:                          # never let config fetch break the run
+        logger.warning(f"[reopen writer] config fetch failed, using fallbacks: {type(e).__name__}: {e}")
+    cfg["pull_limit"] = int(cfg["pull_limit"])
+    cfg["max_batches"] = int(cfg["max_batches"])
+    cfg["http_timeout"] = int(cfg["http_timeout"])
+    cfg["wake_retries"] = int(cfg["wake_retries"])
+    return cfg
 
 
 def _bq():
@@ -97,18 +114,18 @@ def _bq():
 # ---------------------------------------------------------------------------
 # Pull one batch of classified rows from Polaris
 # ---------------------------------------------------------------------------
-def _pull_batch(base_url: str, headers: dict, limit: int) -> dict:
+def _pull_batch(base_url: str, headers: dict, limit: int, timeout: int, wake_retries: int) -> dict:
     url = f"{base_url.rstrip('/')}/api/reopen/pending"
     last_err = None
-    for attempt in range(1, WAKE_RETRIES + 1):
+    for attempt in range(1, wake_retries + 1):
         try:
-            r = requests.get(url, params={"limit": limit}, headers=headers, timeout=HTTP_TIMEOUT)
+            r = requests.get(url, params={"limit": limit}, headers=headers, timeout=timeout)
             r.raise_for_status()
             return r.json()
         except Exception as e:            # cold pod / transient — retry a few times
             last_err = e
             logger.warning(f"[reopen writer] /pending attempt {attempt} failed: {type(e).__name__}: {e}")
-    raise RuntimeError(f"/pending unreachable after {WAKE_RETRIES} attempts: {last_err}")
+    raise RuntimeError(f"/pending unreachable after {wake_retries} attempts: {last_err}")
 
 
 # ---------------------------------------------------------------------------
@@ -138,14 +155,20 @@ def _write_batch(client, rows: list[dict]) -> int:
 # Task
 # ---------------------------------------------------------------------------
 def run_writer(**_):
-    base_url = _cfg("POLARIS_BASE_URL", _DEFAULT_BASE)
-    api_key = _cfg("POLARIS_API_KEY")
+    cfg = _load_config()
+    base_url = cfg["polaris_base_url"]
+    api_key = cfg["polaris_api_key"]
+    pull_limit = cfg["pull_limit"]
+    max_batches = cfg["max_batches"]
+    timeout = cfg["http_timeout"]
+    wake_retries = cfg["wake_retries"]
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    logger.info(f"[reopen writer] config: base_url={base_url} pull_limit={pull_limit} max_batches={max_batches}")
 
     client = _bq()
     total_written = 0
-    for batch_no in range(1, MAX_BATCHES + 1):
-        res = _pull_batch(base_url, headers, PULL_LIMIT)
+    for batch_no in range(1, max_batches + 1):
+        res = _pull_batch(base_url, headers, pull_limit, timeout, wake_retries)
         rows = res.get("rows") or []
         logger.info(f"[reopen writer] batch {batch_no}: fetched={res.get('fetched')} "
                     f"new={res.get('new')} rows={len(rows)}")
@@ -154,7 +177,7 @@ def run_writer(**_):
         written = _write_batch(client, rows)
         total_written += written
         logger.info(f"[reopen writer] batch {batch_no}: wrote {written} (total {total_written})")
-        if len(rows) < PULL_LIMIT:        # backlog drained
+        if len(rows) < pull_limit:        # backlog drained
             break
     logger.info(f"[reopen writer] done: total_written={total_written}")
 
