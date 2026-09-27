@@ -56,7 +56,6 @@ import os
 import pendulum
 import requests
 from airflow import DAG
-from airflow.models import Variable
 from airflow.operators.python import PythonOperator
 
 from utils.slack import RedashClient
