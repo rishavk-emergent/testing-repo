@@ -58,8 +58,8 @@ import requests
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 
-from utils.slack import RedashClient
-from utils.slack.slack_config import REDASH_API_KEY, REDASH_BASE_URL
+from utils.redash import RedashClient   # plugins/utils/redash — RedashClient() self-resolves key+base
+from utils.bq import get_bq_client      # plugins/utils/bq — Composer BQ client (ADC)
 
 logger = logging.getLogger(__name__)
 
@@ -85,7 +85,7 @@ def _load_config() -> dict:
     """Read the one-row Redash config query; fall back to _FALLBACK if unreachable."""
     cfg = dict(_FALLBACK)
     try:
-        redash = RedashClient(api_key=REDASH_API_KEY, base_url=REDASH_BASE_URL)
+        redash = RedashClient()   # self-resolves API key (Secret Manager) + base URL
         rows = redash.fetch_query_results(query_id=CONFIG_QUERY_ID, max_retries=3)
         if rows:
             row = rows[0]
@@ -102,12 +102,7 @@ def _load_config() -> dict:
 
 
 def _bq():
-    try:
-        from utils.slack.bigquery_client import get_bigquery_client   # house helper (Composer ADC)
-        return get_bigquery_client()
-    except Exception:                                                  # pragma: no cover
-        from google.cloud import bigquery
-        return bigquery.Client(project="emergent-default")
+    return get_bq_client(project="emergent-default")   # Composer ADC (analytics-composer SA, has dataEditor)
 
 
 # ---------------------------------------------------------------------------
