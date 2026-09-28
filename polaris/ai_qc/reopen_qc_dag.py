@@ -49,6 +49,7 @@ NOTE: once this DAG owns the write, disable the pod's in-process writer with
 from __future__ import annotations
 
 import logging
+import time
 from datetime import timedelta
 
 import os
@@ -71,11 +72,15 @@ logger = logging.getLogger(__name__)
 BQ_TABLE = "emergent-default.support.reopen_classifications"
 CONFIG_QUERY_ID = int(os.getenv("REOPEN_QC_CONFIG_QUERY_ID", "49612"))  # [polaris-reopen-qc] config
 
+# PROD-SAFE fallbacks: used only if the Redash config query is unreachable on a tick.
+# polaris_base_url MUST be the prod host (never the dev/preview pod) so a config-fetch
+# blip can never cause the prod writer to ingest preview classifications into BQ.
+# max_batches is capped so worst-case (max_batches * http_timeout) stays under dagrun_timeout.
 _FALLBACK = {
-    "polaris_base_url": "https://data-dashboard-mtd.internal.preview.emergentagent.com",
+    "polaris_base_url": "https://polaris-analytics.internal.emergent.host",
     "polaris_api_key": None,
     "pull_limit": 500,
-    "max_batches": 25,
+    "max_batches": 8,          # 8 * 285s = 38m < 45m dagrun_timeout
     "http_timeout": 285,
     "wake_retries": 3,
 }
@@ -116,9 +121,11 @@ def _pull_batch(base_url: str, headers: dict, limit: int, timeout: int, wake_ret
             r = requests.get(url, params={"limit": limit}, headers=headers, timeout=timeout)
             r.raise_for_status()
             return r.json()
-        except Exception as e:            # cold pod / transient — retry a few times
+        except Exception as e:            # cold pod / transient — back off so the pod can warm
             last_err = e
             logger.warning(f"[reopen writer] /pending attempt {attempt} failed: {type(e).__name__}: {e}")
+            if attempt < wake_retries:
+                time.sleep(min(60, 10 * (2 ** (attempt - 1))))   # 10s, 20s, 40s… (bounded)
     raise RuntimeError(f"/pending unreachable after {wake_retries} attempts: {last_err}")
 
 
@@ -193,7 +200,7 @@ with DAG(
     start_date=pendulum.datetime(2026, 9, 27, tz="Asia/Kolkata"),
     catchup=False,
     max_active_runs=1,                     # never overlap — concurrent writes would race
-    dagrun_timeout=timedelta(minutes=30),
+    dagrun_timeout=timedelta(minutes=45),  # covers worst-case max_batches * http_timeout (8*285s=38m)
     tags=["polaris", "ai_qc", "reopen", "support"],
 ) as dag:
     PythonOperator(
