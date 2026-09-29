@@ -157,15 +157,18 @@ def build_slack_message(rows: list) -> tuple[str, str, int, int]:
         raised = r.get("raised_at")
         if raised is None:
             l3_label = "n/a with L3"
+            l3_sort  = float("-inf")   # unknown raise time → bottom
         else:
             if not getattr(raised, "tzinfo", None):
                 raised = raised.replace(tzinfo=_tz.utc)
             l3_s = max(0, int((now_utc - raised).total_seconds()))
             l3_label = f"{l3_s // 86400}d {(l3_s % 86400) // 3600}h with L3"
+            l3_sort  = l3_s
 
         parsed.append({
             "date_display":  _format_date_display(date_val) if date_val else "-",
             "l3_label":      l3_label,
+            "l3_sort":       l3_sort,
             "date_sort":     date_val or today_ist,
             "age_days":      age_days,
             "update_label":  update_label,
@@ -210,7 +213,7 @@ def build_slack_message(rows: list) -> tuple[str, str, int, int]:
         for r in subset:
             grouped.setdefault(r["team"], []).append(r)
         for team in grouped:
-            grouped[team].sort(key=lambda r: r["update_days"], reverse=True)
+            grouped[team].sort(key=lambda r: r["l3_sort"], reverse=True)  # longest in real_l3 first
         extra_teams   = sorted(t for t in grouped if t not in TEAM_ORDER)
         ordered_teams = [t for t in TEAM_ORDER if t in grouped] + extra_teams
 
