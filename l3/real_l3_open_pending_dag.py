@@ -42,7 +42,7 @@ SLACK_CHANNEL_ID = os.getenv('REAL_L3_SLACK_CHANNEL', 'C0B4CHB1PRD')  # #daily-r
 # Team Untagged tickets post to a separate channel; defaults to the main channel until a dedicated one is set
 UNTAGGED_SLACK_CHANNEL_ID = os.getenv('REAL_L3_UNTAGGED_CHANNEL', 'C0B7TBXP60M')  # fallback if config unavailable
 CONFIG_QUERY_ID = 43625   # [RealL3] config: main_channel_id / untagged_channel_id (edit in Redash, no code push)
-DATA_QUERY_ID   = 45385   # [RealL3] Open/Pending data (filter/dedup/columns editable in Redash, no code push)
+DATA_QUERY_ID   = 49749   # [RealL3] Open/Pending data (+raised_at) — Rishav-owned clone of 45385 with a raised_at column
 
 # real_l3 tag (Trinity, non-archived, singleton)
 REAL_L3_TAG_ID = '6a1f2e835ad901b459b7665f'
@@ -138,25 +138,34 @@ def build_slack_message(rows: list) -> tuple[str, str, int, int]:
                 date_val = today_ist
         age_days = (today_ist - date_val).days if date_val else 0
 
-        # "time since last outbound message" → "X day/s"
+        from datetime import datetime as _dt, timezone as _tz
+        now_utc = _dt.now(_tz.utc)
+
+        # "time since last outbound (agent) message" → "Xd Yh last resp."
         last_ts = r.get("last_outbound_ts")
         if last_ts is None:
             update_label = "no reply yet"
             update_days  = float("inf")   # never replied → most urgent, sorts to top
         else:
-            from datetime import datetime as _dt, timezone as _tz
-            now_utc = _dt.now(_tz.utc)
             if not getattr(last_ts, "tzinfo", None):
                 last_ts = last_ts.replace(tzinfo=_tz.utc)
-            delta_s = int((now_utc - last_ts).total_seconds())
-            if delta_s < 0:
-                delta_s = 0
-            d = delta_s // 86400
-            update_label = f"{d} day" + ("" if d == 1 else "s")
-            update_days  = d
+            delta_s = max(0, int((now_utc - last_ts).total_seconds()))
+            update_label = f"{delta_s // 86400}d {(delta_s % 86400) // 3600}h last resp."
+            update_days  = delta_s   # finer sort: exact seconds since last response
+
+        # "time since raised to real_l3" → "Xd Yh with L3"
+        raised = r.get("raised_at")
+        if raised is None:
+            l3_label = "n/a with L3"
+        else:
+            if not getattr(raised, "tzinfo", None):
+                raised = raised.replace(tzinfo=_tz.utc)
+            l3_s = max(0, int((now_utc - raised).total_seconds()))
+            l3_label = f"{l3_s // 86400}d {(l3_s % 86400) // 3600}h with L3"
 
         parsed.append({
             "date_display":  _format_date_display(date_val) if date_val else "-",
+            "l3_label":      l3_label,
             "date_sort":     date_val or today_ist,
             "age_days":      age_days,
             "update_label":  update_label,
@@ -191,6 +200,7 @@ def build_slack_message(rows: list) -> tuple[str, str, int, int]:
         # each get their own tight widths (avoids one section's wide labels
         # bleeding into the other).
         w_date     = 10
+        w_l3       = max(len(r["l3_label"]) for r in subset) + 1
         w_update   = max(len(r["update_label"]) for r in subset) + 2
         w_assignee = max(len(r["assignee"]) for r in subset) + 2
         w_status   = max(len(r["status"]) for r in subset) + 2
@@ -214,13 +224,14 @@ def build_slack_message(rows: list) -> tuple[str, str, int, int]:
             lines.append(f"{bullet} *{team}* ({len(tr)})")
             for r in tr:
                 date_padded     = _pad(r["date_display"], w_date)
+                l3_padded       = _pad(r["l3_label"], w_l3)
                 update_padded   = _pad(r["update_label"], w_update)
                 assignee_padded = _pad(r["assignee"], w_assignee)
                 status_padded   = _pad(r["status"], w_status)
                 ticket_link     = f"<{r['url']}|Trinity #{r['ticket']}>"
                 slack_part      = f"  <{r['slack']}|💬 thread>" if r["slack"] else ""
                 lines.append(
-                    f"   `{date_padded}`  (`{update_padded}`)  {ticket_link}  `{assignee_padded}`  `{status_padded}`{slack_part}"
+                    f"   `{date_padded}`  `{l3_padded}`  (`{update_padded}`)  {ticket_link}  `{assignee_padded}`  `{status_padded}`{slack_part}"
                 )
         return "\n".join(lines)
 
@@ -300,6 +311,17 @@ def run_real_l3_to_slack(**context):
                 except Exception:
                     try: r["last_outbound_ts"] = datetime.strptime(ss[:19], "%Y-%m-%dT%H:%M:%S")
                     except Exception: r["last_outbound_ts"] = None
+        ra = r.get("raised_at")
+        if isinstance(ra, str):
+            rs = ra.strip()
+            if not rs or rs in ("-", "None", "null"):
+                r["raised_at"] = None
+            else:
+                try:
+                    r["raised_at"] = datetime.fromisoformat(rs.replace("Z", "+00:00"))
+                except Exception:
+                    try: r["raised_at"] = datetime.strptime(rs[:19], "%Y-%m-%dT%H:%M:%S")
+                    except Exception: r["raised_at"] = None
     logger.info("      ✓ Got %d rows", len(rows))
 
     logger.info("[2] Partitioning by team (Team Untagged -> separate channel)...")
