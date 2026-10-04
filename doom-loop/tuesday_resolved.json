@@ -1,0 +1,43 @@
+{
+  "_comment": "Tuesday full day (7 IST slots), pulled live from the roster artifact and resolved to real Slack users via Slack MCP. NOTE: artifact s18 tech had an either/or pair (abhishek-pandey OR vibhor) - flattened to both here since Tech is tagged all-at-once in fallback. vibhor's directory role is csm but he covers a tech alternate in s18.",
+  "source_artifact": "https://claude.ai/artifact/1TX7DnRfzqFdK7Dn4aMQYu",
+  "day": "tue",
+  "people": {
+    "nandani":          {"name": "Nandani",        "role": "csm",  "slack_id": "U0B18DG7F6X", "email": "nandani@emergent.sh"},
+    "khyati":           {"name": "Khyati",         "role": "csm",  "slack_id": "U0C2QGXNEJC", "email": "khyati@emergent.sh"},
+    "nikita-choudhary": {"name": "Nikita Choudhary","role": "csm",  "slack_id": "U0A7NJSTF6K", "email": "nikita@emergent.sh"},
+    "varsha":           {"name": "Varsha",         "role": "csm",  "slack_id": "U09BVERUASE", "email": "varsha@emergent.sh"},
+    "guru":             {"name": "Guru",           "role": "csm",  "slack_id": "U0B6X275X9R", "email": "guru@emergent.sh"},
+    "kshamit":          {"name": "Kshamit",        "role": "csm",  "slack_id": "U0BELUYHP1R", "email": "kshamit@emergent.sh"},
+    "yash-mohan":       {"name": "Yash Mohan",     "role": "csm",  "slack_id": "U0C0YUWHFLG", "email": "yash.s@emergent.sh"},
+    "ashil":            {"name": "Ashil",          "role": "csm",  "slack_id": "U0AFKSMAASV", "email": "ashil@emergent.sh"},
+    "rashmika":         {"name": "Rashmika",       "role": "csm",  "slack_id": "U0B6X214PA7", "email": "rashmika@emergent.sh"},
+    "rishitha":         {"name": "Rishitha",       "role": "csm",  "slack_id": "U0B758AJU65", "email": "rishitha@emergent.sh"},
+    "prashika":         {"name": "Prashika",       "role": "csm",  "slack_id": "U09H4NWQKEF", "email": "prashika@emergent.sh"},
+    "vibha":            {"name": "Vibha",          "role": "csm",  "slack_id": "U0ACLGJ22TC", "email": "vibha@emergent.sh"},
+    "vibhor":           {"name": "Vibhor",         "role": "csm",  "slack_id": "U0AMVNX3JJC", "email": "vibhor@emergent.sh"},
+    "shreyas":          {"name": "Shreyas",        "role": "tech", "slack_id": "U0A1L14B83W", "email": "shreyas.g@emergent.sh"},
+    "prateek-maithi":   {"name": "Prateek Maithi", "role": "tech", "slack_id": "U0BNDM0N8P2", "email": "prateek.m@emergent.sh"},
+    "prathu":           {"name": "Prathu",         "role": "tech", "slack_id": "U0BEWU4D3QU", "email": "prathu@emergent.sh"},
+    "yashwanth":        {"name": "Yashwanth",      "role": "tech", "slack_id": "U0BEBR4TE7R", "email": "yashwanth.balaji@emergent.sh"},
+    "saksham":          {"name": "Saksham",        "role": "tech", "slack_id": "U0997FCD4SY", "email": "saksham@emergent.sh"},
+    "abhishek-pandey":  {"name": "Abhishek",       "role": "tech", "slack_id": "U09855PJMPC", "email": "abhishek@emergent.sh"},
+    "ishan-sinha":      {"name": "Ishan Sinha",    "role": "tech", "slack_id": "U0AGAQSAKMH", "email": "ishan@emergent.sh"},
+    "hridaya":          {"name": "Hridaya",        "role": "tech", "slack_id": "U0ADWRBTE68", "email": "hridaya@emergent.sh"},
+    "nikhita-bhat":     {"name": "Nikhita Bhat",   "role": "tech", "slack_id": "U0A39R9Q733", "email": "nikhita@emergent.sh"},
+    "arun-rajeev":      {"name": "Arun Rajeev",    "role": "tech", "slack_id": "U0ASDDX82CE", "email": "arun@emergent.sh"},
+    "subrahmanya-kr":   {"name": "Subrahmanya KR", "role": "tech", "slack_id": "U0A3WQFQHM5", "email": "subrahmanya@emergent.sh"},
+    "himesh":           {"name": "Himesh",         "role": "tech", "slack_id": "U0BER6JRJJ2", "email": "himesh@emergent.sh"},
+    "sayansh":          {"name": "Sayansh",        "role": "tech", "slack_id": "U0BMM9T15EV", "email": "sayansh@emergent.sh"},
+    "ammar":            {"name": "Ammar",          "role": "tech", "slack_id": "U0BRQL39ALX", "email": "mohammad.ammar@emergent.sh"}
+  },
+  "slots": {
+    "s12": {"label": "12 PM - 2 PM",  "csm": ["nandani", "khyati", "nikita-choudhary"],          "tech": ["shreyas", "prateek-maithi"]},
+    "s14": {"label": "2 PM - 4 PM",   "csm": ["varsha", "nandani", "guru", "kshamit"],           "tech": ["shreyas", "prateek-maithi", "prathu"]},
+    "s16": {"label": "4 PM - 6 PM",   "csm": ["khyati", "varsha", "guru", "yash-mohan"],         "tech": ["prathu", "yashwanth", "saksham"]},
+    "s18": {"label": "6 PM - 8 PM",   "csm": ["ashil", "guru", "rashmika", "rishitha"],          "tech": ["abhishek-pandey", "vibhor", "yashwanth", "ishan-sinha"], "tech_either_or": [["abhishek-pandey", "vibhor"]]},
+    "s20": {"label": "8 PM - 10 PM",  "csm": ["guru", "ashil", "rashmika", "rishitha", "prashika"], "tech": ["hridaya", "nikhita-bhat", "arun-rajeev"]},
+    "s22": {"label": "10 PM - 12 AM", "csm": ["rishitha", "rashmika", "vibha", "prashika"],      "tech": ["himesh", "sayansh", "subrahmanya-kr"]},
+    "s00": {"label": "12 AM - 2 AM",  "csm": ["vibha", "rishitha", "rashmika", "prashika"],      "tech": ["himesh", "sayansh", "ammar"]}
+  }
+}

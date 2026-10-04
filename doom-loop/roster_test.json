@@ -1,0 +1,13 @@
+{
+  "_comment": "TEST roster for the live slot. csm_ladder = CSM pickup order (P1,P2,...). tech_ladder = Tech for this slot, used as fallback when all CSMs are busy/not-available (all tagged at once). name = display (bold for now); slack_id = used ONLY for click-authorization. Placeholder ids until the real name->ID map lands.",
+  "slot_label": "Mon 12 PM - 2 PM IST (test)",
+  "csm_ladder": [
+    {"name": "Nandani", "slack_id": "U_NANDANI_TEST"},
+    {"name": "Khyati",  "slack_id": "U_KHYATI_TEST"},
+    {"name": "Aarav",   "slack_id": "U_AARAV_TEST"}
+  ],
+  "tech_ladder": [
+    {"name": "Rohit", "slack_id": "U_ROHIT_TEST"},
+    {"name": "Meera", "slack_id": "U_MEERA_TEST"}
+  ]
+}
