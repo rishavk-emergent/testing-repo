@@ -487,8 +487,15 @@ def run_gst_monthly(**context):
     state['_last_fire_date'] = today_key
     Variable.set(MONTHLY_STATE_VAR, json.dumps(state))
 
-    as_of_ts = now.isoformat()        # exact trigger instant (IST) -> stored in state + query upper bound
-    as_of = now.format('YYYY-MM-DD')  # display only (master / thread comment)
+    # Window = the FULL PREVIOUS CALENDAR MONTH (IST), identical for every accepted vendor and
+    # independent of when the last trigger ran. Oct-2 fire -> all of September; Nov-2 fire -> all of October.
+    win_start = now.subtract(months=1).start_of('month')        # 1st of prev month 00:00:00 IST (inclusive)
+    win_end   = now.start_of('month').subtract(microseconds=1)  # last instant of prev month (inclusive)
+    since_ts  = win_start.subtract(microseconds=1).isoformat()  # query window is (since_ts, as_of_ts]; step back 1us so win_start is included
+    as_of_ts  = win_end.isoformat()                             # inclusive upper bound = end of prev month
+    period_label = win_start.format('MMM YYYY')                 # e.g. "Sep 2026"
+    since_disp = win_start.format('YYYY-MM-DD')                 # 1st of prev month (thread comment)
+    as_of = period_label                                        # master/thread display = the month
     sid, gid, sheet_url = _sheet_loc(cfg)
 
     # ---- every editable knob comes from config #CONFIG_QUERY_ID (fallback constants if blank) ----
@@ -533,8 +540,7 @@ def run_gst_monthly(**context):
         if not fire_v:
             logger.info('      skip %s (non-recurring, already fired once)', email)
             continue
-        since_ts = vs.get('last_trigger_at') or default_since   # exact instant of vendor's last trigger
-        since_disp = str(since_ts)[:10]                          # date only, for display
+        # window (since_ts, as_of_ts] is the fixed previous-calendar-month bounds computed above — same for all vendors
         # the federated (EXTERNAL_QUERY) payments query can flake transiently under back-to-back load;
         # retry a couple of times before giving up (a skipped vendor is retried next trigger anyway).
         pays, err = None, None
