@@ -48,7 +48,7 @@ ENV_CHANNEL_OVERRIDE = os.getenv('CS_SOD_SLACK_CHANNEL')   # set to a test chann
 FORCE_RUN            = os.getenv('CS_SOD_FORCE_RUN') == '1'   # bypass the trigger-hour gate (manual/test runs)
 FALLBACK_CHANNEL     = 'C0B075CBPS7'                        # cs-associates
 CONFIG_QUERY_ID      = 40628                                # Redash: "[CS] SOD Count config"
-TRINITY_MCP_URL      = 'https://trinity-base.internal.emergent.host/api/mcp/'   # base URL lives in code
+TRINITY_MCP_URL      = 'https://trinity-base.int.apis.emergentagent.com/api/mcp/'   # base URL lives in code
 COUNT_STATUSES       = ('open',)                            # value per bucket = sum of these (open tickets only)
 
 
