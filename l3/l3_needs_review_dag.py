@@ -58,7 +58,7 @@ ENV_CHANNEL = os.getenv('L3_NEEDS_REVIEW_SLACK_CHANNEL')
 FORCE_RUN   = os.getenv('L3_NEEDS_REVIEW_FORCE_RUN') == '1'
 
 # Trinity bucket the message header links to (live needs-review view)
-TRINITY_BUCKET_URL = 'https://trinity-base.internal.emergent.host/tickets?bucket=6a1ee9ad5ad901b459b740b0'
+TRINITY_BUCKET_URL = 'https://trinity-base.int.apis.emergentagent.com/tickets?bucket=6a1ee9ad5ad901b459b740b0'
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
