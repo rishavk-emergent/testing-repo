@@ -39,7 +39,7 @@ FEED_QUERY_ID   = 42417
 CONFIG_QUERY_ID = 42418
 MASTER_VAR      = 'RADIO_MASTER'    # {ist_date: thread_ts}
 ALERTED_VAR     = 'RADIO_ALERTED'   # {email: last_alert_iso}
-TICKET_URL      = 'https://trinity-base.internal.emergent.host/tickets/%s'
+TICKET_URL      = 'https://trinity-base.int.apis.emergentagent.com/tickets/%s'
 ENV_CHANNEL     = os.getenv('RADIO_SLACK_CHANNEL')   # test override
 FORCE_RUN       = os.getenv('RADIO_FORCE') == '1'    # ignore cooldown (testing)
 
