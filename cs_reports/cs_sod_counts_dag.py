@@ -49,6 +49,7 @@ FORCE_RUN            = os.getenv('CS_SOD_FORCE_RUN') == '1'   # bypass the trigg
 FALLBACK_CHANNEL     = 'C0B075CBPS7'                        # cs-associates
 CONFIG_QUERY_ID      = 40628                                # Redash: "[CS] SOD Count config"
 TRINITY_MCP_URL      = 'https://trinity-base.int.apis.emergentagent.com/api/mcp/'   # base URL lives in code
+TRINITY_UI_URL       = 'https://trinity-base.int.apis.emergentagent.com'   # ticket-link base (built in code from bucket_id; config 'link' column ignored)
 COUNT_STATUSES       = ('open',)                            # value per bucket = sum of these (open tickets only)
 
 
@@ -210,7 +211,15 @@ def run_cs_sod_counts(**context):
         prefix = ('>  ' if first_indent else '> ') if indented else ''
         if indented:
             first_indent = False
-        link = (r.get('link') or '').strip()
+        # Build the ticket link in code (new Trinity host) from the row's bucket_id;
+        # the config 'link' column points at the retired host, so it's ignored.
+        bid = (r.get('bucket_id') or '').strip()
+        if bid:
+            link = '%s/tickets?bucket=%s' % (TRINITY_UI_URL, bid)
+        elif r.get('type') == 'sum':
+            link = '%s/tickets' % TRINITY_UI_URL
+        else:
+            link = (r.get('link') or '').strip()
         value = '<%s|%d>' % (link, v) if link else str(v)
         lines.append('%s%s - %s' % (prefix, r.get('label'), value))
     msg = '\n'.join(lines)
