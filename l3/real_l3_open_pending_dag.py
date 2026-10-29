@@ -48,8 +48,8 @@ DATA_QUERY_ID   = 49749   # [RealL3] Open/Pending data (+raised_at) — Rishav-o
 REAL_L3_TAG_ID = '6a1f2e835ad901b459b7665f'
 
 # Trinity bucket the message header links to (live RealL3 view)
-TRINITY_BUCKET_URL         = 'https://trinity-base.internal.emergent.host/tickets?bucket=6a1ee9695ad901b459b74089'
-TRINITY_BUCKET_PENDING_URL = 'https://trinity-base.internal.emergent.host/tickets?tab=pending&bucket=6a1ee9695ad901b459b74089'
+TRINITY_BUCKET_URL         = 'https://trinity-base.int.apis.emergentagent.com/tickets?bucket=6a1ee9695ad901b459b74089'
+TRINITY_BUCKET_PENDING_URL = 'https://trinity-base.int.apis.emergentagent.com/tickets?tab=pending&bucket=6a1ee9695ad901b459b74089'
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
