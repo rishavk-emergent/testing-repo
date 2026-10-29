@@ -91,7 +91,11 @@ DEFAULT_MODEL     = 'gpt-4o-mini'
 DEFAULT_TRACK_DAYS = 30
 MAX_PER_RUN       = 5                                      # safety cap on new mails handled per tick
 INTERNAL_DOMAINS  = ('emergent.sh', 'emergentagent.com', 'emergent.host')
-TRINITY_TICKET_URL = 'https://trinity-base.internal.emergent.host/tickets/%s'
+TRINITY_TICKET_URL = 'https://trinity-base.int.apis.emergentagent.com/tickets/%s'
+# Retired-host workaround: config #41566 still carries the old MCP host and we lack write access,
+# so the MCP endpoints are hardcoded here and override the cfg values after load.
+TRINITY_MCP_URL    = 'https://trinity-base.int.apis.emergentagent.com/api/mcp/'
+OVERWATCH_MCP_URL  = 'https://overwatch.int.apis.emergentagent.com/api/mcp/'
 
 BQ_PROJECT  = 'emergent-default'
 BQ_DATASET  = 'support'                                    # helper tables live in `support`, never `analytics`
@@ -802,6 +806,9 @@ def run_erc(**context):
     if not CONFIG_QUERY_ID:
         raise Exception('CONFIG_QUERY_ID not set - create the [ERC] config Redash query first')
     cfg = redash_run(CONFIG_QUERY_ID)[0]
+    # config #41566 still points MCP at the retired host; override with the hardcoded new host
+    cfg['trinity_mcp_url'] = TRINITY_MCP_URL
+    cfg['overwatch_mcp_url'] = OVERWATCH_MCP_URL
     channel = ENV_CHANNEL_OVER or cfg['channel_id']
     erc_bot = cfg['erc_bot_id']
     trin = McpHttp(cfg['trinity_mcp_url'], cfg['trinity_api_key'])
