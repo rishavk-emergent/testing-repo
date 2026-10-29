@@ -108,7 +108,7 @@ def build_slack_message(rows: list) -> tuple:
             "date_sort":    date_sort,
             "age_days":     age_days,
             "ticket":       ticket,
-            "url":          (r.get("ticket_url") or "").strip(),
+            "url":          (r.get("ticket_url") or "").strip().replace("trinity-base.internal.emergent.host", "trinity-base.int.apis.emergentagent.com"),
             "status":       status,
         })
 
