@@ -29,8 +29,8 @@ HOW IT WORKS  (thin runtime - all the logic lives in Redash + the KB, editable w
 SOURCE MAP  -  where to look to understand / change any part
   Redash #42029   config      creds - rca_prompt - rca_times - channel - kb_sources - rca_selection_query
   Redash #42036   selection   VIP / RealL3 / rest cascade + genuine-user + LTV floor
-  Trinity   MCP   trinity-base.internal.emergent.host/api/mcp     get_ticket, messages, customer
-  Overwatch MCP   overwatch.internal.emergent.host/api/mcp        existing analyses (audit only)
+  Trinity   MCP   trinity-base.int.apis.emergentagent.com/api/mcp     get_ticket, messages, customer
+  Overwatch MCP   overwatch.int.apis.emergentagent.com/api/mcp        existing analyses (audit only)
   Redash DS       ds7 BigQuery (trinity_database.v_*) - ds10 agent-service (environments/pipeline_runs)
                   - ds5 deployer (apps/pipeline_runs)
   KB (live)       github.com/emergentbase/mono/.claude/skills/*  via GitHub contents API; token in
@@ -57,6 +57,10 @@ from utils.slack.slack_config import REDASH_API_KEY, REDASH_BASE_URL, SLACK_BOT_
 logger = logging.getLogger(__name__)
 
 CONFIG_QUERY_ID = 42029
+# Retired-host workaround: config #42029 still carries the old MCP host and we lack write access,
+# so the MCP endpoints are hardcoded here and override the cfg values after load.
+TRINITY_MCP_URL  = 'https://trinity-base.int.apis.emergentagent.com/api/mcp/'
+OVERWATCH_MCP_URL = 'https://overwatch.int.apis.emergentagent.com/api/mcp/'
 DONE_VAR        = 'RCA_MIS_DONE'
 LTV_MIN         = 1000.0
 MAX_ITER        = 24
@@ -255,7 +259,7 @@ def basic_details(cfg, tj, ticket_id):
     except Exception:
         pass
     return {'ltv': ltv, 'plan': plan, 'gw': gw, 'region': region, 'email': email, 'opencnt': opencnt, 'num': tj.get('num'),
-            'link': 'https://trinity-base.internal.emergent.host/tickets/%s' % ticket_id}
+            'link': 'https://trinity-base.int.apis.emergentagent.com/tickets/%s' % ticket_id}
 
 def render_main(bd, out):
     return (
@@ -366,6 +370,9 @@ def _resolve(name):
 def run_rca_mis(**context):
     cfg = redash_run(CONFIG_QUERY_ID, REDASH_BASE_URL, REDASH_API_KEY)[0]
     cfg['redash_base_url'] = _https(cfg.get('redash_base_url') or REDASH_BASE_URL)
+    # config #42029 still points MCP at the retired host; override with the hardcoded new host
+    cfg['trinity_mcp_url'] = TRINITY_MCP_URL
+    cfg['overwatch_mcp_url'] = OVERWATCH_MCP_URL
     # Prefer Composer's internal LiteLLM proxy (Secret Manager / Airflow Variable) when present, so a
     # merged PR uses the internal proxy automatically; locally these are unset -> fall back to the
     # config-query OpenAI-direct values. No code/config change needed at go-live.
