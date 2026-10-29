@@ -176,7 +176,7 @@ def build_slack_message(rows: list) -> tuple[str, str, int, int]:
             "team":          _normalize_team(r.get("team")),
             "ticket":        str(r.get("ticket_number", "")).strip(),
             "assignee":      _normalize_assignee(r.get("assignee")),
-            "url":           (r.get("ticket_url") or "").strip(),
+            "url":           (r.get("ticket_url") or "").strip().replace("trinity-base.internal.emergent.host", "trinity-base.int.apis.emergentagent.com"),
             "slack":         _clean_slack(r.get("slack_link")),
             "status":        status,
         })
